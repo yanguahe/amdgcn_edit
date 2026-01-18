@@ -1,0 +1,6 @@
+*.png
+*.dot
+*.svg
+
+ddg_output/
+__pycache__/
