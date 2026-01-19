@@ -225,6 +225,74 @@ def is_scc_writer(opcode: str) -> bool:
     """Check if instruction writes SCC."""
     return opcode.lower() in SCC_WRITERS
 
+
+def is_dead_scc_write(instructions: List, instr_index: int) -> bool:
+    """
+    Check if an instruction's SCC write is dead (never read).
+    
+    An SCC write is dead if:
+    1. The instruction writes SCC (regardless of whether it also reads SCC)
+    2. The next instruction that has any SCC behavior only writes SCC (doesn't read it)
+    
+    This means the SCC value produced by this instruction is never used
+    before being overwritten.
+    
+    Example 1:
+        [47] s_lshl_b64 s[8:9], s[8:9], 1     ; writes SCC (dead)
+        ... (no SCC read/write)
+        [51] s_lshl_b64 s[0:1], s[0:1], 1     ; writes SCC (overwrites before read)
+        
+    Example 2:
+        [19] s_addc_u32 s9, s73, s9           ; reads and writes SCC (SCC write is dead)
+        ... (no SCC read)
+        [23] s_cmpk_gt_i32 s23, 0x7f          ; writes SCC (overwrites before read)
+        
+    In both cases, the SCC write is dead.
+    
+    Args:
+        instructions: List of Instruction objects in the block
+        instr_index: Index of the instruction to check
+        
+    Returns:
+        True if the SCC write is dead and should be removed from defs
+    """
+    if instr_index >= len(instructions):
+        return False
+    
+    instr = instructions[instr_index]
+    opcode = instr.opcode.lower()
+    
+    # Only check instructions that write SCC
+    if not is_scc_writer(opcode):
+        return False
+    
+    # Look forward for the next instruction that touches SCC
+    for i in range(instr_index + 1, len(instructions)):
+        next_instr = instructions[i]
+        next_opcode = next_instr.opcode.lower()
+        
+        # Check if this instruction reads SCC
+        if is_scc_reader(next_opcode):
+            # Next SCC instruction reads SCC - write is not dead
+            return False
+        
+        # Check if this instruction ONLY writes SCC (doesn't read it)
+        # Use is_scc_only_writer, not is_scc_writer, because instructions
+        # that both read and write SCC (like s_addc_u32) need the incoming SCC
+        if is_scc_only_writer(next_opcode):
+            # Next SCC instruction overwrites SCC without reading it
+            # Current SCC write is dead
+            return True
+        
+        # If next instruction both reads and writes SCC, the write is not dead
+        if is_scc_writer(next_opcode):
+            # This instruction reads SCC (it's in SCC_WRITERS but not SCC_ONLY_WRITERS)
+            return False
+    
+    # No more SCC instructions found - SCC might be live-out
+    # Be conservative and assume it's not dead
+    return False
+
 # Instructions that write to VCC
 VCC_WRITERS = {
     'v_cmp_eq_f32', 'v_cmp_lt_f32', 'v_cmp_le_f32', 'v_cmp_gt_f32', 'v_cmp_ge_f32',
@@ -945,19 +1013,34 @@ def is_lgkm_op(opcode: str) -> bool:
     
     LGKM operations include:
     - s_load_* : Scalar memory load instructions
+    - s_store_* : Scalar memory store instructions
     - ds_*     : All LDS (Local Data Share) instructions
     
     These are monitored by lgkmcnt in s_waitcnt.
     """
     op_lower = opcode.lower()
-    return op_lower.startswith('s_load_') or op_lower.startswith('ds_')
+    return (op_lower.startswith('s_load_') or 
+            op_lower.startswith('s_store_') or 
+            op_lower.startswith('ds_'))
 
 
 def is_vm_op(opcode: str) -> bool:
-    """Check if instruction is a VM memory operation (buffer_load, global_load)."""
+    """
+    Check if instruction is a VM memory operation.
+    
+    VM operations include:
+    - buffer_load_* : Buffer load instructions
+    - buffer_store_* : Buffer store instructions
+    - global_load_* : Global load instructions
+    - global_store_* : Global store instructions
+    
+    These are monitored by vmcnt in s_waitcnt.
+    """
     op_lower = opcode.lower()
     return (op_lower.startswith('buffer_load') or 
-            op_lower.startswith('global_load'))
+            op_lower.startswith('buffer_store') or
+            op_lower.startswith('global_load') or
+            op_lower.startswith('global_store'))
 
 
 # =============================================================================
@@ -1086,6 +1169,14 @@ def build_ddg(block: BasicBlock,
     nodes = []
     for i, instr in enumerate(block.instructions):
         defs, uses = parse_instruction_registers(instr)
+        
+        # Optimize: Remove dead SCC writes
+        # If an instruction writes SCC but doesn't read it, and the next
+        # instruction that touches SCC also only writes it (doesn't read),
+        # then the SCC write is dead and should be removed from defs.
+        if 'scc' in defs and is_dead_scc_write(block.instructions, i):
+            defs = defs - {'scc'}
+        
         node = InstructionNode(
             instr=instr,
             node_id=i,
@@ -1135,15 +1226,12 @@ def build_ddg(block: BasicBlock,
                     writer.successors.append(node)
                     ddg.edges.append((writer.node_id, node.node_id, f"RAW:{reg}"))
         
-        # WAW dependencies: current instruction writes what previous wrote
-        for reg in node.defs:
-            if reg in last_writer:
-                writer = last_writer[reg]
-                # Only add if not already connected via RAW
-                if writer not in node.predecessors:
-                    node.predecessors.append(writer)
-                    writer.successors.append(node)
-                    ddg.edges.append((writer.node_id, node.node_id, f"WAW:{reg}"))
+        # Note: WAW (Write After Write) dependencies are NOT created.
+        # Only RAW (Read After Write) dependencies matter for correctness.
+        # WAW edges are unnecessary because:
+        #   - If instruction A writes reg and instruction B also writes reg,
+        #     B will simply overwrite A's value
+        #   - The ordering constraint only matters when someone READS the value
         
         # Handle s_waitcnt dependencies
         if opcode == 's_waitcnt':
@@ -2297,39 +2385,41 @@ def load_analysis_from_json(filepath: str) -> AnalysisResult:
     return result
 
 
-def save_block_instructions(cfg: CFG, output_dir: str):
+def dump_block_instructions(cfg: CFG, output_dir: str) -> None:
     """
-    Save each basic block's instructions to a text file.
+    Dump instructions of each basic block to separate text files.
+    
+    Each instruction is numbered with [idx] prefix to match the instruction
+    list index, making it easy to verify scheduling results against log output.
     
     Args:
-        cfg: The control flow graph
-        output_dir: Output directory
-        
-    For a block named '.LBB0_0', the output file will be 'LBB0_0.txt'.
+        cfg: The CFG containing basic blocks
+        output_dir: Directory to write the block instruction files
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    for label, block in cfg.blocks.items():
-        # Remove leading dot and add .txt extension
-        filename = label.lstrip('.') + '.txt'
+    for block_label, block in cfg.blocks.items():
+        # Create filename: .LBB0_2 -> LBB0_2.txt
+        filename = block_label.lstrip('.') + '.txt'
         filepath = os.path.join(output_dir, filename)
         
         with open(filepath, 'w') as f:
-            # Write block header
-            f.write(f"; Block: {label}\n")
-            f.write(f"; Instruction count: {len(block.instructions)}\n")
-            f.write(f"; Successors: {', '.join(block.successors) if block.successors else 'none'}\n")
-            f.write("\n")
+            f.write(f"; Block: {block_label}\n")
+            f.write(f"; Total instructions: {len(block.instructions)}\n")
+            f.write(f";\n")
             
-            # Write each instruction with line number
-            for i, instr in enumerate(block.instructions):
-                # Format: [node_id] opcode operands
-                line = f"[{i}] {instr.opcode}"
-                if instr.operands:
-                    line += f" {instr.operands}"
-                f.write(line + "\n")
+            for idx, instr in enumerate(block.instructions):
+                # Format: [idx] opcode operands
+                if instr.raw_line:
+                    # Use raw_line but strip leading whitespace
+                    line = instr.raw_line.strip()
+                else:
+                    # Fallback to opcode + operands
+                    line = f"{instr.opcode} {instr.operands}" if instr.operands else instr.opcode
+                
+                f.write(f"[{idx}] {line}\n")
     
-    print(f"Block instruction files saved to: {output_dir}/")
+    print(f"Block instructions dumped to: {output_dir}/")
 
 
 def save_ddg_files(cfg: CFG, ddgs: Dict[str, DDG], output_dir: str, 
@@ -2348,7 +2438,7 @@ def save_ddg_files(cfg: CFG, ddgs: Dict[str, DDG], output_dir: str,
     os.makedirs(output_dir, exist_ok=True)
     
     # Save block instructions to text files
-    save_block_instructions(cfg, output_dir)
+    dump_block_instructions(cfg, output_dir)
     
     # Compute inter-block dependencies
     inter_deps = compute_inter_block_deps(cfg, ddgs)
@@ -2451,7 +2541,6 @@ def print_ddg_stats(ddgs: Dict[str, DDG]):
     total_nodes = 0
     total_edges = 0
     total_raw = 0
-    total_waw = 0
     total_wait = 0
     total_avail = 0
     total_lgkm_ops = 0
@@ -2461,7 +2550,6 @@ def print_ddg_stats(ddgs: Dict[str, DDG]):
         node_count = len(ddg.nodes)
         edge_count = len(ddg.edges)
         raw_count = sum(1 for _, _, t in ddg.edges if t.startswith("RAW"))
-        waw_count = sum(1 for _, _, t in ddg.edges if t.startswith("WAW"))
         wait_count = sum(1 for _, _, t in ddg.edges if t.startswith("WAIT"))
         avail_count = sum(1 for _, _, t in ddg.edges if t.startswith("AVAIL"))
         critical_path = ddg.get_critical_path_length()
@@ -2471,7 +2559,6 @@ def print_ddg_stats(ddgs: Dict[str, DDG]):
         total_nodes += node_count
         total_edges += edge_count
         total_raw += raw_count
-        total_waw += waw_count
         total_wait += wait_count
         total_avail += avail_count
         total_lgkm_ops += lgkm_count
@@ -2479,7 +2566,7 @@ def print_ddg_stats(ddgs: Dict[str, DDG]):
         
         print(f"\n{label}:")
         print(f"  Nodes: {node_count}, Edges: {edge_count}")
-        print(f"  RAW deps: {raw_count}, WAW deps: {waw_count}, WAIT deps: {wait_count}, AVAIL deps: {avail_count}")
+        print(f"  RAW deps: {raw_count}, WAIT deps: {wait_count}, AVAIL deps: {avail_count}")
         print(f"  Memory ops: LGKM={lgkm_count}, VM={vm_count}")
         lgkm_in = len(ddg.lgkm_pending_in)
         vm_in = len(ddg.vm_pending_in)
@@ -2501,7 +2588,6 @@ def print_ddg_stats(ddgs: Dict[str, DDG]):
     print(f"Total nodes: {total_nodes}")
     print(f"Total edges: {total_edges}")
     print(f"Total RAW dependencies: {total_raw}")
-    print(f"Total WAW dependencies: {total_waw}")
     print(f"Total WAIT dependencies: {total_wait}")
     print(f"Total AVAIL dependencies (from s_waitcnt): {total_avail}")
     print(f"Total LGKM operations (s_load, ds_*): {total_lgkm_ops}")
@@ -2546,6 +2632,8 @@ def print_waitcnt_deps(waitcnt_deps: List[WaitcntInterBlockDep]):
     print("=" * 70 + "\n")
 
 
+
+
 def main():
     """Main entry point."""
     import argparse
@@ -2576,8 +2664,8 @@ def main():
                        help='Regenerate .amdgcn file from loaded JSON to specified path')
     parser.add_argument('--keep-debug-labels', action='store_true',
                        help='Keep .Ltmp* debug labels when regenerating .amdgcn file (default: remove them)')
-    parser.add_argument('--move', '-m', nargs=3, metavar=('BLOCK', 'INDEX', 'DIR'),
-                       help='Move instruction: BLOCK INDEX DIRECTION (-1=up, +1=down)')
+    parser.add_argument('--move', '-m', nargs=3, metavar=('BLOCK', 'INDEX', 'CYCLES'),
+                       help='Move instruction: BLOCK INDEX CYCLES (positive=up, negative=down)')
     parser.add_argument('--distribute', '-d', nargs=3, metavar=('BLOCK', 'OPCODE', 'K'),
                        help='Distribute instructions evenly: BLOCK OPCODE K (e.g., .LBB0_2 global_load_dwordx4 8)')
     
@@ -2601,10 +2689,11 @@ def main():
             from amdgcn_passes import move_instruction, MoveResult
             block_label = args.move[0]
             instr_index = int(args.move[1])
-            direction = int(args.move[2])
+            cycles = int(args.move[2])
             
-            print(f"Moving instruction {instr_index} in {block_label} {'up' if direction < 0 else 'down'}...")
-            move_result = move_instruction(result, block_label, instr_index, direction, verbose=True)
+            dir_str = "up" if cycles > 0 else "down"
+            print(f"Moving instruction {instr_index} in {block_label} {dir_str} by {abs(cycles)} cycles...")
+            move_result = move_instruction(result, block_label, instr_index, cycles, verbose=True)
             
             if move_result.success:
                 print(f"Success: {move_result.message}")
@@ -2613,6 +2702,10 @@ def main():
                 ddgs = result.ddgs
                 waitcnt_deps = result.waitcnt_deps
                 inter_deps = result.inter_block_deps
+                
+                # Dump block instructions after scheduling
+                dump_dir = os.path.dirname(args.load_json) or '.'
+                dump_block_instructions(cfg, dump_dir)
             else:
                 print(f"Failed: {move_result.message}")
                 if move_result.blocked_by:
@@ -2636,6 +2729,10 @@ def main():
                 ddgs = result.ddgs
                 waitcnt_deps = result.waitcnt_deps
                 inter_deps = result.inter_block_deps
+                
+                # Dump block instructions after scheduling
+                dump_dir = os.path.dirname(args.load_json) or '.'
+                dump_block_instructions(cfg, dump_dir)
             else:
                 print(f"Distribution failed or made no changes")
                 return 1

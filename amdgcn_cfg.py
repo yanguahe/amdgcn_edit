@@ -96,6 +96,63 @@ class BasicBlock:
             return []
         return [self.raw_lines[ln] for ln in sorted(self.raw_lines.keys())]
     
+    def get_instruction_lines_in_order(self) -> List[str]:
+        """
+        Get lines with instructions in the scheduled order from the instructions list.
+        
+        After instruction scheduling (MoveInstructionPass), the instructions list is
+        in the correct scheduled order. This method outputs instructions in that order,
+        with non-instruction lines (labels, comments) in their original positions.
+        
+        IMPORTANT: Non-instruction lines (like labels .LBB0_*) must stay at their
+        original positions because they're branch targets. We can't move them.
+        
+        The approach:
+        1. Keep non-instruction lines at original positions (by line number)
+        2. Fill instruction slots with instructions in scheduled (list) order
+        
+        Returns:
+            List of all lines with instructions in scheduled order
+        """
+        if not self.raw_lines:
+            return []
+        
+        # Identify instruction positions (line numbers that have instructions)
+        instr_addresses = {instr.address for instr in self.instructions}
+        
+        # Build output: iterate by line number
+        # - Non-instruction lines: output their original content
+        # - Instruction slots: fill with instructions in list order (scheduled)
+        lines = []
+        instr_idx = 0
+        
+        for line_num in sorted(self.raw_lines.keys()):
+            if line_num in instr_addresses:
+                # This is an instruction slot - fill with next instruction in scheduled order
+                if instr_idx < len(self.instructions):
+                    instr = self.instructions[instr_idx]
+                    # Use instr.raw_line directly for the instruction content
+                    # This is the most direct way to get the instruction's text
+                    if instr.raw_line:
+                        lines.append(instr.raw_line + '\n')
+                    elif instr.address in self.raw_lines:
+                        lines.append(self.raw_lines[instr.address])
+                    instr_idx += 1
+            else:
+                # Non-instruction line - keep at original position
+                lines.append(self.raw_lines[line_num])
+        
+        # Append any remaining instructions
+        while instr_idx < len(self.instructions):
+            instr = self.instructions[instr_idx]
+            if instr.address in self.raw_lines:
+                lines.append(self.raw_lines[instr.address])
+            elif instr.raw_line:
+                lines.append(instr.raw_line + '\n')
+            instr_idx += 1
+        
+        return lines
+    
     def to_dict(self) -> Dict[str, Any]:
         """Serialize basic block to dictionary."""
         return {
@@ -183,7 +240,8 @@ class CFG:
             data = json.load(f)
         return cls.from_dict(data)
     
-    def to_amdgcn(self, filepath: str, keep_debug_labels: bool = False):
+    def to_amdgcn(self, filepath: str, keep_debug_labels: bool = False, 
+                   use_instruction_order: bool = True):
         """
         Regenerate the .amdgcn assembly file from this CFG.
         
@@ -198,6 +256,9 @@ class CFG:
                               AND strip debug sections to avoid undefined symbol errors.
                               If True, preserve all labels including .Ltmp* debug labels
                               and keep all debug sections intact.
+            use_instruction_order: If True (default), output instructions in the order
+                              of the instructions list (reflecting any scheduling changes).
+                              If False, output based on original line numbers.
         
         Note:
             When .Ltmp* labels are removed from the code section, the debug sections
@@ -221,7 +282,12 @@ class CFG:
         for label in self.block_order:
             if label in self.blocks:
                 block = self.blocks[label]
-                block_lines = block.get_raw_lines_in_order()
+                # Choose output method based on use_instruction_order
+                if use_instruction_order:
+                    block_lines = block.get_instruction_lines_in_order()
+                else:
+                    block_lines = block.get_raw_lines_in_order()
+                    
                 if keep_debug_labels:
                     lines.extend(block_lines)
                 else:

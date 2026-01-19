@@ -2,5 +2,7 @@
 *.dot
 *.svg
 
+ori_ddg_output/
 ddg_output/
+ddg_trans_out_v1/
 __pycache__/
