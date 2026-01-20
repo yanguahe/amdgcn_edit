@@ -1,0 +1,302 @@
+{
+  "target": "gfx942",
+  "description": "AMD Instinct MI300 (CDNA3) hardware instruction information based on ISA documentation",
+  
+  "mfma_instructions": {
+    "v_mfma_f32_32x32x1_2b_f32": {"passes": 16, "type": "SGEMM", "output_size": 32},
+    "v_mfma_f32_16x16x1_4b_f32": {"passes": 8, "type": "SGEMM", "output_size": 16},
+    "v_mfma_f32_4x4x1_16b_f32": {"passes": 2, "type": "SGEMM", "output_size": 4},
+    "v_mfma_f32_32x32x2_f32": {"passes": 16, "type": "SGEMM", "output_size": 16},
+    "v_mfma_f32_16x16x4_f32": {"passes": 4, "type": "SGEMM", "output_size": 4},
+    
+    "v_mfma_f32_32x32x4_2b_f16": {"passes": 16, "type": "XDL", "output_size": 32},
+    "v_mfma_f32_16x16x4_4b_f16": {"passes": 8, "type": "XDL", "output_size": 16},
+    "v_mfma_f32_4x4x4_16b_f16": {"passes": 2, "type": "XDL", "output_size": 4},
+    "v_mfma_f32_32x32x8_f16": {"passes": 8, "type": "XDL", "output_size": 16},
+    "v_mfma_f32_16x16x16_f16": {"passes": 4, "type": "XDL", "output_size": 4},
+    
+    "v_mfma_f32_32x32x4_2b_bf16": {"passes": 16, "type": "XDL", "output_size": 32},
+    "v_mfma_f32_16x16x4_4b_bf16": {"passes": 8, "type": "XDL", "output_size": 16},
+    "v_mfma_f32_4x4x4_16b_bf16": {"passes": 2, "type": "XDL", "output_size": 4},
+    "v_mfma_f32_32x32x8_bf16": {"passes": 8, "type": "XDL", "output_size": 16},
+    "v_mfma_f32_16x16x16_bf16": {"passes": 4, "type": "XDL", "output_size": 4},
+    
+    "v_mfma_f32_16x16x8_xf32": {"passes": 4, "type": "XDL", "output_size": 4},
+    "v_mfma_f32_32x32x4_xf32": {"passes": 8, "type": "XDL", "output_size": 16},
+    
+    "v_mfma_f32_32x32x16_bf8_bf8": {"passes": 8, "type": "XDL", "output_size": 16},
+    "v_mfma_f32_32x32x16_bf8_fp8": {"passes": 8, "type": "XDL", "output_size": 16},
+    "v_mfma_f32_32x32x16_fp8_bf8": {"passes": 8, "type": "XDL", "output_size": 16},
+    "v_mfma_f32_32x32x16_fp8_fp8": {"passes": 8, "type": "XDL", "output_size": 16},
+    "v_mfma_f32_16x16x32_bf8_bf8": {"passes": 4, "type": "XDL", "output_size": 4},
+    "v_mfma_f32_16x16x32_bf8_fp8": {"passes": 4, "type": "XDL", "output_size": 4},
+    "v_mfma_f32_16x16x32_fp8_bf8": {"passes": 4, "type": "XDL", "output_size": 4},
+    "v_mfma_f32_16x16x32_fp8_fp8": {"passes": 4, "type": "XDL", "output_size": 4},
+    
+    "v_mfma_f64_16x16x4_f64": {"passes": 8, "type": "DGEMM", "output_size": 8},
+    "v_mfma_f64_4x4x4_4b_f64": {"passes": 4, "type": "DGEMM", "output_size": 2}
+  },
+  
+  "latency_rules": {
+    "description": "Latency rules from Table 37 (VOP3P-Matrix Opcodes Required NOPs)",
+    
+    "non_dlops_valu_to_mfma": {
+      "description": "Non-DLops VALU Write VGPR -> V_MFMA* read VGPR",
+      "latency": 2,
+      "comment": "No internal 4 & 8 cycle forwarding path"
+    },
+    
+    "dlops_same_opcode_srcc_forwarding": {
+      "description": "DLops Write VGPR -> Same DLops read VGPR as SrcC",
+      "latency": 0,
+      "comment": "Supports same opcode DLops back-to-back SrcC forwarding for accumulation"
+    },
+    
+    "dlops_same_opcode_srcab": {
+      "description": "DLops Write VGPR -> Same DLops read VGPR as SrcA/B",
+      "latency": 3,
+      "comment": "Does not support SrcA/B forwarding in DLops"
+    },
+    
+    "dlops_different_opcode": {
+      "description": "DLops Write VGPR -> Different opcode read/write VGPR (RAW + WAW)",
+      "latency": 3,
+      "comment": "Disable all forwarding path from DLops to normal VALU/VM/LDS/FLAT ops"
+    },
+    
+    "xdl_to_srcc_exact_same": {
+      "description": "XDL/V_SMFMA* Write VGPR -> XDL read VGPR as SrcC exactly same with 1st vDst",
+      "latency_by_passes": {
+        "2": 2,
+        "4": 0,
+        "8": 0,
+        "16": 0
+      },
+      "comment": "The two V_MFMA must be the same number passes and vDst/vSrc same offset"
+    },
+    
+    "xdl_to_srcc_overlapped": {
+      "description": "XDL/V_SMFMA* Write VGPR -> XDL read VGPR as SrcC overlapped with 1st vDst",
+      "latency_by_passes": {
+        "2": 3,
+        "4": 5,
+        "8": 9,
+        "16": 17
+      },
+      "comment": "Overlapped with XDL"
+    },
+    
+    "xdl_to_sgemm_dgemm_srcc": {
+      "description": "XDL/V_SMFMA* Write VGPR -> S/DGEMM read VGPR as SrcC",
+      "latency_by_passes": {
+        "2": 3,
+        "4": 5,
+        "8": 9,
+        "16": 17
+      },
+      "comment": "Overlapped with S/DGEMM"
+    },
+    
+    "xdl_to_mfma_srcab": {
+      "description": "XDL/V_SMFMA* Write VGPR -> V_MFMA read VGPR as SrcA or SrcB",
+      "latency_by_passes": {
+        "2": 5,
+        "4": 7,
+        "8": 11,
+        "16": 19
+      },
+      "comment": "No internal forwarding path waits for previous V_MFMA commit result to VGPR"
+    },
+    
+    "xdl_to_valu_vm_lds_flat": {
+      "description": "XDL/V_SMFMA* Write VGPR -> VM/L/GDS/FLAT/Export Read VGPR or VALU read/write VGPR (RAW + WAW)",
+      "latency_by_passes": {
+        "2": 5,
+        "4": 7,
+        "8": 11,
+        "16": 19
+      },
+      "comment": "Includes v_accvgpr_read which is VALU read"
+    },
+    
+    "sgemm_to_srcc_exact_same": {
+      "description": "SGEMM Write VGPR -> XDL read VGPR as SrcC exactly same with 1st vDst",
+      "latency_by_passes": {
+        "2": 0,
+        "4": 0,
+        "8": 0,
+        "16": 0
+      },
+      "comment": "The two V_MFMA must be the same number passes"
+    },
+    
+    "sgemm_to_srcc_overlapped": {
+      "description": "SGEMM Write VGPR -> XDL read VGPR as SrcC overlapped with 1st vDst",
+      "latency_by_passes": {
+        "2": 2,
+        "4": 4,
+        "8": 8,
+        "16": 16
+      },
+      "comment": "Overlapped with XDL"
+    },
+    
+    "sgemm_to_sgemm_dgemm_srcc": {
+      "description": "SGEMM Write VGPR -> S/DGEMM read VGPR as SrcC",
+      "latency_by_passes": {
+        "2": 2,
+        "4": 4,
+        "8": 8,
+        "16": 16
+      },
+      "comment": "Overlapped with S/DGEMM"
+    },
+    
+    "sgemm_to_mfma_srcab": {
+      "description": "SGEMM Write VGPR -> V_MFMA read VGPR as SrcA or SrcB",
+      "latency_by_passes": {
+        "2": 4,
+        "4": 6,
+        "8": 10,
+        "16": 18
+      },
+      "comment": "No internal forwarding path"
+    },
+    
+    "sgemm_to_valu_vm_lds_flat": {
+      "description": "SGEMM Write VGPR -> VM/L/GDS/FLAT/Export Read VGPR or VALU read/write VGPR (RAW + WAW)",
+      "latency_by_passes": {
+        "2": 4,
+        "4": 6,
+        "8": 10,
+        "16": 18
+      },
+      "comment": "Includes v_accvgpr_read which is VALU read"
+    },
+    
+    "dgemm_16x16x4_to_same_srcc": {
+      "description": "V_MFMA_16x16x4_F64 Write VGPR -> V_MFMA_16x16x4_F64 read SrcC exactly same",
+      "latency": 0,
+      "comment": "The two V_MFMA must be the same number passes"
+    },
+    
+    "dgemm_16x16x4_to_srcc_overlapped": {
+      "description": "V_MFMA_16x16x4_F64 Write VGPR -> S/DGEMM read SrcC overlapped",
+      "latency": 9,
+      "comment": "Overlapped, different VGPR access sequence"
+    },
+    
+    "dgemm_16x16x4_to_xdl_srcc": {
+      "description": "V_MFMA_16x16x4_F64 Write VGPR -> XDL read SrcC overlapped",
+      "latency": 0
+    },
+    
+    "dgemm_16x16x4_to_srcab": {
+      "description": "V_MFMA_16x16x4_F64 Write VGPR -> read VGPR as SrcA or SrcB",
+      "latency": 11,
+      "comment": "No internal forwarding path"
+    },
+    
+    "dgemm_16x16x4_to_valu": {
+      "description": "V_MFMA_16x16x4_F64 Write VGPR -> VALU read/write VGPR (RAW + WAW)",
+      "latency": 11
+    },
+    
+    "dgemm_16x16x4_to_vm_lds_flat": {
+      "description": "V_MFMA_16x16x4_F64 Write VGPR -> VM/L/GDS/FLAT/Export Read VGPR",
+      "latency": 18,
+      "comment": "No internal forwarding path"
+    },
+    
+    "dgemm_4x4x4_to_same_srcc": {
+      "description": "V_MFMA_4x4x4_F64 Write VGPR -> V_MFMA_4x4x4_F64 read SrcC exactly same",
+      "latency": 4,
+      "comment": "4x4x4 needs accumulation, write VGPR is later than normal XDL 4x4x4"
+    },
+    
+    "dgemm_4x4x4_to_srcc_overlapped": {
+      "description": "V_MFMA_4x4x4_F64 Write VGPR -> S/DGEMM read SrcC overlapped",
+      "latency": 4
+    },
+    
+    "dgemm_4x4x4_to_xdl_srcc": {
+      "description": "V_MFMA_4x4x4_F64 Write VGPR -> XDL read SrcC overlapped",
+      "latency": 0
+    },
+    
+    "dgemm_4x4x4_to_srcab": {
+      "description": "V_MFMA_4x4x4_F64 Write VGPR -> read VGPR as SrcA or SrcB",
+      "latency": 6,
+      "comment": "No internal forwarding path"
+    },
+    
+    "dgemm_4x4x4_to_valu": {
+      "description": "V_MFMA_4x4x4_F64 Write VGPR -> VALU read/write VGPR (RAW + WAW)",
+      "latency": 6
+    },
+    
+    "dgemm_4x4x4_to_vm_lds_flat": {
+      "description": "V_MFMA_4x4x4_F64 Write VGPR -> VM/L/GDS/FLAT/Export Read VGPR",
+      "latency": 9,
+      "comment": "No internal forwarding path"
+    },
+    
+    "vcmpx_to_mfma": {
+      "description": "V_CMPX* write EXEC MASK -> V_MFMA*",
+      "latency": 4,
+      "comment": "CDNA doesn't support execution mask forwarding with XDL/DGEMM"
+    },
+    
+    "mfma_srcc_to_valu_war": {
+      "description": "XDL/SMFMA Read VGPR SrcC -> VALU write VGPR (WAR) Co-Execution Anti-Dependency",
+      "latency_by_passes": {
+        "2": 1,
+        "4": 3,
+        "8": 7,
+        "16": 15
+      },
+      "comment": "For overlapping with 1st SrcC"
+    }
+  },
+  
+  "instruction_cycles": {
+    "description": "Cycle costs for instruction scheduling",
+    "patterns": {
+      "v_mfma_*": 16,
+      "ds_swizzle_*": 8,
+      "ds_write_*": 8,
+      "ds_read_*": 8,
+      "v_exp_*": 16,
+      "global_load_*": 4,
+      "global_store_*": 4,
+      "buffer_load_*": 4,
+      "buffer_store_*": 4,
+      "s_load_*": 4,
+      "s_waitcnt": 1,
+      "s_barrier": 1,
+      "s_nop": 1
+    },
+    "default": 4
+  },
+  
+  "snop_info": {
+    "description": "s_nop instruction information",
+    "max_count": 15,
+    "syntax": "s_nop {count}",
+    "comment": "s_nop N waits for N+1 cycles. s_nop 0 = 1 cycle wait."
+  },
+  
+  "instruction_categories": {
+    "mfma": ["v_mfma_*"],
+    "accvgpr_read": ["v_accvgpr_read_*"],
+    "accvgpr_write": ["v_accvgpr_write_*"],
+    "valu": ["v_*"],
+    "salu": ["s_*"],
+    "vm_load": ["global_load_*", "buffer_load_*", "flat_load_*"],
+    "vm_store": ["global_store_*", "buffer_store_*", "flat_store_*"],
+    "lds": ["ds_*"],
+    "smem": ["s_load_*", "s_store_*"],
+    "export": ["exp_*"]
+  }
+}
+

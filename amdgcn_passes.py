@@ -49,6 +49,21 @@ from amdgcn_ddg import (
     EXEC_WRITERS,
     EXEC_READERS,
 )
+from amdgcn_latency import (
+    load_hardware_info,
+    get_instruction_cycles as get_instruction_cycles_from_config,
+    is_mfma_instruction,
+    get_mfma_dst_registers,
+    get_instruction_src_registers,
+    check_register_overlap,
+    get_required_latency,
+    check_move_preserves_latency,
+    check_move_side_effects_on_latency,
+    calculate_latency_nops_for_move,
+    insert_latency_nops,
+    LatencyNopsResult,
+    InsertLatencyNopsPass,
+)
 
 
 # =============================================================================
@@ -612,11 +627,13 @@ def get_instruction_cycles(opcode: str) -> int:
     """
     Get the number of cycles required to issue an instruction.
     
-    Cycle costs:
+    This function delegates to the JSON-based configuration in amdgcn_latency.py.
+    
+    Cycle costs are loaded from gfx942_hardware_info.json:
     - v_mfma_* instructions: 16 cycles
     - ds_swizzle_*, ds_write_* instructions: 8 cycles
     - v_exp_* instructions: 16 cycles
-    - All other instructions: 4 cycles
+    - All other instructions: 4 cycles (default)
     
     Args:
         opcode: The instruction opcode
@@ -624,16 +641,7 @@ def get_instruction_cycles(opcode: str) -> int:
     Returns:
         Number of cycles for the instruction
     """
-    opcode_lower = opcode.lower()
-    
-    if opcode_lower.startswith('v_mfma'):
-        return 16
-    elif opcode_lower.startswith('ds_swizzle') or opcode_lower.startswith('ds_write'):
-        return 8
-    elif opcode_lower.startswith('v_exp'):
-        return 16
-    else:
-        return 4
+    return get_instruction_cycles_from_config(opcode)
 
 
 def update_waitcnt_instruction(
@@ -1076,7 +1084,8 @@ class MoveInstructionPass(Pass):
         cycles: int,
         verbose: bool = False,
         frozen_boundary: int = 0,
-        protected_instructions: Optional[List['Instruction']] = None
+        protected_instructions: Optional[List['Instruction']] = None,
+        auto_insert_nops: bool = True
     ):
         """
         Initialize the pass.
@@ -1090,6 +1099,9 @@ class MoveInstructionPass(Pass):
                             and no instruction can be moved into this region
             protected_instructions: List of instruction objects that should never be moved
                                    (e.g., remaining target instructions when distributing)
+            auto_insert_nops: If True (default), automatically insert s_nop instructions
+                             when a move would violate MFMA latency constraints.
+                             If False, such moves are blocked.
         """
         self.block_label = block_label
         self.instr_index = instr_index
@@ -1097,6 +1109,7 @@ class MoveInstructionPass(Pass):
         self.verbose = verbose
         self.frozen_boundary = frozen_boundary
         self.protected_instructions = protected_instructions or []
+        self.auto_insert_nops = auto_insert_nops
         self._last_result: Optional[MoveResult] = None
         self._total_cycles_moved: int = 0
         # Detailed tracking of why movement stopped (use sets of instruction object IDs to track unique instructions)
@@ -1106,6 +1119,8 @@ class MoveInstructionPass(Pass):
         self._blocked_by_barrier: Set[int] = set()  # Set of id(instruction) blocked by s_barrier
         self._blocked_by_protected: Set[int] = set()  # Set of id(instruction) blocked because protected
         self._no_candidates: bool = False  # No candidate instructions available
+        # Track inserted nops for reporting
+        self._inserted_nops: List[Tuple[int, int]] = []  # [(position, count), ...]
     
     @property
     def name(self) -> str:
@@ -1500,6 +1515,25 @@ class MoveInstructionPass(Pass):
             if instr_b.is_branch or instr_b.is_terminator:
                 return False
         
+        # Check MFMA latency constraints for moving down
+        # If moving MFMA closer to dependent instruction, check distance
+        # Note: We DON'T insert nops here during the check phase - that would modify
+        # the block and invalidate indices. Instead, nops are inserted after the move
+        # by InsertLatencyNopsPass or by using _ensure_latency_after_move.
+        if not check_move_preserves_latency(block, from_idx, to_idx):
+            # If auto_insert_nops is enabled, we allow the move and will fix latency later
+            if not self.auto_insert_nops:
+                return False
+            # Mark that we need to insert nops after this move
+            # (the actual insertion happens in _move_single_instruction_down_impl)
+        
+        # Check side effects: moving this instruction may shift other instructions
+        # and cause them to violate MFMA latency constraints
+        if not check_move_side_effects_on_latency(block, from_idx, to_idx):
+            # If auto_insert_nops is enabled, we allow the move
+            if not self.auto_insert_nops:
+                return False
+        
         return True
     
     def _can_move_single_instruction_up(
@@ -1604,6 +1638,24 @@ class MoveInstructionPass(Pass):
                 all_avail_regs = cross_block_regs | intra_block_regs
                 if all_avail_regs & uses_a:
                     return False
+        
+        # Check MFMA latency constraints
+        # If moving an instruction that reads MFMA output closer to the MFMA,
+        # check that sufficient distance is maintained
+        # Note: We DON'T insert nops here during the check phase - that would modify
+        # the block and invalidate indices. Instead, nops are inserted after all moves
+        # by InsertLatencyNopsPass.
+        if not check_move_preserves_latency(block, from_idx, to_idx):
+            # If auto_insert_nops is enabled, we allow the move and will fix latency later
+            if not self.auto_insert_nops:
+                return False
+        
+        # Check side effects: moving this instruction may shift other instructions
+        # and cause them to violate MFMA latency constraints
+        if not check_move_side_effects_on_latency(block, from_idx, to_idx):
+            # If auto_insert_nops is enabled, we allow the move
+            if not self.auto_insert_nops:
+                return False
         
         return True
     
@@ -3566,7 +3618,8 @@ def distribute_instructions(
     block_label: str,
     target_opcode: str,
     distribute_count: int,
-    verbose: bool = False
+    verbose: bool = False,
+    auto_fix_latency: bool = True
 ) -> bool:
     """
     Convenience function to distribute instructions evenly across a basic block.
@@ -3581,6 +3634,8 @@ def distribute_instructions(
         target_opcode: Exact opcode to match (e.g., "global_load_dwordx4")
         distribute_count: K, number of instructions to distribute evenly
         verbose: Print progress information
+        auto_fix_latency: If True, automatically run InsertLatencyNopsPass after
+                         distribution to fix any MFMA latency violations
         
     Returns:
         True if any changes were made, False otherwise
@@ -3595,6 +3650,11 @@ def distribute_instructions(
     pm = PassManager()
     pm.verbose = verbose
     pm.add_pass(pass_)
+    
+    # Add latency fix pass to ensure MFMA latency constraints are satisfied
+    if auto_fix_latency:
+        pm.add_pass(InsertLatencyNopsPass())
+    
     return pm.run_all(result)
 
 

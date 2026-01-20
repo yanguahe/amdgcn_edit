@@ -912,10 +912,10 @@ def parse_instruction_registers(instr: Instruction) -> Tuple[Set[str], Set[str]]
             dest_regs, _ = parse_operand_registers(operand_list[0])
             defs.update(dest_regs)
             for op in operand_list[1:]:
-                # Skip op_sel modifiers
-                if 'op_sel' in op:
-                    continue
-                src_regs, _ = parse_operand_registers(op)
+                # Strip op_sel modifiers before parsing registers
+                # e.g., "v[38:39] op_sel_hi:[1,0,1]" -> "v[38:39]"
+                op_clean = op.split(' op_sel')[0].strip() if ' op_sel' in op else op
+                src_regs, _ = parse_operand_registers(op_clean)
                 uses.update(src_regs)
         return defs, uses
     
