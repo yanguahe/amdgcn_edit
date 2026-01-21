@@ -21,6 +21,7 @@ from amdgcn_ddg import (
     InstructionNode,
     build_ddg,
     generate_all_ddgs,
+    compute_inter_block_deps,
     parse_instruction_registers,
     AnalysisResult,
 )
@@ -524,7 +525,6 @@ class TestMoveInstructionPass:
         cfg = CFG(name="test")
         cfg.add_block(block)
         ddgs, waitcnt_deps = generate_all_ddgs(cfg)
-        from amdgcn_ddg import compute_inter_block_deps
         inter_block_deps = compute_inter_block_deps(cfg, ddgs)
         result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
         
@@ -539,7 +539,6 @@ class TestMoveInstructionPass:
             create_instruction("v_mov_b32", "v0, 1.0"),
         ]))
         ddgs, waitcnt_deps = generate_all_ddgs(cfg)
-        from amdgcn_ddg import compute_inter_block_deps
         inter_block_deps = compute_inter_block_deps(cfg, ddgs)
         result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
         
@@ -555,7 +554,6 @@ class TestMoveInstructionPass:
             create_instruction("v_mov_b32", "v0, 1.0"),
         ]))
         ddgs, waitcnt_deps = generate_all_ddgs(cfg)
-        from amdgcn_ddg import compute_inter_block_deps
         inter_block_deps = compute_inter_block_deps(cfg, ddgs)
         result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
         
@@ -636,7 +634,6 @@ class TestPassesIntegration:
         parser = AMDGCNParser()
         cfg = parser.parse_file(str(TEST_ASSEMBLY_FILE))
         ddgs, waitcnt_deps = generate_all_ddgs(cfg)
-        from amdgcn_ddg import compute_inter_block_deps
         inter_block_deps = compute_inter_block_deps(cfg, ddgs)
         return AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
 
@@ -756,5 +753,54 @@ class TestPassesEdgeCases:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    import sys
+    
+    class TestResultCollector:
+        """Pytest plugin to collect test results"""
+        def __init__(self):
+            self.passed = 0
+            self.failed = 0
+            self.skipped = 0
+            self.errors = 0
+        
+        def pytest_runtest_logreport(self, report):
+            if report.when == "call":
+                if report.passed:
+                    self.passed += 1
+                elif report.failed:
+                    self.failed += 1
+            elif report.when == "setup" and report.skipped:
+                self.skipped += 1
+            elif report.when == "setup" and report.failed:
+                self.errors += 1
+    
+    collector = TestResultCollector()
+    exit_code = pytest.main([__file__, "-v"], plugins=[collector])
+    
+    print("\n" + "=" * 60)
+    print("Test Summary")
+    print("=" * 60)
+    print(f"  Passed:  {collector.passed}")
+    print(f"  Failed:  {collector.failed}")
+    print(f"  Skipped: {collector.skipped}")
+    print(f"  Errors:  {collector.errors}")
+    print("-" * 60)
+    total = collector.passed + collector.failed + collector.skipped + collector.errors
+    print(f"  Total:   {total}")
+    print("=" * 60)
+    
+    if collector.failed == 0 and collector.errors == 0:
+        print("\n" + "*" * 60)
+        print("*" + " " * 58 + "*")
+        print("*" + "  ✓ ALL TESTS PASSED!  ".center(58) + "*")
+        print("*" + " " * 58 + "*")
+        print("*" * 60 + "\n")
+    else:
+        print("\n" + "!" * 60)
+        print("!" + " " * 58 + "!")
+        print("!" + "  ✗ SOME TESTS FAILED!  ".center(58) + "!")
+        print("!" + " " * 58 + "!")
+        print("!" * 60 + "\n")
+    
+    sys.exit(exit_code)
 

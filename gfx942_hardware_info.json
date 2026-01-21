@@ -297,6 +297,57 @@
     "lds": ["ds_*"],
     "smem": ["s_load_*", "s_store_*"],
     "export": ["exp_*"]
+  },
+  
+  "register_limits": {
+    "description": "Hardware register limits based on AMD Instinct MI300 (CDNA3) ISA documentation",
+    "vgpr": {
+      "prefix": "v",
+      "max_index": 255,
+      "count": 256,
+      "bits_per_reg": 32,
+      "description": "Vector General-Purpose Registers (V0-V255)"
+    },
+    "agpr": {
+      "prefix": "a",
+      "max_index": 255,
+      "count": 256,
+      "bits_per_reg": 32,
+      "description": "Accumulator Vector General-Purpose Registers (AV0-AV255)"
+    },
+    "sgpr": {
+      "prefix": "s",
+      "max_index": 103,
+      "count": 104,
+      "bits_per_reg": 32,
+      "description": "Scalar General-Purpose Registers (S0-S103)"
+    },
+    "special": {
+      "exec": {
+        "bits": 64,
+        "description": "Execute Mask - controls which threads execute vector instructions"
+      },
+      "vcc": {
+        "bits": 64,
+        "description": "Vector Condition Code - result of vector compare operations"
+      },
+      "scc": {
+        "bits": 1,
+        "description": "Scalar Condition Code - result from scalar ALU comparison"
+      },
+      "m0": {
+        "bits": 32,
+        "description": "Memory Register - used for GPR indexing and bounds checking"
+      },
+      "vccz": {
+        "bits": 1,
+        "description": "VCC is zero flag"
+      },
+      "execz": {
+        "bits": 1,
+        "description": "EXEC is zero flag"
+      }
+    }
   }
 }
 

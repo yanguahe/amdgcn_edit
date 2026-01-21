@@ -190,6 +190,9 @@ class CFG:
     header_lines: List[str] = field(default_factory=list)  # Lines before function body
     footer_lines: List[str] = field(default_factory=list)  # Lines after function body
     block_order: List[str] = field(default_factory=list)   # Order of blocks in file
+    # Register analysis results (populated by DDG analysis)
+    register_stats: Optional[Dict[str, Any]] = None  # Register usage statistics
+    fgpr: Optional[Dict[str, Any]] = None  # Free GPR information
     
     def add_block(self, block: BasicBlock):
         self.blocks[block.label] = block
@@ -207,7 +210,7 @@ class CFG:
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize CFG to dictionary."""
-        return {
+        result = {
             'name': self.name,
             'entry_block': self.entry_block,
             'blocks': {label: block.to_dict() for label, block in self.blocks.items()},
@@ -215,6 +218,12 @@ class CFG:
             'footer_lines': self.footer_lines,
             'block_order': self.block_order,
         }
+        # Include register analysis results if available
+        if self.register_stats is not None:
+            result['register_stats'] = self.register_stats
+        if self.fgpr is not None:
+            result['fgpr'] = self.fgpr
+        return result
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'CFG':
@@ -226,6 +235,9 @@ class CFG:
         cfg.block_order = data.get('block_order', [])
         for label, block_data in data.get('blocks', {}).items():
             cfg.blocks[label] = BasicBlock.from_dict(block_data)
+        # Restore register analysis results if available
+        cfg.register_stats = data.get('register_stats')
+        cfg.fgpr = data.get('fgpr')
         return cfg
     
     def to_json(self, filepath: str, indent: int = 2):
@@ -269,7 +281,6 @@ class CFG:
             To avoid this, when keep_debug_labels=False, we also strip all debug sections
             while preserving the .amdgpu_metadata section (required for kernel execution).
         """
-        import re
         # Pattern to match .Ltmp* debug labels (lines that are just the label)
         ltmp_pattern = re.compile(r'^\s*\.Ltmp\d+:\s*$')
         

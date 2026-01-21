@@ -2231,16 +2231,34 @@ class AnalysisResult:
     ddgs: Dict[str, DDG]
     inter_block_deps: List[InterBlockDep]
     waitcnt_deps: List[WaitcntInterBlockDep]
+    # Register analysis results (optional, computed on demand)
+    # Using forward references as these classes are defined later in the file
+    register_stats: Optional['RegisterStatistics'] = None
+    fgpr_info: Optional['FreeGPRInfo'] = None
+    
+    def compute_register_analysis(self):
+        """Compute register statistics and free GPR info."""
+        self.register_stats = compute_register_statistics(self.ddgs)
+        self.fgpr_info = compute_fgpr(self.register_stats)
+        # Also store in CFG for persistence
+        self.cfg.register_stats = self.register_stats.to_dict()
+        self.cfg.fgpr = self.fgpr_info.to_dict()
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize analysis result to dictionary."""
-        return {
+        result = {
             'version': '1.0',
             'cfg': self.cfg.to_dict(),
             'ddgs': {label: ddg.to_dict() for label, ddg in self.ddgs.items()},
             'inter_block_deps': [dep.to_dict() for dep in self.inter_block_deps],
             'waitcnt_deps': [dep.to_dict() for dep in self.waitcnt_deps],
         }
+        # Include register analysis if computed
+        if self.register_stats is not None:
+            result['register_stats'] = self.register_stats.to_dict()
+        if self.fgpr_info is not None:
+            result['fgpr'] = self.fgpr_info.to_dict()
+        return result
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'AnalysisResult':
@@ -2267,11 +2285,21 @@ class AnalysisResult:
             WaitcntInterBlockDep.from_dict(d) for d in data.get('waitcnt_deps', [])
         ]
         
+        # Restore register analysis if available
+        register_stats = None
+        fgpr_info = None
+        if 'register_stats' in data:
+            register_stats = RegisterStatistics.from_dict(data['register_stats'])
+        if 'fgpr' in data:
+            fgpr_info = FreeGPRInfo.from_dict(data['fgpr'])
+        
         return cls(
             cfg=cfg,
             ddgs=ddgs,
             inter_block_deps=inter_block_deps,
             waitcnt_deps=waitcnt_deps,
+            register_stats=register_stats,
+            fgpr_info=fgpr_info,
         )
     
     def to_amdgcn(self, filepath: str, keep_debug_labels: bool = False):
@@ -2336,7 +2364,8 @@ def save_analysis_to_json(
     inter_block_deps: List[InterBlockDep],
     waitcnt_deps: List[WaitcntInterBlockDep],
     filepath: str,
-    indent: int = 2
+    indent: int = 2,
+    compute_fgpr_analysis: bool = True
 ):
     """
     Save complete analysis result to JSON file.
@@ -2348,6 +2377,7 @@ def save_analysis_to_json(
         waitcnt_deps: Cross-block waitcnt dependencies
         filepath: Output JSON file path
         indent: JSON indentation level (default 2, use None for compact)
+        compute_fgpr_analysis: Whether to compute and include register/FGPR analysis
     """
     result = AnalysisResult(
         cfg=cfg,
@@ -2355,6 +2385,10 @@ def save_analysis_to_json(
         inter_block_deps=inter_block_deps,
         waitcnt_deps=waitcnt_deps,
     )
+    
+    # Compute register analysis (including FGPR) if requested
+    if compute_fgpr_analysis:
+        result.compute_register_analysis()
     
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=indent, ensure_ascii=False)
@@ -2592,7 +2626,302 @@ def print_ddg_stats(ddgs: Dict[str, DDG]):
     print(f"Total AVAIL dependencies (from s_waitcnt): {total_avail}")
     print(f"Total LGKM operations (s_load, ds_*): {total_lgkm_ops}")
     print(f"Total VM operations (buffer_load, global_load): {total_vm_ops}")
+    
+    # Compute and print register statistics
+    print("\n" + "-" * 70)
+    print("Register Usage Statistics")
+    print("-" * 70)
+    
+    stats = compute_register_statistics(ddgs)
+    fgpr_info = compute_fgpr(stats)
+    
+    # Helper function to format register list
+    def format_reg_list(regs: Set[str], prefix: str) -> str:
+        if not regs:
+            return "none"
+        sorted_regs = sorted(regs, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0)
+        if len(sorted_regs) <= 20:
+            return ", ".join(sorted_regs)
+        else:
+            return ", ".join(sorted_regs[:10]) + f" ... (+{len(sorted_regs)-10} more)"
+    
+    # VGPR statistics
+    print(f"\nVGPR (Vector GPR):")
+    print(f"  Used count: {len(stats.vgpr_used)}")
+    print(f"  Max index:  v{stats.vgpr_max_index}" if stats.vgpr_max_index >= 0 else "  Max index:  N/A")
+    scatt_v_str = format_reg_list(fgpr_info.scatt_fgpr_v, "v")
+    print(f"  Scattered free (within v0-v{stats.vgpr_max_index}): {len(fgpr_info.scatt_fgpr_v)} [{scatt_v_str}]")
+    print(f"  Total free (up to v255): {len(fgpr_info.fgpr_v)}")
+    
+    # AGPR statistics
+    print(f"\nAGPR (Accumulator GPR):")
+    print(f"  Used count: {len(stats.agpr_used)}")
+    print(f"  Max index:  a{stats.agpr_max_index}" if stats.agpr_max_index >= 0 else "  Max index:  N/A")
+    scatt_a_str = format_reg_list(fgpr_info.scatt_fgpr_a, "a")
+    print(f"  Scattered free (within a0-a{stats.agpr_max_index}): {len(fgpr_info.scatt_fgpr_a)} [{scatt_a_str}]")
+    print(f"  Total free (up to a255): {len(fgpr_info.fgpr_a)}")
+    
+    # SGPR statistics
+    print(f"\nSGPR (Scalar GPR):")
+    print(f"  Used count: {len(stats.sgpr_used)}")
+    print(f"  Max index:  s{stats.sgpr_max_index}" if stats.sgpr_max_index >= 0 else "  Max index:  N/A")
+    scatt_s_str = format_reg_list(fgpr_info.scatt_fgpr_s, "s")
+    print(f"  Scattered free (within s0-s{stats.sgpr_max_index}): {len(fgpr_info.scatt_fgpr_s)} [{scatt_s_str}]")
+    print(f"  Total free (up to s103): {len(fgpr_info.fgpr_s)}")
+    
+    # Special registers
+    print(f"\nSpecial Registers:")
+    print(f"  exec: {'Used' if stats.uses_exec else 'Not used'}")
+    print(f"  vcc:  {'Used' if stats.uses_vcc else 'Not used'}")
+    print(f"  scc:  {'Used' if stats.uses_scc else 'Not used'}")
+    print(f"  m0:   {'Used' if stats.uses_m0 else 'Not used'}")
+    
+    # Summary
+    print("\n" + "-" * 70)
+    print("Free GPR Summary")
+    print("-" * 70)
+    print(f"ScattFGPR (scattered free within used range):")
+    print(f"  VGPR: {len(fgpr_info.scatt_fgpr_v)}, AGPR: {len(fgpr_info.scatt_fgpr_a)}, SGPR: {len(fgpr_info.scatt_fgpr_s)}")
+    print(f"FGPR (total free up to hardware limits):")
+    print(f"  VGPR: {len(fgpr_info.fgpr_v)}, AGPR: {len(fgpr_info.fgpr_a)}, SGPR: {len(fgpr_info.fgpr_s)}")
+    
     print("=" * 70 + "\n")
+
+
+def load_hardware_info() -> Dict[str, Any]:
+    """Load hardware info from JSON file."""
+    hw_info_path = Path(__file__).parent / "gfx942_hardware_info.json"
+    if hw_info_path.exists():
+        with open(hw_info_path, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+@dataclass
+class RegisterStatistics:
+    """Statistics about register usage across all DDGs."""
+    # VGPR statistics
+    vgpr_used: Set[str] = field(default_factory=set)
+    vgpr_max_index: int = -1
+    
+    # AGPR statistics
+    agpr_used: Set[str] = field(default_factory=set)
+    agpr_max_index: int = -1
+    
+    # SGPR statistics (excludes special registers)
+    sgpr_used: Set[str] = field(default_factory=set)
+    sgpr_max_index: int = -1
+    
+    # Special registers
+    uses_exec: bool = False
+    uses_vcc: bool = False
+    uses_scc: bool = False
+    uses_m0: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary."""
+        return {
+            'vgpr': {
+                'used_count': len(self.vgpr_used),
+                'max_index': self.vgpr_max_index,
+                'used_set': sorted(self.vgpr_used, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0)
+            },
+            'agpr': {
+                'used_count': len(self.agpr_used),
+                'max_index': self.agpr_max_index,
+                'used_set': sorted(self.agpr_used, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0)
+            },
+            'sgpr': {
+                'used_count': len(self.sgpr_used),
+                'max_index': self.sgpr_max_index,
+                'used_set': sorted(self.sgpr_used, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0)
+            },
+            'special': {
+                'exec': self.uses_exec,
+                'vcc': self.uses_vcc,
+                'scc': self.uses_scc,
+                'm0': self.uses_m0
+            }
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'RegisterStatistics':
+        """Deserialize from dictionary."""
+        stats = cls()
+        if 'vgpr' in data:
+            stats.vgpr_used = set(data['vgpr'].get('used_set', []))
+            stats.vgpr_max_index = data['vgpr'].get('max_index', -1)
+        if 'agpr' in data:
+            stats.agpr_used = set(data['agpr'].get('used_set', []))
+            stats.agpr_max_index = data['agpr'].get('max_index', -1)
+        if 'sgpr' in data:
+            stats.sgpr_used = set(data['sgpr'].get('used_set', []))
+            stats.sgpr_max_index = data['sgpr'].get('max_index', -1)
+        if 'special' in data:
+            stats.uses_exec = data['special'].get('exec', False)
+            stats.uses_vcc = data['special'].get('vcc', False)
+            stats.uses_scc = data['special'].get('scc', False)
+            stats.uses_m0 = data['special'].get('m0', False)
+        return stats
+
+
+@dataclass
+class FreeGPRInfo:
+    """Information about free (unused) GPRs."""
+    # Scattered free GPRs (within used range)
+    scatt_fgpr_v: Set[str] = field(default_factory=set)
+    scatt_fgpr_a: Set[str] = field(default_factory=set)
+    scatt_fgpr_s: Set[str] = field(default_factory=set)
+    
+    # Full free GPRs (scattered + beyond max used)
+    fgpr_v: Set[str] = field(default_factory=set)
+    fgpr_a: Set[str] = field(default_factory=set)
+    fgpr_s: Set[str] = field(default_factory=set)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary."""
+        return {
+            'scattered_free': {
+                'vgpr': sorted(self.scatt_fgpr_v, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0),
+                'agpr': sorted(self.scatt_fgpr_a, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0),
+                'sgpr': sorted(self.scatt_fgpr_s, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0),
+                'vgpr_count': len(self.scatt_fgpr_v),
+                'agpr_count': len(self.scatt_fgpr_a),
+                'sgpr_count': len(self.scatt_fgpr_s)
+            },
+            'full_free': {
+                'vgpr': sorted(self.fgpr_v, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0),
+                'agpr': sorted(self.fgpr_a, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0),
+                'sgpr': sorted(self.fgpr_s, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0),
+                'vgpr_count': len(self.fgpr_v),
+                'agpr_count': len(self.fgpr_a),
+                'sgpr_count': len(self.fgpr_s)
+            }
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'FreeGPRInfo':
+        """Deserialize from dictionary."""
+        info = cls()
+        if 'scattered_free' in data:
+            info.scatt_fgpr_v = set(data['scattered_free'].get('vgpr', []))
+            info.scatt_fgpr_a = set(data['scattered_free'].get('agpr', []))
+            info.scatt_fgpr_s = set(data['scattered_free'].get('sgpr', []))
+        if 'full_free' in data:
+            info.fgpr_v = set(data['full_free'].get('vgpr', []))
+            info.fgpr_a = set(data['full_free'].get('agpr', []))
+            info.fgpr_s = set(data['full_free'].get('sgpr', []))
+        return info
+
+
+def compute_register_statistics(ddgs: Dict[str, DDG]) -> RegisterStatistics:
+    """
+    Compute register usage statistics across all DDGs.
+    
+    Args:
+        ddgs: Dictionary of DDGs for each block
+        
+    Returns:
+        RegisterStatistics containing used registers and max indices
+    """
+    stats = RegisterStatistics()
+    
+    for label, ddg in ddgs.items():
+        for node in ddg.nodes:
+            # Collect all registers from defs and uses
+            all_regs = node.defs | node.uses | node.available_regs
+            
+            for reg in all_regs:
+                reg_lower = reg.lower()
+                
+                # Check for special registers first
+                if reg_lower == 'exec':
+                    stats.uses_exec = True
+                elif reg_lower == 'vcc':
+                    stats.uses_vcc = True
+                elif reg_lower == 'scc':
+                    stats.uses_scc = True
+                elif reg_lower == 'm0':
+                    stats.uses_m0 = True
+                # VGPR: v0, v1, ...
+                elif reg_lower.startswith('v') and len(reg_lower) > 1:
+                    try:
+                        idx = int(reg_lower[1:])
+                        stats.vgpr_used.add(reg_lower)
+                        stats.vgpr_max_index = max(stats.vgpr_max_index, idx)
+                    except ValueError:
+                        pass  # Not a valid VGPR
+                # AGPR: a0, a1, ...
+                elif reg_lower.startswith('a') and len(reg_lower) > 1:
+                    try:
+                        idx = int(reg_lower[1:])
+                        stats.agpr_used.add(reg_lower)
+                        stats.agpr_max_index = max(stats.agpr_max_index, idx)
+                    except ValueError:
+                        pass  # Not a valid AGPR
+                # SGPR: s0, s1, ...
+                elif reg_lower.startswith('s') and len(reg_lower) > 1:
+                    try:
+                        idx = int(reg_lower[1:])
+                        stats.sgpr_used.add(reg_lower)
+                        stats.sgpr_max_index = max(stats.sgpr_max_index, idx)
+                    except ValueError:
+                        pass  # Not a valid SGPR (might be 'scc')
+    
+    return stats
+
+
+def compute_fgpr(stats: RegisterStatistics, hw_info: Optional[Dict[str, Any]] = None) -> FreeGPRInfo:
+    """
+    Compute free (unused) GPRs based on register statistics and hardware limits.
+    
+    Args:
+        stats: Register usage statistics
+        hw_info: Hardware info dictionary (loaded from JSON if not provided)
+        
+    Returns:
+        FreeGPRInfo containing scattered free and full free GPR sets
+    """
+    if hw_info is None:
+        hw_info = load_hardware_info()
+    
+    fgpr_info = FreeGPRInfo()
+    
+    # Get hardware limits (defaults if not in JSON)
+    reg_limits = hw_info.get('register_limits', {})
+    vgpr_max = reg_limits.get('vgpr', {}).get('max_index', 255)
+    agpr_max = reg_limits.get('agpr', {}).get('max_index', 255)
+    sgpr_max = reg_limits.get('sgpr', {}).get('max_index', 103)
+    
+    # Compute scattered free VGPRs (within used range)
+    if stats.vgpr_max_index >= 0:
+        all_vgpr_in_range = {f"v{i}" for i in range(stats.vgpr_max_index + 1)}
+        fgpr_info.scatt_fgpr_v = all_vgpr_in_range - stats.vgpr_used
+    
+    # Compute scattered free AGPRs (within used range)
+    if stats.agpr_max_index >= 0:
+        all_agpr_in_range = {f"a{i}" for i in range(stats.agpr_max_index + 1)}
+        fgpr_info.scatt_fgpr_a = all_agpr_in_range - stats.agpr_used
+    
+    # Compute scattered free SGPRs (within used range)
+    if stats.sgpr_max_index >= 0:
+        all_sgpr_in_range = {f"s{i}" for i in range(stats.sgpr_max_index + 1)}
+        fgpr_info.scatt_fgpr_s = all_sgpr_in_range - stats.sgpr_used
+    
+    # Compute full free GPRs (scattered + beyond max used up to hardware limit)
+    # Full free VGPRs
+    all_vgpr_hw = {f"v{i}" for i in range(vgpr_max + 1)}
+    fgpr_info.fgpr_v = all_vgpr_hw - stats.vgpr_used
+    
+    # Full free AGPRs
+    all_agpr_hw = {f"a{i}" for i in range(agpr_max + 1)}
+    fgpr_info.fgpr_a = all_agpr_hw - stats.agpr_used
+    
+    # Full free SGPRs
+    all_sgpr_hw = {f"s{i}" for i in range(sgpr_max + 1)}
+    fgpr_info.fgpr_s = all_sgpr_hw - stats.sgpr_used
+    
+    return fgpr_info
 
 
 def print_inter_block_deps(inter_deps: List[InterBlockDep]):

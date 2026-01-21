@@ -35,6 +35,8 @@ from amdgcn_ddg import (
     PendingMemOp,
     parse_instruction_registers,
     build_ddg,
+    generate_all_ddgs,
+    compute_inter_block_deps,
     is_lgkm_op,
     is_vm_op,
     SCC_WRITERS,
@@ -49,6 +51,7 @@ from amdgcn_ddg import (
     EXEC_WRITERS,
     EXEC_READERS,
 )
+from amdgcn_verify import build_global_ddg, verify_optimization
 from amdgcn_latency import (
     load_hardware_info,
     get_instruction_cycles as get_instruction_cycles_from_config,
@@ -156,8 +159,6 @@ class PassManager:
     
     def _rebuild_ddgs(self, result: AnalysisResult) -> None:
         """Rebuild all DDGs after instruction modifications."""
-        from amdgcn_ddg import generate_all_ddgs, compute_inter_block_deps
-        
         # Rebuild DDGs
         new_ddgs, waitcnt_deps = generate_all_ddgs(result.cfg, enable_cross_block_waitcnt=True)
         result.ddgs = new_ddgs
@@ -1172,9 +1173,6 @@ class MoveInstructionPass(Pass):
         Raises:
             SchedulingVerificationError: If the optimization violates any dependency constraints.
         """
-        # Import verification module
-        from amdgcn_verify import build_global_ddg, verify_optimization
-        
         # Validate block exists
         if self.block_label not in result.cfg.blocks:
             self._last_result = MoveResult(
@@ -3386,9 +3384,6 @@ class DistributeInstructionPass(Pass):
         Raises:
             SchedulingVerificationError: If the optimization violates any dependency constraints.
         """
-        # Import verification module
-        from amdgcn_verify import build_global_ddg, verify_optimization
-        
         # Validate block exists
         if self.block_label not in result.cfg.blocks:
             if self.verbose:

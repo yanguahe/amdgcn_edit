@@ -81,6 +81,7 @@ from amdgcn_latency import (
     validate_block_latency,
     check_move_preserves_latency,
 )
+from amdgcn_passes import MoveInstructionPass
 
 
 # =============================================================================
@@ -1117,7 +1118,6 @@ class TestCalculateLatencyNopsForMove(unittest.TestCase):
     """Tests for calculate_latency_nops_for_move function."""
     
     def setUp(self):
-        from amdgcn_latency import calculate_latency_nops_for_move, LatencyNopsResult
         self.calculate_nops = calculate_latency_nops_for_move
         self.hw_info = load_hardware_info()
     
@@ -1240,7 +1240,6 @@ class TestInsertLatencyNops(unittest.TestCase):
     """Tests for insert_latency_nops function."""
     
     def setUp(self):
-        from amdgcn_latency import insert_latency_nops
         self.insert_nops = insert_latency_nops
     
     def test_insert_small_nop_count(self):
@@ -1322,8 +1321,6 @@ class TestMoveInstructionPassAutoInsertNops(unittest.TestCase):
     """Tests for MoveInstructionPass with auto_insert_nops feature."""
     
     def setUp(self):
-        from amdgcn_passes import MoveInstructionPass
-        from amdgcn_ddg import generate_all_ddgs
         self.MoveInstructionPass = MoveInstructionPass
         self.generate_ddgs = generate_all_ddgs
         self.hw_info = load_hardware_info()
@@ -1489,8 +1486,6 @@ class TestAutoInsertNopsEdgeCases(unittest.TestCase):
     
     def test_move_immediately_after_mfma(self):
         """Test moving reader to immediately after MFMA."""
-        from amdgcn_latency import calculate_latency_nops_for_move
-        
         block = BasicBlock(label=".test")
         
         mfma = create_mfma_instruction(dst="a[0:3]", address=0)
@@ -1512,8 +1507,6 @@ class TestAutoInsertNopsEdgeCases(unittest.TestCase):
     
     def test_multiple_mfma_readers(self):
         """Test block with multiple MFMA outputs being read."""
-        from amdgcn_latency import calculate_latency_nops_for_move
-        
         block = BasicBlock(label=".test")
         
         mfma1 = create_mfma_instruction(dst="a[0:3]", address=0)
@@ -1537,8 +1530,6 @@ class TestAutoInsertNopsEdgeCases(unittest.TestCase):
     
     def test_chained_mfma_accumulator_no_nops(self):
         """Test chained MFMA with accumulator forwarding needs no nops."""
-        from amdgcn_latency import calculate_latency_nops_for_move
-        
         block = BasicBlock(label=".test")
         
         mfma1 = create_mfma_instruction(
@@ -1566,8 +1557,6 @@ class TestAutoInsertNopsEdgeCases(unittest.TestCase):
     
     def test_8pass_mfma_nops(self):
         """Test 8-pass MFMA requires 11 independent instructions."""
-        from amdgcn_latency import calculate_latency_nops_for_move
-        
         block = BasicBlock(label=".test")
         
         mfma = create_mfma_instruction(
@@ -1596,6 +1585,41 @@ class TestAutoInsertNopsEdgeCases(unittest.TestCase):
 # =============================================================================
 
 if __name__ == '__main__':
-    # Run tests with verbosity
-    unittest.main(verbosity=2)
+    # Create test suite
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromModule(sys.modules[__name__])
+    
+    # Run tests and collect results
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    
+    # Print test results summary
+    passed = result.testsRun - len(result.failures) - len(result.errors) - len(result.skipped)
+    
+    print("\n" + "=" * 60)
+    print("Test Summary")
+    print("=" * 60)
+    print(f"  Passed:  {passed}")
+    print(f"  Failed:  {len(result.failures)}")
+    print(f"  Skipped: {len(result.skipped)}")
+    print(f"  Errors:  {len(result.errors)}")
+    print("-" * 60)
+    print(f"  Total:   {result.testsRun}")
+    print("=" * 60)
+    
+    if result.wasSuccessful():
+        print("\n" + "*" * 60)
+        print("*" + " " * 58 + "*")
+        print("*" + "  ✓ ALL TESTS PASSED!  ".center(58) + "*")
+        print("*" + " " * 58 + "*")
+        print("*" * 60 + "\n")
+    else:
+        print("\n" + "!" * 60)
+        print("!" + " " * 58 + "!")
+        print("!" + "  ✗ SOME TESTS FAILED!  ".center(58) + "!")
+        print("!" + " " * 58 + "!")
+        print("!" * 60 + "\n")
+    
+    # Return appropriate exit code
+    sys.exit(0 if result.wasSuccessful() else 1)
 

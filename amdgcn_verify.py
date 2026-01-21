@@ -28,6 +28,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Set, Optional, Tuple, Any
 from pathlib import Path
 
+from amdgcn_cfg import AMDGCNParser
+from amdgcn_ddg import generate_all_ddgs, is_vm_op, is_lgkm_op
+
 
 # =============================================================================
 # Exceptions
@@ -600,7 +603,6 @@ def verify_optimization(
     # - For each instruction that uses memory operation results (RAW dependency on mem op)
     # - There should be a s_waitcnt before it that has the needed registers in available_regs
     
-    from amdgcn_ddg import generate_all_ddgs, is_vm_op, is_lgkm_op
     optimized_ddgs, _ = generate_all_ddgs(optimized_cfg, enable_cross_block_waitcnt=False)
     
     for block_label, ddg in optimized_ddgs.items():
@@ -755,10 +757,6 @@ def compare_before_after(original_path: str, optimized_path: str, verbose: bool 
     Returns:
         True if verification passed, False otherwise
     """
-    # Import here to avoid circular imports
-    from amdgcn_cfg import AMDGCNParser
-    from amdgcn_ddg import generate_all_ddgs
-    
     if verbose:
         print(f"=== AMDGCN Scheduling Verification ===")
         print(f"Original: {original_path}")
