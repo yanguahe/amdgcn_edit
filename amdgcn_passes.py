@@ -3654,6 +3654,449 @@ def distribute_instructions(
 
 
 # =============================================================================
+# Register Replace Pass
+# =============================================================================
+
+@dataclass
+class RegisterSegment:
+    """Represents a contiguous segment of registers."""
+    prefix: str  # 'v', 'a', or 's'
+    start: int   # Starting index
+    count: int   # Number of registers
+    
+    def get_registers(self) -> List[str]:
+        """Get list of register names in this segment."""
+        return [f"{self.prefix}{i}" for i in range(self.start, self.start + self.count)]
+    
+    def __str__(self) -> str:
+        if self.count == 1:
+            return f"{self.prefix}{self.start}"
+        return f"{self.prefix}[{self.start}:{self.start + self.count - 1}]"
+
+
+def parse_register_segment(reg_str: str) -> Optional[RegisterSegment]:
+    """
+    Parse a register segment string into a RegisterSegment.
+    
+    Supports formats:
+    - "v40" -> single register
+    - "v[40:45]" -> range of registers (inclusive)
+    - "s[37:40]" -> range of registers (inclusive)
+    
+    Args:
+        reg_str: Register segment string
+        
+    Returns:
+        RegisterSegment or None if parsing fails
+    """
+    reg_str = reg_str.strip().lower()
+    
+    # Match range format: v[40:45], s[37:40], a[0:3]
+    range_match = re.match(r'^([vsa])\[(\d+):(\d+)\]$', reg_str)
+    if range_match:
+        prefix = range_match.group(1)
+        start = int(range_match.group(2))
+        end = int(range_match.group(3))
+        count = end - start + 1
+        return RegisterSegment(prefix=prefix, start=start, count=count)
+    
+    # Match single register: v40, s37, a0
+    single_match = re.match(r'^([vsa])(\d+)$', reg_str)
+    if single_match:
+        prefix = single_match.group(1)
+        start = int(single_match.group(2))
+        return RegisterSegment(prefix=prefix, start=start, count=1)
+    
+    return None
+
+
+def find_aligned_free_registers(
+    fgpr_set: Set[str],
+    prefix: str,
+    count: int,
+    alignment: int
+) -> Optional[int]:
+    """
+    Find the smallest aligned starting index from free registers.
+    
+    Args:
+        fgpr_set: Set of free register names (e.g., {'v91', 'v92', 'v93', ...})
+        prefix: Register prefix ('v', 'a', or 's')
+        count: Number of consecutive registers needed
+        alignment: Starting index must be divisible by this value
+        
+    Returns:
+        Starting index if found, None otherwise
+    """
+    # Extract indices from the free set that match the prefix
+    free_indices = sorted([
+        int(r[1:]) for r in fgpr_set 
+        if r.startswith(prefix) and r[1:].isdigit()
+    ])
+    
+    if len(free_indices) < count:
+        return None
+    
+    # Find the smallest aligned starting index with 'count' consecutive registers
+    for start_idx in free_indices:
+        # Check alignment
+        if alignment > 1 and start_idx % alignment != 0:
+            continue
+        
+        # Check if we have 'count' consecutive registers starting from start_idx
+        consecutive = True
+        for i in range(count):
+            if (start_idx + i) not in free_indices:
+                consecutive = False
+                break
+        
+        if consecutive:
+            return start_idx
+    
+    return None
+
+
+class RegisterReplacePass(Pass):
+    """
+    Pass that replaces a set of registers with free registers within a specified instruction range.
+    
+    This pass:
+    1. Parses register segments from RPRS (Registers to Replace Set)
+    2. Finds aligned free registers from FGPR (Free GPR set)
+    3. Creates a mapping from old registers to new registers
+    4. Replaces all occurrences in instructions within the specified range
+    
+    The pass does NOT change instruction order, only modifies operands.
+    This means it's compatible with verify_optimization() which checks
+    instruction ordering constraints.
+    
+    Attributes:
+        range_start: Starting instruction address (global ID, inclusive)
+        range_end: Ending instruction address (global ID, inclusive)
+        registers_to_replace: List of register segment strings (e.g., ["v[40:45]", "s[37:40]"])
+        alignments: List of alignment requirements for each segment
+        verbose: Print detailed information during execution
+    """
+    
+    def __init__(
+        self,
+        range_start: int,
+        range_end: int,
+        registers_to_replace: List[str],
+        alignments: Optional[List[int]] = None,
+        verbose: bool = False
+    ):
+        """
+        Initialize the pass.
+        
+        Args:
+            range_start: Starting instruction address (global ID, inclusive)
+            range_end: Ending instruction address (global ID, inclusive)
+            registers_to_replace: List of register segment strings
+            alignments: List of alignment values (default: [1] * len(registers_to_replace))
+            verbose: Print detailed information
+        """
+        self.range_start = range_start
+        self.range_end = range_end
+        self.registers_to_replace = registers_to_replace
+        self.alignments = alignments or [1] * len(registers_to_replace)
+        self.verbose = verbose
+        
+        # Computed during run
+        self._register_mapping: Dict[str, str] = {}  # old_reg -> new_reg
+        self._instructions_modified: int = 0
+        self._error_message: Optional[str] = None
+    
+    @property
+    def name(self) -> str:
+        return "RegisterReplacePass"
+    
+    @property
+    def description(self) -> str:
+        return f"Replace registers {self.registers_to_replace} in range [{self.range_start}, {self.range_end}]"
+    
+    @property
+    def register_mapping(self) -> Dict[str, str]:
+        """Get the computed register mapping (old -> new)."""
+        return self._register_mapping
+    
+    @property
+    def error_message(self) -> Optional[str]:
+        """Get error message if run failed."""
+        return self._error_message
+    
+    def run(self, result: AnalysisResult) -> bool:
+        """
+        Execute the register replacement pass.
+        
+        Args:
+            result: The AnalysisResult to modify
+            
+        Returns:
+            True if any changes were made, False otherwise
+        """
+        self._register_mapping = {}
+        self._instructions_modified = 0
+        self._error_message = None
+        
+        cfg = result.cfg
+        
+        # Step 1: Parse register segments
+        segments = []
+        for reg_str in self.registers_to_replace:
+            segment = parse_register_segment(reg_str)
+            if segment is None:
+                self._error_message = f"Invalid register segment: {reg_str}"
+                if self.verbose:
+                    print(f"Error: {self._error_message}")
+                return False
+            segments.append(segment)
+        
+        if len(self.alignments) != len(segments):
+            self._error_message = f"Alignment count ({len(self.alignments)}) doesn't match segment count ({len(segments)})"
+            if self.verbose:
+                print(f"Error: {self._error_message}")
+            return False
+        
+        if self.verbose:
+            print(f"Parsed {len(segments)} register segments:")
+            for i, seg in enumerate(segments):
+                print(f"  [{i}] {seg} (alignment={self.alignments[i]})")
+        
+        # Step 2: Get FGPR from CFG
+        if cfg.fgpr is None:
+            # Compute FGPR if not already computed
+            from amdgcn_ddg import compute_register_statistics, compute_fgpr
+            stats = compute_register_statistics(result.ddgs)
+            fgpr_info = compute_fgpr(stats)
+            cfg.fgpr = fgpr_info.to_dict()
+            cfg.register_stats = stats.to_dict()
+        
+        fgpr_data = cfg.fgpr
+        fgpr_v = set(fgpr_data['full_free']['vgpr'])
+        fgpr_a = set(fgpr_data['full_free']['agpr'])
+        fgpr_s = set(fgpr_data['full_free']['sgpr'])
+        
+        if self.verbose:
+            print(f"Free registers available: VGPR={len(fgpr_v)}, AGPR={len(fgpr_a)}, SGPR={len(fgpr_s)}")
+        
+        # Step 3: Find aligned free registers for each segment and build mapping
+        used_new_regs = set()  # Track newly allocated registers
+        
+        for i, segment in enumerate(segments):
+            alignment = self.alignments[i]
+            
+            # Select the appropriate FGPR set
+            if segment.prefix == 'v':
+                fgpr_set = fgpr_v - used_new_regs
+            elif segment.prefix == 'a':
+                fgpr_set = fgpr_a - used_new_regs
+            else:  # 's'
+                fgpr_set = fgpr_s - used_new_regs
+            
+            # Find aligned starting index
+            new_start = find_aligned_free_registers(
+                fgpr_set, segment.prefix, segment.count, alignment
+            )
+            
+            if new_start is None:
+                self._error_message = (
+                    f"Insufficient free {segment.prefix.upper()}GPRs for segment {segment}: "
+                    f"need {segment.count} consecutive registers with alignment {alignment}"
+                )
+                if self.verbose:
+                    print(f"Error: {self._error_message}")
+                return False
+            
+            # Build mapping for this segment
+            old_regs = segment.get_registers()
+            new_regs = [f"{segment.prefix}{new_start + j}" for j in range(segment.count)]
+            
+            for old_reg, new_reg in zip(old_regs, new_regs):
+                self._register_mapping[old_reg] = new_reg
+                used_new_regs.add(new_reg)
+            
+            if self.verbose:
+                print(f"Segment {segment} -> {segment.prefix}[{new_start}:{new_start + segment.count - 1}]")
+        
+        if self.verbose:
+            print(f"Register mapping ({len(self._register_mapping)} registers):")
+            for old, new in sorted(self._register_mapping.items(), 
+                                   key=lambda x: (x[0][0], int(x[0][1:]) if x[0][1:].isdigit() else 0)):
+                print(f"  {old} -> {new}")
+        
+        # Step 4: Replace registers in instructions within the range
+        for block_label in cfg.block_order:
+            block = cfg.blocks[block_label]
+            for instr in block.instructions:
+                # Check if instruction is within the range
+                if not (self.range_start <= instr.address <= self.range_end):
+                    continue
+                
+                # Replace registers in operands
+                modified = self._replace_registers_in_instruction(instr)
+                if modified:
+                    self._instructions_modified += 1
+        
+        if self.verbose:
+            print(f"Modified {self._instructions_modified} instructions")
+        
+        # Step 5: Update DDG nodes to reflect register changes
+        self._update_ddg_registers(result)
+        
+        return self._instructions_modified > 0
+    
+    def _replace_registers_in_instruction(self, instr: Instruction) -> bool:
+        """
+        Replace registers in a single instruction.
+        
+        Returns True if any replacement was made.
+        """
+        modified = False
+        new_operands = instr.operands
+        new_raw_line = instr.raw_line if instr.raw_line else ""
+        
+        # Sort by length (longer first) to avoid partial replacements
+        # e.g., replace v40 before v4
+        sorted_mappings = sorted(
+            self._register_mapping.items(),
+            key=lambda x: -len(x[0])
+        )
+        
+        for old_reg, new_reg in sorted_mappings:
+            # Replace in operands - use word boundary matching
+            # Match patterns like v40, v[40:41], etc.
+            old_pattern = re.compile(
+                r'\b' + re.escape(old_reg) + r'(?=[\s,\]\):]|$)',
+                re.IGNORECASE
+            )
+            
+            if old_pattern.search(new_operands):
+                new_operands = old_pattern.sub(new_reg, new_operands)
+                modified = True
+            
+            # Also replace in raw_line if present
+            if new_raw_line and old_pattern.search(new_raw_line):
+                new_raw_line = old_pattern.sub(new_reg, new_raw_line)
+        
+        # Also handle register range format like v[40:45]
+        # Need to update both start and end indices in ranges
+        for old_reg, new_reg in sorted_mappings:
+            old_idx = int(old_reg[1:])
+            new_idx = int(new_reg[1:])
+            prefix = old_reg[0]
+            
+            # Pattern for range like v[40:45] where old_idx is start or end
+            def replace_range_idx(match):
+                start = int(match.group(1))
+                end = int(match.group(2))
+                
+                # Check if this range overlaps with our old registers
+                new_start = start
+                new_end = end
+                
+                if start == old_idx:
+                    new_start = new_idx
+                if end == old_idx:
+                    new_end = new_idx
+                
+                if new_start != start or new_end != end:
+                    return f"{prefix}[{new_start}:{new_end}]"
+                return match.group(0)
+            
+            range_pattern = re.compile(
+                r'\b' + prefix + r'\[(\d+):(\d+)\]',
+                re.IGNORECASE
+            )
+            
+            if range_pattern.search(new_operands):
+                new_operands = range_pattern.sub(replace_range_idx, new_operands)
+                modified = True
+            
+            if new_raw_line and range_pattern.search(new_raw_line):
+                new_raw_line = range_pattern.sub(replace_range_idx, new_raw_line)
+        
+        if modified:
+            instr.operands = new_operands
+            if instr.raw_line:
+                instr.raw_line = new_raw_line
+        
+        return modified
+    
+    def _update_ddg_registers(self, result: AnalysisResult) -> None:
+        """Update DDG nodes to reflect register changes."""
+        for block_label, ddg in result.ddgs.items():
+            for node in ddg.nodes:
+                # Only update nodes within the range
+                if not (self.range_start <= node.instr.address <= self.range_end):
+                    continue
+                
+                # Update defs
+                new_defs = set()
+                for reg in node.defs:
+                    reg_lower = reg.lower()
+                    if reg_lower in self._register_mapping:
+                        new_defs.add(self._register_mapping[reg_lower])
+                    else:
+                        new_defs.add(reg)
+                node.defs = new_defs
+                
+                # Update uses
+                new_uses = set()
+                for reg in node.uses:
+                    reg_lower = reg.lower()
+                    if reg_lower in self._register_mapping:
+                        new_uses.add(self._register_mapping[reg_lower])
+                    else:
+                        new_uses.add(reg)
+                node.uses = new_uses
+                
+                # Update available_regs
+                new_avail = set()
+                for reg in node.available_regs:
+                    reg_lower = reg.lower()
+                    if reg_lower in self._register_mapping:
+                        new_avail.add(self._register_mapping[reg_lower])
+                    else:
+                        new_avail.add(reg)
+                node.available_regs = new_avail
+
+
+def replace_registers(
+    result: AnalysisResult,
+    range_start: int,
+    range_end: int,
+    registers_to_replace: List[str],
+    alignments: Optional[List[int]] = None,
+    verbose: bool = False
+) -> Tuple[bool, Dict[str, str]]:
+    """
+    Convenience function to replace registers in an instruction range.
+    
+    Args:
+        result: The AnalysisResult to modify
+        range_start: Starting instruction address (global ID, inclusive)
+        range_end: Ending instruction address (global ID, inclusive)
+        registers_to_replace: List of register segment strings (e.g., ["v[40:45]", "s[37:40]"])
+        alignments: List of alignment values (default: [1] * len(registers_to_replace))
+        verbose: Print progress information
+        
+    Returns:
+        Tuple of (success, register_mapping)
+    """
+    pass_ = RegisterReplacePass(
+        range_start=range_start,
+        range_end=range_end,
+        registers_to_replace=registers_to_replace,
+        alignments=alignments,
+        verbose=verbose
+    )
+    
+    success = pass_.run(result)
+    return success, pass_.register_mapping
+
+
+# =============================================================================
 # Main (for testing)
 # =============================================================================
 

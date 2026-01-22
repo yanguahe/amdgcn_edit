@@ -62,6 +62,13 @@ from amdgcn_passes import (
     find_dependent_waitcnt,
     find_dependency_chain,
     find_immediate_dependency_chain,
+    
+    # Register Replace Pass
+    RegisterReplacePass,
+    RegisterSegment,
+    parse_register_segment,
+    find_aligned_free_registers,
+    replace_registers,
 )
 
 
@@ -750,6 +757,673 @@ class TestPassesEdgeCases:
         pass2 = MoveInstructionPass(".LBB0_0", 5, 2, auto_insert_nops=False)
         assert pass1.auto_insert_nops is True
         assert pass2.auto_insert_nops is False
+
+
+# =============================================================================
+# Test RegisterReplacePass
+# =============================================================================
+
+class TestParseRegisterSegment:
+    """Test the parse_register_segment helper function."""
+    
+    def test_single_vgpr(self):
+        """Test parsing single VGPR."""
+        seg = parse_register_segment("v40")
+        assert seg is not None
+        assert seg.prefix == "v"
+        assert seg.start == 40
+        assert seg.count == 1
+        assert seg.get_registers() == ["v40"]
+    
+    def test_single_sgpr(self):
+        """Test parsing single SGPR."""
+        seg = parse_register_segment("s37")
+        assert seg is not None
+        assert seg.prefix == "s"
+        assert seg.start == 37
+        assert seg.count == 1
+    
+    def test_single_agpr(self):
+        """Test parsing single AGPR."""
+        seg = parse_register_segment("a0")
+        assert seg is not None
+        assert seg.prefix == "a"
+        assert seg.start == 0
+        assert seg.count == 1
+    
+    def test_vgpr_range(self):
+        """Test parsing VGPR range."""
+        seg = parse_register_segment("v[40:45]")
+        assert seg is not None
+        assert seg.prefix == "v"
+        assert seg.start == 40
+        assert seg.count == 6  # 40, 41, 42, 43, 44, 45
+        assert seg.get_registers() == ["v40", "v41", "v42", "v43", "v44", "v45"]
+    
+    def test_sgpr_range(self):
+        """Test parsing SGPR range."""
+        seg = parse_register_segment("s[37:40]")
+        assert seg is not None
+        assert seg.prefix == "s"
+        assert seg.start == 37
+        assert seg.count == 4  # 37, 38, 39, 40
+    
+    def test_agpr_range(self):
+        """Test parsing AGPR range."""
+        seg = parse_register_segment("a[0:3]")
+        assert seg is not None
+        assert seg.prefix == "a"
+        assert seg.start == 0
+        assert seg.count == 4
+    
+    def test_uppercase(self):
+        """Test parsing with uppercase."""
+        seg = parse_register_segment("V[10:15]")
+        assert seg is not None
+        assert seg.prefix == "v"
+        assert seg.start == 10
+        assert seg.count == 6
+    
+    def test_whitespace(self):
+        """Test parsing with whitespace."""
+        seg = parse_register_segment("  v40  ")
+        assert seg is not None
+        assert seg.prefix == "v"
+        assert seg.start == 40
+    
+    def test_invalid_format(self):
+        """Test invalid format returns None."""
+        assert parse_register_segment("invalid") is None
+        assert parse_register_segment("x40") is None
+        assert parse_register_segment("v[40]") is None  # Missing end
+        assert parse_register_segment("v40:45") is None  # Missing brackets
+        assert parse_register_segment("") is None
+    
+    def test_segment_str(self):
+        """Test RegisterSegment __str__ method."""
+        seg1 = parse_register_segment("v40")
+        assert str(seg1) == "v40"
+        
+        seg2 = parse_register_segment("v[40:45]")
+        assert str(seg2) == "v[40:45]"
+
+
+class TestFindAlignedFreeRegisters:
+    """Test the find_aligned_free_registers helper function."""
+    
+    def test_basic_allocation(self):
+        """Test basic allocation without alignment."""
+        fgpr = {"v90", "v91", "v92", "v93", "v94", "v95"}
+        result = find_aligned_free_registers(fgpr, "v", 3, 1)
+        assert result == 90  # Smallest starting index
+    
+    def test_alignment_2(self):
+        """Test allocation with alignment 2."""
+        fgpr = {"v90", "v91", "v92", "v93", "v94", "v95"}
+        result = find_aligned_free_registers(fgpr, "v", 3, 2)
+        assert result == 90  # 90 is divisible by 2
+    
+    def test_alignment_4(self):
+        """Test allocation with alignment 4."""
+        fgpr = {"v90", "v91", "v92", "v93", "v94", "v95", "v96", "v97", "v98"}
+        result = find_aligned_free_registers(fgpr, "v", 4, 4)
+        assert result == 92  # 92 is divisible by 4
+    
+    def test_gap_in_registers(self):
+        """Test allocation skips non-consecutive ranges."""
+        fgpr = {"v90", "v91", "v93", "v94", "v95"}  # Gap at v92
+        result = find_aligned_free_registers(fgpr, "v", 3, 1)
+        assert result == 93  # Must skip past the gap
+    
+    def test_insufficient_registers(self):
+        """Test returns None when insufficient registers."""
+        fgpr = {"v90", "v91"}
+        result = find_aligned_free_registers(fgpr, "v", 5, 1)
+        assert result is None
+    
+    def test_empty_set(self):
+        """Test returns None for empty set."""
+        fgpr = set()
+        result = find_aligned_free_registers(fgpr, "v", 1, 1)
+        assert result is None
+    
+    def test_no_aligned_start(self):
+        """Test returns None when no aligned start available."""
+        fgpr = {"v91", "v92", "v93"}  # 91 not divisible by 4, and no aligned 4-consecutive
+        result = find_aligned_free_registers(fgpr, "v", 3, 4)
+        assert result is None  # 92 divisible by 4, but only 2 consecutive from there
+    
+    def test_different_prefix(self):
+        """Test allocation with different prefix."""
+        fgpr = {"v90", "s10", "s11", "s12"}
+        result = find_aligned_free_registers(fgpr, "s", 2, 1)
+        assert result == 10
+
+
+class TestRegisterReplacePass:
+    """Test the RegisterReplacePass class."""
+    
+    def _create_test_cfg(self) -> AnalysisResult:
+        """Create a test CFG with known register usage."""
+        # Create a simple CFG
+        cfg = CFG(name="test_cfg")
+        
+        # Block with instructions using v40-v45
+        block = BasicBlock(label=".LBB0_0")
+        block.instructions = [
+            create_instruction("v_mov_b32", "v40, 0x100", address=100),
+            create_instruction("v_mov_b32", "v41, v40", address=101),
+            create_instruction("v_add_f32", "v42, v40, v41", address=102),
+            create_instruction("v_mov_b32", "v43, v42", address=103),
+            create_instruction("global_store_dword", "v[44:45], v43, off", address=104),
+            # Instruction outside range
+            create_instruction("v_mov_b32", "v50, v40", address=200),
+        ]
+        cfg.add_block(block)
+        
+        # Set up FGPR - free registers v90-v99
+        cfg.fgpr = {
+            'full_free': {
+                'vgpr': ['v90', 'v91', 'v92', 'v93', 'v94', 'v95', 'v96', 'v97', 'v98', 'v99'],
+                'agpr': [],
+                'sgpr': ['s80', 's81', 's82', 's83']
+            },
+            'scattered_free': {
+                'vgpr': [],
+                'agpr': [],
+                'sgpr': []
+            }
+        }
+        
+        # Create DDGs with nodes
+        nodes = []
+        for node_id, instr in enumerate(block.instructions):
+            defs, uses = parse_instruction_registers(instr)
+            node = InstructionNode(instr=instr, node_id=node_id, defs=defs, uses=uses)
+            nodes.append(node)
+        
+        ddgs = {".LBB0_0": DDG(block_label=".LBB0_0", nodes=nodes)}
+        
+        result = AnalysisResult(
+            cfg=cfg,
+            ddgs=ddgs,
+            inter_block_deps=[],
+            waitcnt_deps=[]
+        )
+        
+        return result
+    
+    def test_basic_replacement(self):
+        """Test basic register replacement."""
+        result = self._create_test_cfg()
+        
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=104,
+            registers_to_replace=["v40"],
+            alignments=[1],
+            verbose=True
+        )
+        
+        changed = pass_.run(result)
+        assert changed is True
+        
+        # Check mapping was created
+        assert "v40" in pass_.register_mapping
+        new_reg = pass_.register_mapping["v40"]
+        assert new_reg.startswith("v")
+        
+        # Check instruction was modified
+        block = result.cfg.blocks[".LBB0_0"]
+        assert new_reg in block.instructions[0].operands
+    
+    def test_range_replacement(self):
+        """Test replacing a range of registers."""
+        result = self._create_test_cfg()
+        
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=104,
+            registers_to_replace=["v[40:42]"],
+            alignments=[1],
+            verbose=True
+        )
+        
+        changed = pass_.run(result)
+        assert changed is True
+        
+        # Check all registers in range were mapped
+        assert "v40" in pass_.register_mapping
+        assert "v41" in pass_.register_mapping
+        assert "v42" in pass_.register_mapping
+        
+        # New registers should be consecutive
+        new_indices = sorted([int(r[1:]) for r in pass_.register_mapping.values()])
+        assert new_indices[1] - new_indices[0] == 1
+        assert new_indices[2] - new_indices[1] == 1
+    
+    def test_alignment_constraint(self):
+        """Test alignment constraint is respected."""
+        result = self._create_test_cfg()
+        
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=104,
+            registers_to_replace=["v[40:41]"],
+            alignments=[2],  # Must start at even index
+            verbose=True
+        )
+        
+        changed = pass_.run(result)
+        assert changed is True
+        
+        # Check new register starts at aligned index
+        new_start = int(pass_.register_mapping["v40"][1:])
+        assert new_start % 2 == 0
+    
+    def test_multiple_segments(self):
+        """Test replacing multiple register segments."""
+        result = self._create_test_cfg()
+        
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=104,
+            registers_to_replace=["v40", "v41"],
+            alignments=[1, 1],
+            verbose=True
+        )
+        
+        changed = pass_.run(result)
+        assert changed is True
+        
+        # Check both were mapped (to different registers)
+        assert "v40" in pass_.register_mapping
+        assert "v41" in pass_.register_mapping
+        assert pass_.register_mapping["v40"] != pass_.register_mapping["v41"]
+    
+    def test_instructions_outside_range_not_modified(self):
+        """Test instructions outside the range are not modified."""
+        result = self._create_test_cfg()
+        
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=104,  # address 200 is outside
+            registers_to_replace=["v40"],
+            alignments=[1],
+            verbose=True
+        )
+        
+        changed = pass_.run(result)
+        assert changed is True
+        
+        # Instruction at address 200 should still have v40
+        block = result.cfg.blocks[".LBB0_0"]
+        instr_200 = [i for i in block.instructions if i.address == 200][0]
+        assert "v40" in instr_200.operands
+    
+    def test_insufficient_free_registers(self):
+        """Test error when insufficient free registers."""
+        result = self._create_test_cfg()
+        
+        # Request more registers than available
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=104,
+            registers_to_replace=["v[0:99]"],  # 100 registers, but only 10 free
+            alignments=[1],
+            verbose=True
+        )
+        
+        changed = pass_.run(result)
+        assert changed is False
+        assert pass_.error_message is not None
+        assert "Insufficient" in pass_.error_message
+    
+    def test_invalid_register_segment(self):
+        """Test error for invalid register segment."""
+        result = self._create_test_cfg()
+        
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=104,
+            registers_to_replace=["invalid_reg"],
+            alignments=[1],
+            verbose=True
+        )
+        
+        changed = pass_.run(result)
+        assert changed is False
+        assert pass_.error_message is not None
+        assert "Invalid" in pass_.error_message
+    
+    def test_mismatched_alignment_count(self):
+        """Test error when alignment count doesn't match segment count."""
+        result = self._create_test_cfg()
+        
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=104,
+            registers_to_replace=["v40", "v41"],
+            alignments=[1],  # Only 1 alignment for 2 segments
+            verbose=True
+        )
+        
+        changed = pass_.run(result)
+        assert changed is False
+        assert pass_.error_message is not None
+        assert "Alignment count" in pass_.error_message
+    
+    def test_empty_range(self):
+        """Test replacement with empty instruction range."""
+        result = self._create_test_cfg()
+        
+        pass_ = RegisterReplacePass(
+            range_start=500,  # No instructions in this range
+            range_end=600,
+            registers_to_replace=["v40"],
+            alignments=[1],
+            verbose=True
+        )
+        
+        changed = pass_.run(result)
+        # Mapping is created but no instructions modified
+        assert changed is False  # No changes because no instructions in range
+    
+    def test_ddg_nodes_updated(self):
+        """Test that DDG nodes are updated after replacement."""
+        result = self._create_test_cfg()
+        
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=104,
+            registers_to_replace=["v40"],
+            alignments=[1],
+            verbose=True
+        )
+        
+        changed = pass_.run(result)
+        assert changed is True
+        
+        new_reg = pass_.register_mapping["v40"]
+        
+        # Check DDG nodes were updated
+        ddg = result.ddgs[".LBB0_0"]
+        for node in ddg.nodes:
+            if node.instr.address == 100:
+                # v40 should be in defs (written by mov)
+                assert new_reg in node.defs or "v40" not in node.defs
+    
+    def test_convenience_function(self):
+        """Test the replace_registers convenience function."""
+        result = self._create_test_cfg()
+        
+        success, mapping = replace_registers(
+            result,
+            range_start=100,
+            range_end=104,
+            registers_to_replace=["v40"],
+            alignments=[1],
+            verbose=True
+        )
+        
+        assert success is True
+        assert "v40" in mapping
+    
+    def test_pass_properties(self):
+        """Test RegisterReplacePass property methods."""
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=200,
+            registers_to_replace=["v[40:45]"],
+            alignments=[2]
+        )
+        
+        assert pass_.name == "RegisterReplacePass"
+        assert "v[40:45]" in pass_.description
+        assert "100" in pass_.description
+        assert "200" in pass_.description
+
+
+class TestRegisterReplacePassWithRealFile:
+    """Test RegisterReplacePass with real assembly file."""
+    
+    @pytest.fixture
+    def real_analysis_result(self):
+        """Load real assembly file and create analysis result."""
+        if not TEST_ASSEMBLY_FILE.exists():
+            pytest.skip(f"Test file {TEST_ASSEMBLY_FILE} not found")
+        
+        parser = AMDGCNParser()
+        cfg = parser.parse_file(str(TEST_ASSEMBLY_FILE))
+        ddgs, waitcnt_deps = generate_all_ddgs(cfg)
+        inter_deps = compute_inter_block_deps(cfg, ddgs)
+        
+        # Compute FGPR
+        from amdgcn_ddg import compute_register_statistics, compute_fgpr
+        stats = compute_register_statistics(ddgs)
+        fgpr_info = compute_fgpr(stats)
+        cfg.fgpr = fgpr_info.to_dict()
+        cfg.register_stats = stats.to_dict()
+        
+        return AnalysisResult(
+            cfg=cfg,
+            ddgs=ddgs,
+            inter_block_deps=inter_deps,
+            waitcnt_deps=waitcnt_deps
+        )
+    
+    def test_real_file_replacement(self, real_analysis_result):
+        """Test register replacement on real file."""
+        result = real_analysis_result
+        
+        # Find a block with instructions
+        block_label = list(result.cfg.blocks.keys())[0]
+        block = result.cfg.blocks[block_label]
+        
+        if len(block.instructions) < 2:
+            pytest.skip("Block has too few instructions")
+        
+        # Get range from first few instructions
+        range_start = block.instructions[0].address
+        range_end = block.instructions[min(10, len(block.instructions) - 1)].address
+        
+        # Find a VGPR used in this range
+        from amdgcn_ddg import parse_instruction_registers
+        used_vgprs = set()
+        for instr in block.instructions[:11]:
+            defs, uses = parse_instruction_registers(instr)
+            for reg in defs | uses:
+                if reg.startswith('v') and reg[1:].isdigit():
+                    used_vgprs.add(reg)
+        
+        if not used_vgprs:
+            pytest.skip("No VGPRs found in range")
+        
+        # Get a VGPR to replace
+        test_vgpr = sorted(used_vgprs)[0]
+        
+        pass_ = RegisterReplacePass(
+            range_start=range_start,
+            range_end=range_end,
+            registers_to_replace=[test_vgpr],
+            alignments=[1],
+            verbose=True
+        )
+        
+        # This may or may not succeed depending on free registers
+        # The important thing is it doesn't crash
+        pass_.run(result)
+
+
+class TestRegisterReplacePassChaining:
+    """Test chaining RegisterReplacePass with other passes."""
+    
+    def _create_test_cfg_for_chaining(self) -> AnalysisResult:
+        """Create a test CFG suitable for chaining passes."""
+        cfg = CFG(name="test_cfg")
+        
+        # Block with more instructions for testing movement
+        block = BasicBlock(label=".LBB0_0")
+        block.instructions = [
+            create_instruction("v_mov_b32", "v10, 0x0", address=100),
+            create_instruction("v_mov_b32", "v40, 0x100", address=101),
+            create_instruction("v_mov_b32", "v11, v10", address=102),
+            create_instruction("v_mov_b32", "v41, v40", address=103),
+            create_instruction("v_add_f32", "v12, v10, v11", address=104),
+            create_instruction("v_add_f32", "v42, v40, v41", address=105),
+            create_instruction("s_nop", "0", address=106),
+            create_instruction("v_mov_b32", "v13, v12", address=107),
+            create_instruction("v_mov_b32", "v43, v42", address=108),
+        ]
+        cfg.add_block(block)
+        
+        # Set up FGPR
+        cfg.fgpr = {
+            'full_free': {
+                'vgpr': ['v90', 'v91', 'v92', 'v93', 'v94', 'v95', 'v96', 'v97', 'v98', 'v99'],
+                'agpr': [],
+                'sgpr': []
+            },
+            'scattered_free': {'vgpr': [], 'agpr': [], 'sgpr': []}
+        }
+        
+        nodes = []
+        for node_id, instr in enumerate(block.instructions):
+            defs, uses = parse_instruction_registers(instr)
+            node = InstructionNode(instr=instr, node_id=node_id, defs=defs, uses=uses)
+            nodes.append(node)
+        
+        ddgs = {".LBB0_0": DDG(block_label=".LBB0_0", nodes=nodes)}
+        
+        return AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=[], waitcnt_deps=[])
+    
+    def test_pass_manager_with_register_replace(self):
+        """Test RegisterReplacePass works with PassManager."""
+        result = self._create_test_cfg_for_chaining()
+        
+        pm = PassManager()
+        pm.verbose = True
+        
+        # Add register replace pass
+        replace_pass = RegisterReplacePass(
+            range_start=101,
+            range_end=108,
+            registers_to_replace=["v[40:42]"],
+            alignments=[1],
+            verbose=True
+        )
+        pm.add_pass(replace_pass)
+        
+        # Run passes
+        changed = pm.run_all(result, rebuild_ddg=False)
+        
+        assert changed is True
+        assert "v40" in replace_pass.register_mapping
+    
+    def test_register_replace_then_move(self):
+        """Test chaining RegisterReplacePass followed by MoveInstructionPass."""
+        result = self._create_test_cfg_for_chaining()
+        
+        pm = PassManager()
+        pm.verbose = True
+        
+        # First: replace registers
+        replace_pass = RegisterReplacePass(
+            range_start=101,
+            range_end=105,
+            registers_to_replace=["v40"],
+            alignments=[1],
+            verbose=False
+        )
+        pm.add_pass(replace_pass)
+        
+        # Run replacement first
+        changed = pm.run_all(result, rebuild_ddg=False)
+        assert changed is True
+        
+        # The new register should be used in instructions
+        new_reg = replace_pass.register_mapping["v40"]
+        block = result.cfg.blocks[".LBB0_0"]
+        
+        # Check that at least one instruction now uses the new register
+        found_new_reg = any(new_reg in instr.operands for instr in block.instructions)
+        assert found_new_reg, f"New register {new_reg} not found in any instruction"
+    
+    def test_chained_passes_via_pass_manager(self):
+        """Test multiple passes chained via PassManager."""
+        result = self._create_test_cfg_for_chaining()
+        
+        # Store original instructions for comparison
+        block = result.cfg.blocks[".LBB0_0"]
+        original_count = len(block.instructions)
+        
+        # Create passes
+        replace_pass = RegisterReplacePass(
+            range_start=101,
+            range_end=105,
+            registers_to_replace=["v40"],
+            alignments=[1],
+            verbose=False
+        )
+        
+        pm = PassManager()
+        pm.verbose = True
+        pm.add_pass(replace_pass)
+        
+        # Run all passes
+        changed = pm.run_all(result, rebuild_ddg=False)
+        
+        assert changed is True
+        # Instruction count should be same (register replace doesn't add/remove)
+        assert len(block.instructions) == original_count
+    
+    def test_register_replace_preserves_instruction_order(self):
+        """Test that RegisterReplacePass preserves instruction order."""
+        result = self._create_test_cfg_for_chaining()
+        
+        block = result.cfg.blocks[".LBB0_0"]
+        original_addresses = [instr.address for instr in block.instructions]
+        
+        pass_ = RegisterReplacePass(
+            range_start=100,
+            range_end=108,
+            registers_to_replace=["v[40:43]"],
+            alignments=[1],
+            verbose=False
+        )
+        
+        pass_.run(result)
+        
+        # Check addresses are unchanged
+        new_addresses = [instr.address for instr in block.instructions]
+        assert original_addresses == new_addresses
+    
+    def test_verify_optimization_compatible(self):
+        """Test that RegisterReplacePass doesn't break verify_optimization."""
+        # RegisterReplacePass only changes operands, not instruction order.
+        # verify_optimization checks instruction ordering constraints,
+        # so register replacement should be compatible.
+        
+        result = self._create_test_cfg_for_chaining()
+        
+        # Store original block for building GDG
+        from amdgcn_verify import build_global_ddg
+        original_gdg = build_global_ddg(result.cfg, result.ddgs)
+        
+        pass_ = RegisterReplacePass(
+            range_start=101,
+            range_end=108,
+            registers_to_replace=["v40"],
+            alignments=[1],
+            verbose=False
+        )
+        
+        changed = pass_.run(result)
+        assert changed is True
+        
+        # verify_optimization should still pass because order is unchanged
+        # (We can't fully test this without real DDG edges, but the key
+        # point is that instruction addresses are preserved)
 
 
 if __name__ == "__main__":

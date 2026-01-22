@@ -12,9 +12,12 @@ Usage:
 import re
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple, Any, TYPE_CHECKING
 from pathlib import Path
 import json
+
+if TYPE_CHECKING:
+    from amdgcn_ddg import RegisterMetadata
 
 
 # =============================================================================
@@ -379,6 +382,82 @@ class CFG:
         else:
             # No metadata section found, just return pre-debug content
             return pre_debug.rstrip() + '\n'
+    
+    def update_register_metadata(self, metadata: 'RegisterMetadata', kernel_name: Optional[str] = None) -> None:
+        """
+        Update register metadata values in footer_lines and block raw_lines.
+        
+        This method updates all register-related values:
+        - .amdhsa_* directives (runtime-critical) - may be in block raw_lines
+        - .set symbol definitions (assembler-required) - in footer_lines
+        - Comment information (debugging/profiling) - in footer_lines
+        - YAML metadata (informational) - in footer_lines
+        
+        Args:
+            metadata: RegisterMetadata object with computed values
+            kernel_name: Kernel function name (defaults to self.name)
+        """
+        if kernel_name is None:
+            kernel_name = self.name
+        
+        # Define all the patterns and their new values
+        # Pattern format: (regex_pattern, replacement_format)
+        
+        # .amdhsa_* directives (runtime-critical)
+        amdhsa_updates = [
+            (r'(\.amdhsa_next_free_vgpr\s+)\d+', rf'\g<1>{metadata.next_free_vgpr}'),
+            (r'(\.amdhsa_next_free_sgpr\s+)\d+', rf'\g<1>{metadata.next_free_sgpr}'),
+            (r'(\.amdhsa_accum_offset\s+)\d+', rf'\g<1>{metadata.accum_offset}'),
+        ]
+        
+        # .set symbol definitions (assembler-required)
+        # Escape special characters in kernel_name for regex
+        escaped_kernel_name = re.escape(kernel_name)
+        set_updates = [
+            (rf'(\.set\s+{escaped_kernel_name}\.num_vgpr,\s*)\d+', rf'\g<1>{metadata.num_arch_vgpr}'),
+            (rf'(\.set\s+{escaped_kernel_name}\.num_agpr,\s*)\d+', rf'\g<1>{metadata.num_agpr}'),
+            (rf'(\.set\s+{escaped_kernel_name}\.numbered_sgpr,\s*)\d+', rf'\g<1>{metadata.next_free_sgpr}'),
+        ]
+        
+        # Comment information (pattern: ; key: value)
+        comment_updates = [
+            (r'(;\s*TotalNumSgprs:\s*)\d+', rf'\g<1>{metadata.total_num_sgprs}'),
+            (r'(;\s*NumVgprs:\s*)\d+', rf'\g<1>{metadata.num_arch_vgpr}'),
+            (r'(;\s*NumAgprs:\s*)\d+', rf'\g<1>{metadata.num_agpr}'),
+            (r'(;\s*TotalNumVgprs:\s*)\d+', rf'\g<1>{metadata.next_free_vgpr}'),
+            (r'(;\s*SGPRBlocks:\s*)\d+', rf'\g<1>{metadata.sgpr_blocks}'),
+            (r'(;\s*VGPRBlocks:\s*)\d+', rf'\g<1>{metadata.vgpr_blocks}'),
+            (r'(;\s*AccumOffset:\s*)\d+', rf'\g<1>{metadata.accum_offset}'),
+            (r'(;\s*NumSGPRsForWavesPerEU:\s*)\d+', rf'\g<1>{metadata.total_num_sgprs}'),
+            (r'(;\s*NumVGPRsForWavesPerEU:\s*)\d+', rf'\g<1>{metadata.next_free_vgpr}'),
+            (r'(;\s*COMPUTE_PGM_RSRC3_GFX90A:ACCUM_OFFSET:\s*)\d+', rf'\g<1>{metadata.accum_offset_encoded}'),
+        ]
+        
+        # YAML metadata (pattern: .key:     value)
+        yaml_updates = [
+            (r'(\.sgpr_count:\s*)\d+', rf'\g<1>{metadata.total_num_sgprs}'),
+            (r'(\.vgpr_count:\s*)\d+', rf'\g<1>{metadata.next_free_vgpr}'),
+        ]
+        
+        # Combine all updates
+        all_updates = amdhsa_updates + set_updates + comment_updates + yaml_updates
+        
+        def apply_updates(line: str) -> str:
+            """Apply all regex updates to a single line."""
+            for pattern, replacement in all_updates:
+                line = re.sub(pattern, replacement, line)
+            return line
+        
+        # Apply updates to footer_lines
+        self.footer_lines = [apply_updates(line) for line in self.footer_lines]
+        
+        # Apply updates to block raw_lines (for .amdhsa_* directives which may be in blocks)
+        for block in self.blocks.values():
+            # raw_lines is a dict: {line_number: line_content}
+            updated_raw_lines = {}
+            for line_num, line_content in block.raw_lines.items():
+                updated_raw_lines[line_num] = apply_updates(line_content)
+            block.raw_lines = updated_raw_lines
 
 
 # =============================================================================

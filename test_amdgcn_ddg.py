@@ -54,6 +54,13 @@ from amdgcn_ddg import (
     generate_all_ddgs,
     compute_inter_block_deps,
     AnalysisResult,
+    
+    # Register statistics and metadata
+    RegisterStatistics,
+    RegisterMetadata,
+    compute_register_statistics,
+    compute_register_metadata,
+    _align_to,
 )
 
 
@@ -1054,6 +1061,362 @@ class TestDDGEdgeCases:
         assert len(ddg.nodes) == 3
         raw_edges = [e for e in ddg.edges if e[2].startswith("RAW:")]
         assert len(raw_edges) >= 2  # v0->v1, v1->v2
+
+
+# =============================================================================
+# Register Metadata Tests
+# =============================================================================
+
+class TestAlignTo:
+    """Tests for _align_to helper function."""
+    
+    def test_already_aligned(self):
+        """Test value that's already aligned."""
+        assert _align_to(8, 4) == 8
+        assert _align_to(16, 8) == 16
+        assert _align_to(4, 4) == 4
+    
+    def test_needs_alignment(self):
+        """Test value that needs alignment."""
+        assert _align_to(5, 4) == 8
+        assert _align_to(7, 4) == 8
+        assert _align_to(9, 8) == 16
+        assert _align_to(1, 4) == 4
+    
+    def test_alignment_1(self):
+        """Test alignment of 1 (no change)."""
+        assert _align_to(5, 1) == 5
+        assert _align_to(1, 1) == 1
+
+
+class TestRegisterMetadata:
+    """Tests for RegisterMetadata dataclass."""
+    
+    def test_basic_computation(self):
+        """Test basic metadata computation."""
+        metadata = RegisterMetadata(
+            num_arch_vgpr=216,
+            num_agpr=16,
+            next_free_sgpr=78,
+            uses_vcc=True
+        )
+        
+        # AccumOffset should be aligned to 4
+        assert metadata.accum_offset == 216  # already aligned
+        
+        # next_free_vgpr = max(num_arch_vgpr, accum_offset) + num_agpr
+        assert metadata.next_free_vgpr == 232  # 216 + 16
+        
+        # extra_sgprs = 4 + 2 (FlatScratch + VCC)
+        assert metadata.extra_sgprs == 6
+        
+        # total_num_sgprs = next_free_sgpr + extra_sgprs
+        assert metadata.total_num_sgprs == 84  # 78 + 6
+    
+    def test_accum_offset_alignment(self):
+        """Test accum_offset is properly aligned to 4."""
+        # Test value needing alignment
+        metadata = RegisterMetadata(
+            num_arch_vgpr=215,
+            num_agpr=0,
+            next_free_sgpr=50,
+            uses_vcc=False
+        )
+        assert metadata.accum_offset == 216  # 215 aligned to 4 = 216
+    
+    def test_no_vcc(self):
+        """Test extra_sgprs without VCC."""
+        metadata = RegisterMetadata(
+            num_arch_vgpr=100,
+            num_agpr=0,
+            next_free_sgpr=50,
+            uses_vcc=False
+        )
+        # extra_sgprs = 4 (FlatScratch only)
+        assert metadata.extra_sgprs == 4
+        assert metadata.total_num_sgprs == 54  # 50 + 4
+    
+    def test_with_vcc(self):
+        """Test extra_sgprs with VCC."""
+        metadata = RegisterMetadata(
+            num_arch_vgpr=100,
+            num_agpr=0,
+            next_free_sgpr=50,
+            uses_vcc=True
+        )
+        # extra_sgprs = 4 + 2 (FlatScratch + VCC)
+        assert metadata.extra_sgprs == 6
+        assert metadata.total_num_sgprs == 56  # 50 + 6
+    
+    def test_vgpr_blocks(self):
+        """Test VGPR block calculation."""
+        metadata = RegisterMetadata(
+            num_arch_vgpr=216,
+            num_agpr=16,
+            next_free_sgpr=78,
+            uses_vcc=True
+        )
+        # vgpr_blocks = (align(232, 8) / 8) - 1 = (232 / 8) - 1 = 29 - 1 = 28
+        assert metadata.vgpr_blocks == 28
+    
+    def test_sgpr_blocks(self):
+        """Test SGPR block calculation."""
+        metadata = RegisterMetadata(
+            num_arch_vgpr=216,
+            num_agpr=16,
+            next_free_sgpr=78,
+            uses_vcc=True
+        )
+        # sgpr_blocks = (align(84, 8) / 8) - 1 = (88 / 8) - 1 = 11 - 1 = 10
+        assert metadata.sgpr_blocks == 10
+    
+    def test_accum_offset_encoded(self):
+        """Test RSRC3 AccumOffset encoding."""
+        metadata = RegisterMetadata(
+            num_arch_vgpr=216,
+            num_agpr=16,
+            next_free_sgpr=78,
+            uses_vcc=True
+        )
+        # accum_offset_encoded = (216 / 4) - 1 = 54 - 1 = 53
+        assert metadata.accum_offset_encoded == 53
+    
+    def test_to_dict_from_dict(self):
+        """Test serialization and deserialization."""
+        original = RegisterMetadata(
+            num_arch_vgpr=216,
+            num_agpr=16,
+            next_free_sgpr=78,
+            uses_vcc=True
+        )
+        
+        data = original.to_dict()
+        restored = RegisterMetadata.from_dict(data)
+        
+        assert restored.num_arch_vgpr == original.num_arch_vgpr
+        assert restored.num_agpr == original.num_agpr
+        assert restored.next_free_sgpr == original.next_free_sgpr
+        assert restored.uses_vcc == original.uses_vcc
+        assert restored.accum_offset == original.accum_offset
+        assert restored.next_free_vgpr == original.next_free_vgpr
+    
+    def test_minimum_values(self):
+        """Test with minimum/zero values."""
+        metadata = RegisterMetadata(
+            num_arch_vgpr=0,
+            num_agpr=0,
+            next_free_sgpr=0,
+            uses_vcc=False
+        )
+        # accum_offset = align(max(1, 0), 4) = align(1, 4) = 4
+        assert metadata.accum_offset == 4
+        # next_free_vgpr = max(0, 4) + 0 = 4
+        assert metadata.next_free_vgpr == 4
+
+
+class TestComputeRegisterMetadata:
+    """Tests for compute_register_metadata function."""
+    
+    def test_from_statistics(self):
+        """Test computing metadata from RegisterStatistics."""
+        stats = RegisterStatistics()
+        stats.vgpr_max_index = 215  # v0-v215, 216 VGPRs
+        stats.agpr_max_index = 15   # a0-a15, 16 AGPRs
+        stats.sgpr_max_index = 77   # s0-s77, next_free = 78
+        stats.uses_vcc = True
+        
+        metadata = compute_register_metadata(stats)
+        
+        assert metadata.num_arch_vgpr == 216
+        assert metadata.num_agpr == 16
+        assert metadata.next_free_sgpr == 78
+        assert metadata.uses_vcc is True
+    
+    def test_no_registers_used(self):
+        """Test with no registers used."""
+        stats = RegisterStatistics()
+        # Default values: all max_index = -1
+        
+        metadata = compute_register_metadata(stats)
+        
+        assert metadata.num_arch_vgpr == 0
+        assert metadata.num_agpr == 0
+        assert metadata.next_free_sgpr == 0
+    
+    def test_only_vgpr(self):
+        """Test with only VGPRs used."""
+        stats = RegisterStatistics()
+        stats.vgpr_max_index = 99  # v0-v99
+        
+        metadata = compute_register_metadata(stats)
+        
+        assert metadata.num_arch_vgpr == 100
+        assert metadata.num_agpr == 0
+        assert metadata.accum_offset == 100  # aligned to 4
+
+
+class TestCFGUpdateRegisterMetadata:
+    """Tests for CFG.update_register_metadata method."""
+    
+    def test_update_amdhsa_directives_in_footer(self):
+        """Test updating .amdhsa_* directives in footer_lines."""
+        from amdgcn_cfg import CFG
+        
+        cfg = CFG(name="test_kernel")
+        cfg.footer_lines = [
+            "\t\t.amdhsa_next_free_vgpr 100",
+            "\t\t.amdhsa_next_free_sgpr 50",
+            "\t\t.amdhsa_accum_offset 80",
+        ]
+        
+        metadata = RegisterMetadata(
+            num_arch_vgpr=216,
+            num_agpr=16,
+            next_free_sgpr=78,
+            uses_vcc=True
+        )
+        
+        cfg.update_register_metadata(metadata, "test_kernel")
+        
+        assert ".amdhsa_next_free_vgpr 232" in cfg.footer_lines[0]
+        assert ".amdhsa_next_free_sgpr 78" in cfg.footer_lines[1]
+        assert ".amdhsa_accum_offset 216" in cfg.footer_lines[2]
+    
+    def test_update_amdhsa_directives_in_block(self):
+        """Test updating .amdhsa_* directives in block raw_lines."""
+        from amdgcn_cfg import CFG, BasicBlock
+        
+        cfg = CFG(name="test_kernel")
+        block = BasicBlock(label=".LBB0_0")
+        block.raw_lines = {
+            100: "\t\t.amdhsa_next_free_vgpr 100\n",
+            101: "\t\t.amdhsa_next_free_sgpr 50\n",
+            102: "\t\t.amdhsa_accum_offset 80\n",
+        }
+        cfg.add_block(block)
+        
+        metadata = RegisterMetadata(
+            num_arch_vgpr=216,
+            num_agpr=16,
+            next_free_sgpr=78,
+            uses_vcc=True
+        )
+        
+        cfg.update_register_metadata(metadata, "test_kernel")
+        
+        assert ".amdhsa_next_free_vgpr 232" in block.raw_lines[100]
+        assert ".amdhsa_next_free_sgpr 78" in block.raw_lines[101]
+        assert ".amdhsa_accum_offset 216" in block.raw_lines[102]
+    
+    def test_update_set_symbols(self):
+        """Test updating .set symbol definitions."""
+        from amdgcn_cfg import CFG
+        
+        cfg = CFG(name="my_kernel")
+        cfg.footer_lines = [
+            "\t.set my_kernel.num_vgpr, 100",
+            "\t.set my_kernel.num_agpr, 0",
+            "\t.set my_kernel.numbered_sgpr, 50",
+        ]
+        
+        metadata = RegisterMetadata(
+            num_arch_vgpr=216,
+            num_agpr=16,
+            next_free_sgpr=78,
+            uses_vcc=True
+        )
+        
+        cfg.update_register_metadata(metadata, "my_kernel")
+        
+        assert "my_kernel.num_vgpr, 216" in cfg.footer_lines[0]
+        assert "my_kernel.num_agpr, 16" in cfg.footer_lines[1]
+        assert "my_kernel.numbered_sgpr, 78" in cfg.footer_lines[2]
+    
+    def test_update_comments(self):
+        """Test updating comment information."""
+        from amdgcn_cfg import CFG
+        
+        cfg = CFG(name="test_kernel")
+        cfg.footer_lines = [
+            "; TotalNumSgprs: 50",
+            "; NumVgprs: 100",
+            "; NumAgprs: 0",
+            "; TotalNumVgprs: 100",
+            "; SGPRBlocks: 5",
+            "; VGPRBlocks: 12",
+            "; AccumOffset: 80",
+        ]
+        
+        metadata = RegisterMetadata(
+            num_arch_vgpr=216,
+            num_agpr=16,
+            next_free_sgpr=78,
+            uses_vcc=True
+        )
+        
+        cfg.update_register_metadata(metadata, "test_kernel")
+        
+        assert "; TotalNumSgprs: 84" in cfg.footer_lines[0]
+        assert "; NumVgprs: 216" in cfg.footer_lines[1]
+        assert "; NumAgprs: 16" in cfg.footer_lines[2]
+        assert "; TotalNumVgprs: 232" in cfg.footer_lines[3]
+        assert "; SGPRBlocks: 10" in cfg.footer_lines[4]
+        assert "; VGPRBlocks: 28" in cfg.footer_lines[5]
+        assert "; AccumOffset: 216" in cfg.footer_lines[6]
+    
+    def test_update_yaml_metadata(self):
+        """Test updating YAML metadata."""
+        from amdgcn_cfg import CFG
+        
+        cfg = CFG(name="test_kernel")
+        cfg.footer_lines = [
+            "    .sgpr_count:     50",
+            "    .vgpr_count:     100",
+        ]
+        
+        metadata = RegisterMetadata(
+            num_arch_vgpr=216,
+            num_agpr=16,
+            next_free_sgpr=78,
+            uses_vcc=True
+        )
+        
+        cfg.update_register_metadata(metadata, "test_kernel")
+        
+        assert ".sgpr_count:     84" in cfg.footer_lines[0]
+        assert ".vgpr_count:     232" in cfg.footer_lines[1]
+
+
+class TestRegisterMetadataIntegration:
+    """Integration tests for register metadata with real assembly file."""
+    
+    @pytest.mark.skipif(
+        not TEST_ASSEMBLY_FILE.exists(),
+        reason="Test assembly file not found"
+    )
+    def test_with_real_file(self):
+        """Test register metadata computation with real assembly file."""
+        parser = AMDGCNParser()
+        cfg = parser.parse_file(str(TEST_ASSEMBLY_FILE))
+        ddgs, waitcnt_deps = generate_all_ddgs(cfg)
+        
+        stats = compute_register_statistics(ddgs)
+        metadata = compute_register_metadata(stats)
+        
+        # Verify expected values from pa_dot_kernel.v2.amdgcn
+        # Original file has: vgpr=216, agpr=16, sgpr=78
+        assert metadata.num_arch_vgpr == 216
+        assert metadata.num_agpr == 16
+        assert metadata.next_free_sgpr == 78
+        assert metadata.uses_vcc is True
+        
+        # Computed values
+        assert metadata.accum_offset == 216
+        assert metadata.next_free_vgpr == 232
+        assert metadata.total_num_sgprs == 84
+        assert metadata.vgpr_blocks == 28
+        assert metadata.sgpr_blocks == 10
+        assert metadata.accum_offset_encoded == 53
 
 
 if __name__ == "__main__":

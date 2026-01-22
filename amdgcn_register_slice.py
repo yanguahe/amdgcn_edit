@@ -32,7 +32,8 @@ from amdgcn_ddg import (
     DDG, InstructionNode,
     parse_instruction_registers,
     generate_all_ddgs,
-    is_lgkm_op, is_vm_op
+    is_lgkm_op, is_vm_op,
+    load_analysis_from_json,
 )
 from amdgcn_verify import is_barrier_instruction
 
@@ -1088,12 +1089,20 @@ def main():
 Examples:
   %(prog)s input.amdgcn --registers v3,s7,exec,scc
   %(prog)s input.amdgcn --registers "v[0:3],s[4:7]" --output-dir ./slice_output
+  %(prog)s --load-json analysis.json --registers v40,v41 --output-dir ./slice_output
   %(prog)s input.amdgcn --registers vcc,scc --no-svg --quiet
 '''
     )
     parser.add_argument(
         'input',
-        help='Input .amdgcn assembly file'
+        nargs='?',
+        default=None,
+        help='Input .amdgcn assembly file (optional if --load-json is used)'
+    )
+    parser.add_argument(
+        '--load-json', '-j',
+        metavar='JSON_FILE',
+        help='Load CFG/DDG from JSON file instead of parsing .amdgcn file'
     )
     parser.add_argument(
         '--registers', '-r',
@@ -1118,6 +1127,10 @@ Examples:
     
     args = parser.parse_args()
     
+    # Validate input: either input file or --load-json must be specified
+    if not args.input and not args.load_json:
+        parser.error("Either input file or --load-json must be specified")
+    
     # Parse register list
     target_registers = parse_register_list(args.registers)
     
@@ -1127,13 +1140,25 @@ Examples:
     
     if not args.quiet:
         print(f"Searching for registers: {', '.join(sorted(target_registers))}")
-        print(f"Input file: {args.input}")
+        if args.load_json:
+            print(f"Loading from JSON: {args.load_json}")
+        else:
+            print(f"Input file: {args.input}")
     
     # Build the slice
     try:
-        slice_result = build_register_slice(args.input, target_registers)
-    except FileNotFoundError:
-        print(f"Error: File not found: {args.input}")
+        if args.load_json:
+            # Load from JSON file
+            result = load_analysis_from_json(args.load_json)
+            slice_result = build_register_slice_from_cfg(
+                result.cfg, result.ddgs, target_registers
+            )
+        else:
+            # Parse from .amdgcn file
+            slice_result = build_register_slice(args.input, target_registers)
+    except FileNotFoundError as e:
+        input_file = args.load_json if args.load_json else args.input
+        print(f"Error: File not found: {input_file}")
         return 1
     except Exception as e:
         print(f"Error: {e}")

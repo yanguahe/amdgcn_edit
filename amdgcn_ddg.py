@@ -2302,7 +2302,8 @@ class AnalysisResult:
             fgpr_info=fgpr_info,
         )
     
-    def to_amdgcn(self, filepath: str, keep_debug_labels: bool = False):
+    def to_amdgcn(self, filepath: str, keep_debug_labels: bool = False, 
+                   update_metadata: bool = True):
         """
         Regenerate the .amdgcn assembly file from this analysis result.
         
@@ -2315,7 +2316,21 @@ class AnalysisResult:
             filepath: Output file path
             keep_debug_labels: If False (default), remove .Ltmp* debug labels from output.
                               If True, preserve all labels including .Ltmp* debug labels.
+            update_metadata: If True (default), update register metadata in footer_lines
+                            based on current register usage. This ensures .amdhsa_*
+                            directives, .set symbols, and comments reflect any changes
+                            made by optimization passes.
         """
+        if update_metadata:
+            # Recompute register statistics from current DDGs
+            stats = compute_register_statistics(self.ddgs)
+            # Compute metadata values
+            metadata = compute_register_metadata(stats)
+            # Update footer_lines with new values
+            self.cfg.update_register_metadata(metadata, self.cfg.name)
+            # Also update cached register_stats
+            self.cfg.register_stats = stats.to_dict()
+        
         self.cfg.to_amdgcn(filepath, keep_debug_labels=keep_debug_labels)
     
     def update_block_instructions(self, block_label: str, new_instructions: List[str]):
@@ -2419,16 +2434,18 @@ def load_analysis_from_json(filepath: str) -> AnalysisResult:
     return result
 
 
-def dump_block_instructions(cfg: CFG, output_dir: str) -> None:
+def dump_block_instructions(cfg: CFG, output_dir: str, use_global_id: bool = True) -> None:
     """
     Dump instructions of each basic block to separate text files.
     
-    Each instruction is numbered with [idx] prefix to match the instruction
-    list index, making it easy to verify scheduling results against log output.
+    Each instruction is numbered with a prefix to identify it:
+    - If use_global_id=True: uses instruction.address (global line number from original file)
+    - If use_global_id=False: uses local index within the block
     
     Args:
         cfg: The CFG containing basic blocks
         output_dir: Directory to write the block instruction files
+        use_global_id: If True, use instruction's global address; if False, use local index
     """
     os.makedirs(output_dir, exist_ok=True)
     
@@ -2443,7 +2460,10 @@ def dump_block_instructions(cfg: CFG, output_dir: str) -> None:
             f.write(f";\n")
             
             for idx, instr in enumerate(block.instructions):
-                # Format: [idx] opcode operands
+                # Format: [id] opcode operands
+                # Use global address or local index based on parameter
+                instr_id = instr.address if use_global_id else idx
+                
                 if instr.raw_line:
                     # Use raw_line but strip leading whitespace
                     line = instr.raw_line.strip()
@@ -2451,7 +2471,7 @@ def dump_block_instructions(cfg: CFG, output_dir: str) -> None:
                     # Fallback to opcode + operands
                     line = f"{instr.opcode} {instr.operands}" if instr.operands else instr.opcode
                 
-                f.write(f"[{idx}] {line}\n")
+                f.write(f"[{instr_id}] {line}\n")
     
     print(f"Block instructions dumped to: {output_dir}/")
 
@@ -2493,7 +2513,7 @@ def save_ddg_files(cfg: CFG, ddgs: Dict[str, DDG], output_dir: str,
             svg_file = os.path.join(output_dir, f"ddg_{node_id}.svg")
             try:
                 subprocess.run(['dot', '-Tsvg', dot_file, '-o', svg_file], 
-                             check=True, capture_output=True)
+                             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             except subprocess.CalledProcessError as e:
                 print(f"Warning: Failed to generate SVG for {label}: {e}")
             except FileNotFoundError:
@@ -2510,7 +2530,7 @@ def save_ddg_files(cfg: CFG, ddgs: Dict[str, DDG], output_dir: str,
         combined_svg_file = os.path.join(output_dir, "cfg_ddg_combined.svg")
         try:
             subprocess.run(['dot', '-Tsvg', combined_dot_file, '-o', combined_svg_file],
-                         check=True, capture_output=True)
+                         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             print(f"Combined CFG+DDG SVG saved to: {combined_svg_file}")
         except subprocess.CalledProcessError as e:
             print(f"Warning: Failed to generate combined SVG: {e}")
@@ -2525,7 +2545,7 @@ def save_ddg_files(cfg: CFG, ddgs: Dict[str, DDG], output_dir: str,
         summary_svg_file = os.path.join(output_dir, "cfg_summary.svg")
         try:
             subprocess.run(['dot', '-Tsvg', summary_dot_file, '-o', summary_svg_file],
-                         check=True, capture_output=True)
+                         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             print(f"Summary CFG SVG saved to: {summary_svg_file}")
         except subprocess.CalledProcessError as e:
             print(f"Warning: Failed to generate summary SVG: {e}")
@@ -2540,7 +2560,7 @@ def save_ddg_files(cfg: CFG, ddgs: Dict[str, DDG], output_dir: str,
         inter_svg_file = os.path.join(output_dir, "cfg_inter_deps.svg")
         try:
             subprocess.run(['dot', '-Tsvg', inter_dot_file, '-o', inter_svg_file],
-                         check=True, capture_output=True)
+                         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             print(f"Inter-block dependencies SVG saved to: {inter_svg_file}")
         except subprocess.CalledProcessError as e:
             print(f"Warning: Failed to generate inter-deps SVG: {e}")
@@ -2556,7 +2576,7 @@ def save_ddg_files(cfg: CFG, ddgs: Dict[str, DDG], output_dir: str,
             waitcnt_svg_file = os.path.join(output_dir, "cfg_waitcnt_deps.svg")
             try:
                 subprocess.run(['dot', '-Tsvg', waitcnt_dot_file, '-o', waitcnt_svg_file],
-                             check=True, capture_output=True)
+                             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 print(f"Waitcnt dependencies SVG saved to: {waitcnt_svg_file}")
             except subprocess.CalledProcessError as e:
                 print(f"Warning: Failed to generate waitcnt-deps SVG: {e}")
@@ -2924,6 +2944,119 @@ def compute_fgpr(stats: RegisterStatistics, hw_info: Optional[Dict[str, Any]] = 
     return fgpr_info
 
 
+# =============================================================================
+# Register Metadata for AMDGCN Output
+# =============================================================================
+
+def _align_to(value: int, alignment: int) -> int:
+    """Align value up to the given alignment."""
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+@dataclass
+class RegisterMetadata:
+    """
+    Computed register metadata values for updating .amdgcn file.
+    
+    These values are derived from register usage statistics and are used
+    to update the kernel descriptor directives, assembler symbols, and
+    informational comments in the output file.
+    """
+    # Input values (from RegisterStatistics)
+    num_arch_vgpr: int      # Max VGPR index + 1 (number of ArchVGPRs used)
+    num_agpr: int           # Max AGPR index + 1 (0 if unused)
+    next_free_sgpr: int     # Max SGPR index + 1
+    uses_vcc: bool          # Whether VCC register is used
+    
+    # Computed values
+    accum_offset: int = field(init=False)       # AGPR starting position, 4-aligned
+    next_free_vgpr: int = field(init=False)     # Total VGPR usage
+    extra_sgprs: int = field(init=False)        # Extra SGPRs for VCC + FlatScratch
+    total_num_sgprs: int = field(init=False)    # Total SGPR usage
+    vgpr_blocks: int = field(init=False)        # VGPR block encoding
+    sgpr_blocks: int = field(init=False)        # SGPR block encoding
+    accum_offset_encoded: int = field(init=False)  # RSRC3 AccumOffset encoding
+    
+    def __post_init__(self):
+        """Compute derived values after initialization."""
+        # AccumOffset: AGPR start position, must be 4-aligned
+        self.accum_offset = _align_to(max(1, self.num_arch_vgpr), 4)
+        
+        # next_free_vgpr: Total VGPR usage (ArchVGPR + AGPR)
+        self.next_free_vgpr = max(self.num_arch_vgpr, self.accum_offset) + self.num_agpr
+        
+        # Extra SGPRs for gfx942/gfx950: FlatScratch(4) + VCC(2 if used)
+        # FlatScratch is always 4 for gfx942/gfx950 (includes xnack)
+        self.extra_sgprs = 4 + (2 if self.uses_vcc else 0)
+        
+        # Total SGPR usage
+        self.total_num_sgprs = self.next_free_sgpr + self.extra_sgprs
+        
+        # Block encoding values (for hardware resource allocation)
+        # VGPR granularity is 8 for GFX90A
+        self.vgpr_blocks = _align_to(max(1, self.next_free_vgpr), 8) // 8 - 1
+        self.sgpr_blocks = _align_to(max(1, self.total_num_sgprs), 8) // 8 - 1
+        
+        # COMPUTE_PGM_RSRC3 AccumOffset encoding: (accum_offset / 4) - 1
+        self.accum_offset_encoded = self.accum_offset // 4 - 1
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary."""
+        return {
+            'num_arch_vgpr': self.num_arch_vgpr,
+            'num_agpr': self.num_agpr,
+            'next_free_sgpr': self.next_free_sgpr,
+            'uses_vcc': self.uses_vcc,
+            'accum_offset': self.accum_offset,
+            'next_free_vgpr': self.next_free_vgpr,
+            'extra_sgprs': self.extra_sgprs,
+            'total_num_sgprs': self.total_num_sgprs,
+            'vgpr_blocks': self.vgpr_blocks,
+            'sgpr_blocks': self.sgpr_blocks,
+            'accum_offset_encoded': self.accum_offset_encoded
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'RegisterMetadata':
+        """Deserialize from dictionary."""
+        return cls(
+            num_arch_vgpr=data['num_arch_vgpr'],
+            num_agpr=data['num_agpr'],
+            next_free_sgpr=data['next_free_sgpr'],
+            uses_vcc=data['uses_vcc']
+        )
+
+
+def compute_register_metadata(stats: RegisterStatistics) -> RegisterMetadata:
+    """
+    Compute register metadata from register usage statistics.
+    
+    This function takes the raw register statistics and computes all the
+    derived values needed for updating the .amdgcn file metadata.
+    
+    Args:
+        stats: Register usage statistics from DDG analysis
+        
+    Returns:
+        RegisterMetadata with all computed values
+    """
+    # num_arch_vgpr: number of ArchVGPRs used (max index + 1)
+    num_arch_vgpr = stats.vgpr_max_index + 1 if stats.vgpr_max_index >= 0 else 0
+    
+    # num_agpr: number of AGPRs used (max index + 1, or 0 if unused)
+    num_agpr = stats.agpr_max_index + 1 if stats.agpr_max_index >= 0 else 0
+    
+    # next_free_sgpr: max SGPR index + 1
+    next_free_sgpr = stats.sgpr_max_index + 1 if stats.sgpr_max_index >= 0 else 0
+    
+    return RegisterMetadata(
+        num_arch_vgpr=num_arch_vgpr,
+        num_agpr=num_agpr,
+        next_free_sgpr=next_free_sgpr,
+        uses_vcc=stats.uses_vcc
+    )
+
+
 def print_inter_block_deps(inter_deps: List[InterBlockDep]):
     """Print inter-block dependencies."""
     print("\n" + "=" * 70)
@@ -2997,6 +3130,9 @@ def main():
                        help='Move instruction: BLOCK INDEX CYCLES (positive=up, negative=down)')
     parser.add_argument('--distribute', '-d', nargs=3, metavar=('BLOCK', 'OPCODE', 'K'),
                        help='Distribute instructions evenly: BLOCK OPCODE K (e.g., .LBB0_2 global_load_dwordx4 8)')
+    parser.add_argument('--replace-regs', nargs='+', metavar='ARG',
+                       help='Replace registers: START END REG1 [ALIGN1] [REG2 ALIGN2 ...] '
+                            '(e.g., 267 1000 v[40:45] 2 s[37:40] 1)')
     
     args = parser.parse_args()
     
@@ -3032,9 +3168,10 @@ def main():
                 waitcnt_deps = result.waitcnt_deps
                 inter_deps = result.inter_block_deps
                 
-                # Dump block instructions after scheduling
-                dump_dir = os.path.dirname(args.load_json) or '.'
-                dump_block_instructions(cfg, dump_dir)
+                # Save transformed analysis to JSON
+                transform_dir = os.path.dirname(args.load_json) or '.'
+                transform_json = os.path.join(transform_dir, "analysis_transform.json")
+                save_analysis_to_json(cfg, ddgs, inter_deps, waitcnt_deps, transform_json)
             else:
                 print(f"Failed: {move_result.message}")
                 if move_result.blocked_by:
@@ -3059,16 +3196,78 @@ def main():
                 waitcnt_deps = result.waitcnt_deps
                 inter_deps = result.inter_block_deps
                 
-                # Dump block instructions after scheduling
-                dump_dir = os.path.dirname(args.load_json) or '.'
-                dump_block_instructions(cfg, dump_dir)
+                # Save transformed analysis to JSON
+                transform_dir = os.path.dirname(args.load_json) or '.'
+                transform_json = os.path.join(transform_dir, "analysis_transform.json")
+                save_analysis_to_json(cfg, ddgs, inter_deps, waitcnt_deps, transform_json)
             else:
                 print(f"Distribution failed or made no changes")
+                return 1
+        
+        # Apply register replacement if requested
+        if args.replace_regs:
+            from amdgcn_passes import replace_registers
+            
+            # Parse arguments: START END REG1 [ALIGN1] [REG2 ALIGN2 ...]
+            replace_args = args.replace_regs
+            if len(replace_args) < 3:
+                print("Error: --replace-regs requires at least START END REG1")
+                return 1
+            
+            range_start = int(replace_args[0])
+            range_end = int(replace_args[1])
+            
+            # Parse register segments and alignments
+            registers = []
+            alignments = []
+            i = 2
+            while i < len(replace_args):
+                registers.append(replace_args[i])
+                i += 1
+                # Check if next argument is an alignment (integer)
+                if i < len(replace_args):
+                    try:
+                        alignments.append(int(replace_args[i]))
+                        i += 1
+                    except ValueError:
+                        # Not an integer, assume it's the next register
+                        alignments.append(1)
+                else:
+                    alignments.append(1)
+            
+            print(f"Replacing registers in range [{range_start}, {range_end}]:")
+            print(f"  Registers: {registers}")
+            print(f"  Alignments: {alignments}")
+            
+            success, mapping = replace_registers(
+                result, range_start, range_end, registers, alignments, verbose=True
+            )
+            
+            if success:
+                print(f"Register replacement completed successfully")
+                print(f"Mapping: {mapping}")
+                # Update local variables to reflect changes
+                cfg = result.cfg
+                ddgs = result.ddgs
+                waitcnt_deps = result.waitcnt_deps
+                inter_deps = result.inter_block_deps
+                
+                # Save transformed analysis to JSON
+                transform_dir = os.path.dirname(args.load_json) or '.'
+                transform_json = os.path.join(transform_dir, "analysis_transform.json")
+                save_analysis_to_json(cfg, ddgs, inter_deps, waitcnt_deps, transform_json)
+            else:
+                print(f"Register replacement failed")
                 return 1
         
         # Regenerate .amdgcn file if requested
         if args.regenerate:
             result.to_amdgcn(args.regenerate, keep_debug_labels=args.keep_debug_labels)
+            
+            # Dump block instructions with global IDs after regeneration
+            dump_dir = os.path.dirname(args.regenerate) or '.'
+            dump_block_instructions(cfg, dump_dir, use_global_id=True)
+            
             if not args.output_dir and not args.stats and not args.inter_deps and not args.waitcnt_deps:
                 print("Done!")
                 return 0
@@ -3138,9 +3337,9 @@ def main():
         print("Done!")
         return 0
     
-    # Save files
-    print(f"Saving output to {output_dir}...")
-    save_ddg_files(cfg, ddgs, output_dir, generate_svg=not args.no_svg, waitcnt_deps=waitcnt_deps)
+    # # Save files
+    # print(f"Saving output to {output_dir}...")
+    # save_ddg_files(cfg, ddgs, output_dir, generate_svg=not args.no_svg, waitcnt_deps=waitcnt_deps)
     
     print("Done!")
     return 0
