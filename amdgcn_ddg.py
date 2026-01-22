@@ -3133,6 +3133,8 @@ def main():
     parser.add_argument('--replace-regs', nargs='+', metavar='ARG',
                        help='Replace registers: START END REG1 [ALIGN1] [REG2 ALIGN2 ...] '
                             '(e.g., 267 1000 v[40:45] 2 s[37:40] 1)')
+    parser.add_argument('--transform-json', '-t', default=None,
+                       help='Load transform passes from JSON file. Format: [{"type": "move", ...}, ...]')
     
     args = parser.parse_args()
     
@@ -3149,65 +3151,63 @@ def main():
         waitcnt_deps = result.waitcnt_deps
         inter_deps = result.inter_block_deps
         
-        # Apply instruction move if requested
+        # Build transform pass list from CLI arguments and/or JSON file
+        transform_pass_list = []
+        
+        # Load passes from JSON file if specified
+        if args.transform_json:
+            with open(args.transform_json, 'r') as f:
+                pass_configs = json.load(f)
+            
+            if not isinstance(pass_configs, list):
+                print("Error: Transform JSON must contain a list of pass configurations")
+                return 1
+            
+            for pass_config in pass_configs:
+                pass_type = pass_config.get('type')
+                if pass_type == 'move':
+                    transform_pass_list.append({
+                        'type': 'move',
+                        'block': pass_config['block'],
+                        'index': pass_config['index'],
+                        'cycles': pass_config['cycles']
+                    })
+                elif pass_type == 'distribute':
+                    transform_pass_list.append({
+                        'type': 'distribute',
+                        'block': pass_config['block'],
+                        'opcode': pass_config['opcode'],
+                        'k': pass_config['k']
+                    })
+                elif pass_type == 'replace_registers':
+                    transform_pass_list.append({
+                        'type': 'replace_registers',
+                        'range_start': pass_config['range_start'],
+                        'range_end': pass_config['range_end'],
+                        'registers': pass_config['registers'],
+                        'alignments': pass_config.get('alignments', [1] * len(pass_config['registers']))
+                    })
+                else:
+                    print(f"Warning: Unknown pass type '{pass_type}', skipping")
+        
+        # Add CLI-specified passes (these run after JSON passes)
         if args.move:
-            from amdgcn_passes import move_instruction, MoveResult
-            block_label = args.move[0]
-            instr_index = int(args.move[1])
-            cycles = int(args.move[2])
-            
-            dir_str = "up" if cycles > 0 else "down"
-            print(f"Moving instruction {instr_index} in {block_label} {dir_str} by {abs(cycles)} cycles...")
-            move_result = move_instruction(result, block_label, instr_index, cycles, verbose=True)
-            
-            if move_result.success:
-                print(f"Success: {move_result.message}")
-                # Update local variables to reflect changes
-                cfg = result.cfg
-                ddgs = result.ddgs
-                waitcnt_deps = result.waitcnt_deps
-                inter_deps = result.inter_block_deps
-                
-                # Save transformed analysis to JSON
-                transform_dir = os.path.dirname(args.load_json) or '.'
-                transform_json = os.path.join(transform_dir, "analysis_transform.json")
-                save_analysis_to_json(cfg, ddgs, inter_deps, waitcnt_deps, transform_json)
-            else:
-                print(f"Failed: {move_result.message}")
-                if move_result.blocked_by:
-                    print(f"  Blocked by: {move_result.blocked_by}")
-                return 1
+            transform_pass_list.append({
+                'type': 'move',
+                'block': args.move[0],
+                'index': int(args.move[1]),
+                'cycles': int(args.move[2])
+            })
         
-        # Apply instruction distribute if requested
         if args.distribute:
-            from amdgcn_passes import distribute_instructions
-            block_label = args.distribute[0]
-            target_opcode = args.distribute[1]
-            distribute_count = int(args.distribute[2])
-            
-            print(f"Distributing {target_opcode} instructions in {block_label} (K={distribute_count})...")
-            success = distribute_instructions(result, block_label, target_opcode, distribute_count, verbose=True)
-            
-            if success:
-                print(f"Distribution completed successfully")
-                # Update local variables to reflect changes
-                cfg = result.cfg
-                ddgs = result.ddgs
-                waitcnt_deps = result.waitcnt_deps
-                inter_deps = result.inter_block_deps
-                
-                # Save transformed analysis to JSON
-                transform_dir = os.path.dirname(args.load_json) or '.'
-                transform_json = os.path.join(transform_dir, "analysis_transform.json")
-                save_analysis_to_json(cfg, ddgs, inter_deps, waitcnt_deps, transform_json)
-            else:
-                print(f"Distribution failed or made no changes")
-                return 1
+            transform_pass_list.append({
+                'type': 'distribute',
+                'block': args.distribute[0],
+                'opcode': args.distribute[1],
+                'k': int(args.distribute[2])
+            })
         
-        # Apply register replacement if requested
         if args.replace_regs:
-            from amdgcn_passes import replace_registers
-            
             # Parse arguments: START END REG1 [ALIGN1] [REG2 ALIGN2 ...]
             replace_args = args.replace_regs
             if len(replace_args) < 3:
@@ -3235,30 +3235,97 @@ def main():
                 else:
                     alignments.append(1)
             
-            print(f"Replacing registers in range [{range_start}, {range_end}]:")
-            print(f"  Registers: {registers}")
-            print(f"  Alignments: {alignments}")
-            
-            success, mapping = replace_registers(
-                result, range_start, range_end, registers, alignments, verbose=True
+            transform_pass_list.append({
+                'type': 'replace_registers',
+                'range_start': range_start,
+                'range_end': range_end,
+                'registers': registers,
+                'alignments': alignments
+            })
+        
+        # Execute all passes in transform_pass_list
+        if transform_pass_list:
+            from amdgcn_passes import (
+                move_instruction, distribute_instructions, replace_registers, MoveResult
             )
             
-            if success:
-                print(f"Register replacement completed successfully")
-                print(f"Mapping: {mapping}")
-                # Update local variables to reflect changes
-                cfg = result.cfg
-                ddgs = result.ddgs
-                waitcnt_deps = result.waitcnt_deps
-                inter_deps = result.inter_block_deps
+            print(f"\n{'='*60}")
+            print(f"Executing {len(transform_pass_list)} transform pass(es)")
+            print(f"{'='*60}\n")
+            
+            for pass_idx, pass_config in enumerate(transform_pass_list):
+                pass_type = pass_config['type']
+                print(f"[Pass {pass_idx + 1}/{len(transform_pass_list)}] {pass_type}")
                 
-                # Save transformed analysis to JSON
-                transform_dir = os.path.dirname(args.load_json) or '.'
-                transform_json = os.path.join(transform_dir, "analysis_transform.json")
-                save_analysis_to_json(cfg, ddgs, inter_deps, waitcnt_deps, transform_json)
-            else:
-                print(f"Register replacement failed")
-                return 1
+                if pass_type == 'move':
+                    block_label = pass_config['block']
+                    instr_index = pass_config['index']
+                    cycles = pass_config['cycles']
+                    
+                    dir_str = "up" if cycles > 0 else "down"
+                    print(f"  Moving instruction {instr_index} in {block_label} {dir_str} by {abs(cycles)} cycles...")
+                    move_result = move_instruction(result, block_label, instr_index, cycles, verbose=True)
+                    
+                    if move_result.success:
+                        print(f"  Success: {move_result.message}")
+                    else:
+                        print(f"  Failed: {move_result.message}")
+                        if move_result.blocked_by:
+                            print(f"    Blocked by: {move_result.blocked_by}")
+                        return 1
+                
+                elif pass_type == 'distribute':
+                    block_label = pass_config['block']
+                    target_opcode = pass_config['opcode']
+                    distribute_count = pass_config['k']
+                    
+                    print(f"  Distributing {target_opcode} in {block_label} (K={distribute_count})...")
+                    success = distribute_instructions(result, block_label, target_opcode, distribute_count, verbose=True)
+                    
+                    if success:
+                        print(f"  Distribution completed successfully")
+                    else:
+                        print(f"  Distribution failed or made no changes")
+                        return 1
+                
+                elif pass_type == 'replace_registers':
+                    range_start = pass_config['range_start']
+                    range_end = pass_config['range_end']
+                    registers = pass_config['registers']
+                    alignments = pass_config['alignments']
+                    
+                    print(f"  Replacing registers in range [{range_start}, {range_end}]:")
+                    print(f"    Registers: {registers}")
+                    print(f"    Alignments: {alignments}")
+                    
+                    success, mapping = replace_registers(
+                        result, range_start, range_end, registers, alignments, verbose=True
+                    )
+                    
+                    if success:
+                        print(f"  Register replacement completed successfully")
+                        print(f"  Mapping: {mapping}")
+                    else:
+                        print(f"  Register replacement failed")
+                        return 1
+                
+                print()  # Empty line between passes
+            
+            # Update local variables to reflect changes
+            cfg = result.cfg
+            ddgs = result.ddgs
+            waitcnt_deps = result.waitcnt_deps
+            inter_deps = result.inter_block_deps
+            
+            # Save transformed analysis to JSON
+            transform_dir = os.path.dirname(args.load_json) or '.'
+            transform_json = os.path.join(transform_dir, "analysis_transform.json")
+            save_analysis_to_json(cfg, ddgs, inter_deps, waitcnt_deps, transform_json)
+            
+            print(f"{'='*60}")
+            print(f"All {len(transform_pass_list)} passes completed successfully")
+            print(f"Transformed analysis saved to: {transform_json}")
+            print(f"{'='*60}\n")
         
         # Regenerate .amdgcn file if requested
         if args.regenerate:
