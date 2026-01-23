@@ -2580,10 +2580,6 @@ def save_ddg_files(cfg: CFG, ddgs: Dict[str, DDG], output_dir: str,
                 print(f"Waitcnt dependencies SVG saved to: {waitcnt_svg_file}")
             except subprocess.CalledProcessError as e:
                 print(f"Warning: Failed to generate waitcnt-deps SVG: {e}")
-    
-    # Save analysis result to JSON
-    json_file = os.path.join(output_dir, "analysis.json")
-    save_analysis_to_json(cfg, ddgs, inter_deps, waitcnt_deps, json_file)
 
 
 def print_ddg_stats(ddgs: Dict[str, DDG]):
@@ -3112,16 +3108,16 @@ def main():
                        help='Print inter-block dependencies')
     parser.add_argument('--waitcnt-deps', action='store_true',
                        help='Print cross-block waitcnt dependencies')
-    parser.add_argument('--no-svg', action='store_true',
-                       help='Do not generate SVG files')
+    parser.add_argument('--save-ddg', action='store_true',
+                       help='Save DDG files and SVG/DOT files')
     parser.add_argument('--block', '-b', default=None,
                        help='Generate DDG for specific block only')
     parser.add_argument('--no-cross-block-waitcnt', action='store_true',
                        help='Disable cross-block waitcnt dependency analysis')
     parser.add_argument('--load-json', '-l', default=None,
                        help='Load analysis from JSON file instead of parsing .amdgcn')
-    parser.add_argument('--json-only', action='store_true',
-                       help='Only save JSON file, skip SVG/DOT generation')
+    parser.add_argument('--save-json', action='store_true',
+                       help='Save JSON file')
     parser.add_argument('--regenerate', '-r', default=None,
                        help='Regenerate .amdgcn file from loaded JSON to specified path')
     parser.add_argument('--keep-debug-labels', action='store_true',
@@ -3135,8 +3131,16 @@ def main():
                             '(e.g., 267 1000 v[40:45] 2 s[37:40] 1)')
     parser.add_argument('--transform-json', '-t', default=None,
                        help='Load transform passes from JSON file. Format: [{"type": "move", ...}, ...]')
+    parser.add_argument('--barrier-crossing', default=None,
+                       help='Comma-separated opcodes allowed to cross s_barrier (e.g., global_load_dwordx4,global_store_dwordx4)')
     
     args = parser.parse_args()
+    
+    # Parse barrier_crossing_opcodes
+    barrier_crossing_opcodes = None
+    if args.barrier_crossing:
+        barrier_crossing_opcodes = set(args.barrier_crossing.split(','))
+        print(f"Barrier crossing opcodes: {barrier_crossing_opcodes}")
     
     # Check input arguments
     if args.load_json is None and args.input is None:
@@ -3170,14 +3174,16 @@ def main():
                         'type': 'move',
                         'block': pass_config['block'],
                         'index': pass_config['index'],
-                        'cycles': pass_config['cycles']
+                        'cycles': pass_config['cycles'],
+                        'barrier_crossing_opcodes': set(pass_config.get('barrier_crossing_opcodes', []))
                     })
                 elif pass_type == 'distribute':
                     transform_pass_list.append({
                         'type': 'distribute',
                         'block': pass_config['block'],
                         'opcode': pass_config['opcode'],
-                        'k': pass_config['k']
+                        'k': pass_config['k'],
+                        'barrier_crossing_opcodes': set(pass_config.get('barrier_crossing_opcodes', []))
                     })
                 elif pass_type == 'replace_registers':
                     transform_pass_list.append({
@@ -3262,9 +3268,15 @@ def main():
                     instr_index = pass_config['index']
                     cycles = pass_config['cycles']
                     
+                    # Use pass-specific barrier_crossing_opcodes if provided, otherwise use global
+                    pass_barrier_crossing = pass_config.get('barrier_crossing_opcodes', barrier_crossing_opcodes)
+                    
                     dir_str = "up" if cycles > 0 else "down"
                     print(f"  Moving instruction {instr_index} in {block_label} {dir_str} by {abs(cycles)} cycles...")
-                    move_result = move_instruction(result, block_label, instr_index, cycles, verbose=True)
+                    if pass_barrier_crossing:
+                        print(f"    Barrier crossing opcodes: {pass_barrier_crossing}")
+                    move_result = move_instruction(result, block_label, instr_index, cycles, verbose=True,
+                                                   barrier_crossing_opcodes=pass_barrier_crossing)
                     
                     if move_result.success:
                         print(f"  Success: {move_result.message}")
@@ -3279,8 +3291,14 @@ def main():
                     target_opcode = pass_config['opcode']
                     distribute_count = pass_config['k']
                     
+                    # Use pass-specific barrier_crossing_opcodes if provided, otherwise use global
+                    pass_barrier_crossing = pass_config.get('barrier_crossing_opcodes', barrier_crossing_opcodes)
+                    
                     print(f"  Distributing {target_opcode} in {block_label} (K={distribute_count})...")
-                    success = distribute_instructions(result, block_label, target_opcode, distribute_count, verbose=True)
+                    if pass_barrier_crossing:
+                        print(f"    Barrier crossing opcodes: {pass_barrier_crossing}")
+                    success = distribute_instructions(result, block_label, target_opcode, distribute_count, verbose=True,
+                                                      barrier_crossing_opcodes=pass_barrier_crossing)
                     
                     if success:
                         print(f"  Distribution completed successfully")
@@ -3330,15 +3348,10 @@ def main():
         # Regenerate .amdgcn file if requested
         if args.regenerate:
             result.to_amdgcn(args.regenerate, keep_debug_labels=args.keep_debug_labels)
-            
             # Dump block instructions with global IDs after regeneration
             dump_dir = os.path.dirname(args.regenerate) or '.'
             dump_block_instructions(cfg, dump_dir, use_global_id=True)
-            
-            if not args.output_dir and not args.stats and not args.inter_deps and not args.waitcnt_deps:
-                print("Done!")
-                return 0
-        
+
         # Determine output directory
         if args.output_dir:
             output_dir = args.output_dir
@@ -3394,19 +3407,18 @@ def main():
         else:
             print(f"Error: Block '{args.block}' not found")
             print(f"Available blocks: {list(ddgs.keys())}")
-            return 1
     
-    # Save JSON only mode
-    if args.json_only:
+    # Save JSON file
+    if args.save_json:
+        print(f"Saving JSON file to {output_dir}...")
         os.makedirs(output_dir, exist_ok=True)
         json_file = os.path.join(output_dir, "analysis.json")
         save_analysis_to_json(cfg, ddgs, inter_deps, waitcnt_deps, json_file)
-        print("Done!")
-        return 0
     
-    # # Save files
-    # print(f"Saving output to {output_dir}...")
-    # save_ddg_files(cfg, ddgs, output_dir, generate_svg=not args.no_svg, waitcnt_deps=waitcnt_deps)
+    # Save files
+    if args.save_ddg:
+        print(f"Saving output to {output_dir}...")
+        save_ddg_files(cfg, ddgs, output_dir, generate_svg=True, waitcnt_deps=waitcnt_deps)
     
     print("Done!")
     return 0

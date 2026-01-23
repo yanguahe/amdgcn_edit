@@ -173,6 +173,12 @@ class DistributeDebugger:
         self.verbose = args.verbose
         self.test_cmd = args.test_cmd
         
+        # Parse barrier_crossing_opcodes from comma-separated string
+        if hasattr(args, 'barrier_crossing') and args.barrier_crossing:
+            self.barrier_crossing_opcodes = set(args.barrier_crossing.split(','))
+        else:
+            self.barrier_crossing_opcodes = set()
+        
         self.result = None
         self.block = None
         self.ddg = None
@@ -324,7 +330,8 @@ class DistributeDebugger:
                 cycles_to_move,
                 verbose=False,
                 frozen_boundary=self.frozen_boundary,
-                protected_instructions=self.protected_instructions
+                protected_instructions=self.protected_instructions,
+                barrier_crossing_opcodes=self.barrier_crossing_opcodes
             )
             move_pass.run(self.result)
             
@@ -470,7 +477,8 @@ class DistributeDebugger:
                 small_move,
                 verbose=False,
                 frozen_boundary=self.frozen_boundary,
-                protected_instructions=self.protected_instructions
+                protected_instructions=self.protected_instructions,
+                barrier_crossing_opcodes=self.barrier_crossing_opcodes
             )
             success = move_pass.run(self.result)
             
@@ -580,6 +588,8 @@ def main():
                        help="Start from move K within --detail-step (skip earlier moves)")
     parser.add_argument("--skip-baseline", action="store_true",
                        help="Skip baseline test")
+    parser.add_argument("--barrier-crossing", default=None,
+                       help="Comma-separated opcodes allowed to cross s_barrier (e.g., global_load_dwordx4,global_store_dwordx4)")
     parser.add_argument("--verbose", "-v", action="store_true",
                        help="Show verbose output")
     

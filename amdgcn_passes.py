@@ -1086,7 +1086,8 @@ class MoveInstructionPass(Pass):
         verbose: bool = False,
         frozen_boundary: int = 0,
         protected_instructions: Optional[List['Instruction']] = None,
-        auto_insert_nops: bool = True
+        auto_insert_nops: bool = True,
+        barrier_crossing_opcodes: Optional[Set[str]] = None
     ):
         """
         Initialize the pass.
@@ -1103,6 +1104,9 @@ class MoveInstructionPass(Pass):
             auto_insert_nops: If True (default), automatically insert s_nop instructions
                              when a move would violate MFMA latency constraints.
                              If False, such moves are blocked.
+            barrier_crossing_opcodes: Set of opcodes that can cross s_barrier instructions.
+                                     If specified, instructions with these opcodes can move
+                                     past s_barrier (e.g., {"global_load_dwordx4"}).
         """
         self.block_label = block_label
         self.instr_index = instr_index
@@ -1111,6 +1115,7 @@ class MoveInstructionPass(Pass):
         self.frozen_boundary = frozen_boundary
         self.protected_instructions = protected_instructions or []
         self.auto_insert_nops = auto_insert_nops
+        self.barrier_crossing_opcodes = barrier_crossing_opcodes or set()
         self._last_result: Optional[MoveResult] = None
         self._total_cycles_moved: int = 0
         # Detailed tracking of why movement stopped (use sets of instruction object IDs to track unique instructions)
@@ -1224,7 +1229,7 @@ class MoveInstructionPass(Pass):
         )
         
         # Mandatory verification: raises SchedulingVerificationError on failure
-        verify_optimization(original_gdg, result.cfg)
+        verify_optimization(original_gdg, result.cfg, barrier_crossing_opcodes=self.barrier_crossing_opcodes)
         
         return success
     
@@ -1432,8 +1437,13 @@ class MoveInstructionPass(Pass):
         defs_a, uses_a = get_instruction_defs_uses(instr_a)
         opcode_a = instr_a.opcode.lower()
         
-        # s_barrier is a boundary - it cannot be moved
-        if opcode_a == 's_barrier':
+        # Check if this instruction can cross s_barrier (instruction A is in allowed set)
+        instr_a_can_cross_barrier = instr_a.opcode in self.barrier_crossing_opcodes
+        # Check if s_barrier can cross this instruction (when A is s_barrier moving past allowed instructions)
+        is_barrier_moving = opcode_a == 's_barrier'
+        
+        # s_barrier can only be moved if barrier_crossing_opcodes is set
+        if is_barrier_moving and not self.barrier_crossing_opcodes:
             return False
         
         # Check all instructions we would pass
@@ -1445,9 +1455,21 @@ class MoveInstructionPass(Pass):
             defs_b, uses_b = get_instruction_defs_uses(instr_b)
             opcode_b = instr_b.opcode.lower()
             
-            # s_barrier is a boundary - cannot cross it
+            # Handle barrier crossing logic:
+            # Case 1: A is s_barrier, B is some instruction -> s_barrier can cross B if B is in allowed set
+            # Case 2: A is some instruction, B is s_barrier -> A can cross s_barrier if A is in allowed set
             if opcode_b == 's_barrier':
-                return False
+                if not instr_a_can_cross_barrier:
+                    return False
+                # s_barrier doesn't have register dependencies, skip other checks for this iteration
+                continue
+            
+            if is_barrier_moving:
+                # s_barrier is moving past instr_b, check if B is in allowed set
+                if instr_b.opcode not in self.barrier_crossing_opcodes:
+                    return False
+                # s_barrier doesn't have register dependencies, skip other checks for this iteration
+                continue
             
             # RAW: B reads what A writes -> BLOCKED (A must stay before B)
             raw_conflicts = defs_a & uses_b
@@ -1567,8 +1589,13 @@ class MoveInstructionPass(Pass):
         defs_a, uses_a = get_instruction_defs_uses(instr_a)
         opcode_a = instr_a.opcode.lower()
         
-        # s_barrier is a boundary - it cannot be moved
-        if opcode_a == 's_barrier':
+        # Check if this instruction can cross s_barrier (instruction A is in allowed set)
+        instr_a_can_cross_barrier = instr_a.opcode in self.barrier_crossing_opcodes
+        # Check if s_barrier can cross this instruction (when A is s_barrier moving past allowed instructions)
+        is_barrier_moving = opcode_a == 's_barrier'
+        
+        # s_barrier can only be moved if barrier_crossing_opcodes is set
+        if is_barrier_moving and not self.barrier_crossing_opcodes:
             return False
         
         # Check all instructions we would pass
@@ -1580,9 +1607,21 @@ class MoveInstructionPass(Pass):
             defs_b, uses_b = get_instruction_defs_uses(instr_b)
             opcode_b = instr_b.opcode.lower()
             
-            # s_barrier is a boundary - cannot cross it
+            # Handle barrier crossing logic:
+            # Case 1: A is s_barrier, B is some instruction -> s_barrier can cross B if B is in allowed set
+            # Case 2: A is some instruction, B is s_barrier -> A can cross s_barrier if A is in allowed set
             if opcode_b == 's_barrier':
-                return False
+                if not instr_a_can_cross_barrier:
+                    return False
+                # s_barrier doesn't have register dependencies, skip other checks for this iteration
+                continue
+            
+            if is_barrier_moving:
+                # s_barrier is moving past instr_b, check if B is in allowed set
+                if instr_b.opcode not in self.barrier_crossing_opcodes:
+                    return False
+                # s_barrier doesn't have register dependencies, skip other checks for this iteration
+                continue
             
             # RAW: A reads what B writes -> BLOCKED (A depends on B)
             raw_conflicts = defs_b & uses_a
@@ -1835,14 +1874,17 @@ class MoveInstructionPass(Pass):
                 # Skip branch/terminator - they are boundaries
                 if instr.is_branch or instr.is_terminator:
                     continue
-                # Skip s_barrier - it's a synchronization boundary
+                # s_barrier can be moved if barrier_crossing_opcodes is set
+                # (it can cross instructions in the allowed set)
                 if instr.opcode.lower() == 's_barrier':
-                    self._blocked_by_barrier.add(id(instr))
-                    continue
+                    if not self.barrier_crossing_opcodes:
+                        self._blocked_by_barrier.add(id(instr))
+                        continue
+                    # s_barrier is allowed to be moved, add to candidates
                 if instr in self.protected_instructions:
                     self._blocked_by_protected.add(id(instr))
                 else:
-                        above_bb_instrs.append(instr)
+                    above_bb_instrs.append(instr)
             
             for instr_to_move in above_bb_instrs:
                 if self._total_cycles_moved >= cycles_to_move:
@@ -1975,16 +2017,18 @@ class MoveInstructionPass(Pass):
         self._blocked_by_protected = set()
         self._no_candidates = False
 
-        # Find branch/barrier boundary
+        # Find branch boundary (excluding s_barrier if barrier_crossing_opcodes is set)
         # s_barrier is a synchronization barrier that acts as a boundary line
         branch_boundary = len(block.instructions)
         boundary_is_barrier = False  # Track if boundary is s_barrier
+        has_barrier_crossing = len(self.barrier_crossing_opcodes) > 0
         for i, instr in enumerate(block.instructions):
             if instr.is_branch or instr.is_terminator:
                 branch_boundary = i
                 boundary_is_barrier = False
                 break
-            if instr.opcode.lower() == 's_barrier':
+            # Only treat s_barrier as boundary if no barrier_crossing_opcodes specified
+            if instr.opcode.lower() == 's_barrier' and not has_barrier_crossing:
                 branch_boundary = i
                 boundary_is_barrier = True
                 break
@@ -2021,10 +2065,13 @@ class MoveInstructionPass(Pass):
                 # Skip branch/terminator - they are boundaries
                 if instr.is_branch or instr.is_terminator:
                     continue
-                # Skip s_barrier - it's a synchronization boundary
+                # s_barrier can be moved if barrier_crossing_opcodes is set
+                # (it can cross instructions in the allowed set)
                 if instr.opcode.lower() == 's_barrier':
-                    self._blocked_by_barrier.add(id(instr))
-                    continue
+                    if not self.barrier_crossing_opcodes:
+                        self._blocked_by_barrier.add(id(instr))
+                        continue
+                    # s_barrier is allowed to be moved, add to candidates
                 if instr in self.protected_instructions:
                     self._blocked_by_protected.add(id(instr))
                 else:
@@ -3052,6 +3099,7 @@ class DistributeInstructionPass(Pass):
         target_opcode: Exact opcode to match (e.g., "global_load_dwordx4")
         distribute_count: K, number of instructions to distribute evenly
         verbose: Print detailed information during execution
+        barrier_crossing_opcodes: Set of opcodes that can cross s_barrier
     """
     
     def __init__(
@@ -3059,7 +3107,8 @@ class DistributeInstructionPass(Pass):
         block_label: str,
         target_opcode: str,
         distribute_count: int,
-        verbose: bool = False
+        verbose: bool = False,
+        barrier_crossing_opcodes: Optional[Set[str]] = None
     ):
         """
         Initialize the pass.
@@ -3069,11 +3118,15 @@ class DistributeInstructionPass(Pass):
             target_opcode: Exact opcode to match (e.g., "global_load_dwordx4")
             distribute_count: K, number of instructions to distribute evenly
             verbose: Print detailed information during execution
+            barrier_crossing_opcodes: Set of opcodes that can cross s_barrier instructions.
+                                     If specified, instructions with these opcodes can move
+                                     past s_barrier (e.g., {"global_load_dwordx4"}).
         """
         self.block_label = block_label
         self.target_opcode = target_opcode
         self.distribute_count = distribute_count
         self.verbose = verbose
+        self.barrier_crossing_opcodes = barrier_crossing_opcodes or set()
         self._moved_count = 0
     
     @property
@@ -3122,19 +3175,22 @@ class DistributeInstructionPass(Pass):
     
     def _find_branch_boundary(self, block: BasicBlock) -> int:
         """
-        Find index of first branch/terminator/s_barrier instruction.
+        Find index of first branch/terminator instruction.
+        If barrier_crossing_opcodes is not set, also treat s_barrier as boundary.
         Instructions cannot be moved past this boundary.
         
         s_barrier is a synchronization barrier that acts as a boundary line -
-        instructions before and after it cannot cross the boundary.
+        instructions before and after it cannot cross the boundary (unless allowed).
         
         Returns:
-            Index of first branch/terminator/s_barrier, or len(instructions) if none
+            Index of first branch/terminator (or s_barrier if no barrier crossing), or len(instructions) if none
         """
+        has_barrier_crossing = len(self.barrier_crossing_opcodes) > 0
         for i, instr in enumerate(block.instructions):
             if instr.is_branch or instr.is_terminator:
                 return i
-            if instr.opcode.lower() == 's_barrier':
+            # Only treat s_barrier as boundary if no barrier_crossing_opcodes specified
+            if instr.opcode.lower() == 's_barrier' and not has_barrier_crossing:
                 return i
         return len(block.instructions)
     
@@ -3266,7 +3322,8 @@ class DistributeInstructionPass(Pass):
             cycles_to_move,
             verbose=False,
             frozen_boundary=frozen_boundary,
-            protected_instructions=protected_instructions
+            protected_instructions=protected_instructions,
+            barrier_crossing_opcodes=self.barrier_crossing_opcodes
         )
         
         success = move_pass.run(result)
@@ -3539,7 +3596,7 @@ class DistributeInstructionPass(Pass):
             print(f"===============================================\n")
         
         # Mandatory verification: raises SchedulingVerificationError on failure
-        verify_optimization(original_gdg, result.cfg)
+        verify_optimization(original_gdg, result.cfg, barrier_crossing_opcodes=self.barrier_crossing_opcodes)
         
         return self._moved_count > 0
 
@@ -3574,7 +3631,8 @@ def move_instruction(
     cycles: int,
     verbose: bool = False,
     frozen_boundary: int = 0,
-    protected_instructions: Optional[List['Instruction']] = None
+    protected_instructions: Optional[List['Instruction']] = None,
+    barrier_crossing_opcodes: Optional[Set[str]] = None
 ) -> MoveResult:
     """
     Convenience function to move a single instruction by a specified number of cycles.
@@ -3587,6 +3645,7 @@ def move_instruction(
         verbose: Print progress information
         frozen_boundary: Instructions at idx < frozen_boundary cannot be moved
         protected_instructions: List of instruction objects that should never be moved
+        barrier_crossing_opcodes: Set of opcodes that can cross s_barrier instructions
         
     Returns:
         MoveResult with success status and message
@@ -3597,7 +3656,8 @@ def move_instruction(
         cycles=cycles,
         verbose=verbose,
         frozen_boundary=frozen_boundary,
-        protected_instructions=protected_instructions
+        protected_instructions=protected_instructions,
+        barrier_crossing_opcodes=barrier_crossing_opcodes
     )
     
     pm = PassManager()
@@ -3614,7 +3674,8 @@ def distribute_instructions(
     target_opcode: str,
     distribute_count: int,
     verbose: bool = False,
-    auto_fix_latency: bool = True
+    auto_fix_latency: bool = True,
+    barrier_crossing_opcodes: Optional[Set[str]] = None
 ) -> bool:
     """
     Convenience function to distribute instructions evenly across a basic block.
@@ -3631,6 +3692,7 @@ def distribute_instructions(
         verbose: Print progress information
         auto_fix_latency: If True, automatically run InsertLatencyNopsPass after
                          distribution to fix any MFMA latency violations
+        barrier_crossing_opcodes: Set of opcodes that can cross s_barrier instructions
         
     Returns:
         True if any changes were made, False otherwise
@@ -3639,7 +3701,8 @@ def distribute_instructions(
         block_label=block_label,
         target_opcode=target_opcode,
         distribute_count=distribute_count,
-        verbose=verbose
+        verbose=verbose,
+        barrier_crossing_opcodes=barrier_crossing_opcodes
     )
     
     pm = PassManager()

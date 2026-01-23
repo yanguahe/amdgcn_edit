@@ -477,24 +477,29 @@ def is_before(
 
 def verify_optimization(
     original_gdg: GlobalDependencyGraph,
-    optimized_cfg: 'CFG'
+    optimized_cfg: 'CFG',
+    barrier_crossing_opcodes: Optional[Set[str]] = None
 ) -> None:
     """
     Verify that the optimized CFG maintains all dependencies from the original.
     
     This function checks:
     1. All RAW dependencies are preserved (writer before reader)
-    2. All barrier constraints are preserved (no crossing)
+    2. All barrier constraints are preserved (no crossing, unless allowed)
     3. All WAIT dependencies are preserved
     
     Args:
         original_gdg: The global dependency graph from before optimization
         optimized_cfg: The CFG after optimization
+        barrier_crossing_opcodes: Set of opcodes that are allowed to cross s_barrier.
+                                 Instructions with these opcodes won't trigger barrier
+                                 violations when they cross a barrier.
         
     Raises:
         SchedulingVerificationError: If any constraint is violated
     """
     result = VerificationResult()
+    barrier_crossing_opcodes = barrier_crossing_opcodes or set()
     
     # Build position map for optimized code
     new_positions = build_position_map(optimized_cfg)
@@ -560,6 +565,11 @@ def verify_optimization(
             
             if not is_before(before_pos, barrier_pos, block_order):
                 before_info = original_gdg.instructions.get(before_addr)
+                
+                # Skip barrier check if this opcode is allowed to cross barriers
+                if before_info and before_info.opcode in barrier_crossing_opcodes:
+                    continue
+                
                 before_desc = f"@line{before_addr}"
                 if before_info:
                     before_desc = f"[{before_info.opcode}] @line{before_addr}"
@@ -578,6 +588,11 @@ def verify_optimization(
             
             if not is_before(barrier_pos, after_pos, block_order):
                 after_info = original_gdg.instructions.get(after_addr)
+                
+                # Skip barrier check if this opcode is allowed to cross barriers
+                if after_info and after_info.opcode in barrier_crossing_opcodes:
+                    continue
+                
                 after_desc = f"@line{after_addr}"
                 if after_info:
                     after_desc = f"[{after_info.opcode}] @line{after_addr}"
@@ -662,7 +677,8 @@ def verify_optimization(
 def verify_and_report(
     original_gdg: GlobalDependencyGraph,
     optimized_cfg: 'CFG',
-    verbose: bool = True
+    verbose: bool = True,
+    barrier_crossing_opcodes: Optional[Set[str]] = None
 ) -> VerificationResult:
     """
     Verify optimization and return detailed result (without raising exception).
@@ -673,11 +689,13 @@ def verify_and_report(
         original_gdg: The global dependency graph from before optimization
         optimized_cfg: The CFG after optimization
         verbose: If True, print progress information
+        barrier_crossing_opcodes: Set of opcodes that are allowed to cross s_barrier
         
     Returns:
         VerificationResult with success status and any errors
     """
     result = VerificationResult()
+    barrier_crossing_opcodes = barrier_crossing_opcodes or set()
     
     new_positions = build_position_map(optimized_cfg)
     block_order = list(optimized_cfg.block_order) if hasattr(optimized_cfg, 'block_order') else list(optimized_cfg.blocks.keys())
@@ -686,6 +704,8 @@ def verify_and_report(
         print(f"Verifying {original_gdg.get_instruction_count()} instructions...")
         print(f"  RAW edges: {original_gdg.get_raw_edge_count()}")
         print(f"  Barriers: {original_gdg.get_barrier_count()}")
+        if barrier_crossing_opcodes:
+            print(f"  Barrier crossing opcodes: {barrier_crossing_opcodes}")
     
     # Same verification logic as verify_optimization but collect results
     for writer_addr, reader_addr, reg in original_gdg.raw_edges:
@@ -723,6 +743,10 @@ def verify_and_report(
                 continue
             before_pos = new_positions[before_addr]
             if not is_before(before_pos, barrier_pos, block_order):
+                before_info = original_gdg.instructions.get(before_addr)
+                # Skip if opcode is allowed to cross barrier
+                if before_info and before_info.opcode in barrier_crossing_opcodes:
+                    continue
                 result.barrier_violations.append(
                     f"@line{before_addr} crossed after barrier @line{barrier_addr}"
                 )
@@ -733,6 +757,10 @@ def verify_and_report(
                 continue
             after_pos = new_positions[after_addr]
             if not is_before(barrier_pos, after_pos, block_order):
+                after_info = original_gdg.instructions.get(after_addr)
+                # Skip if opcode is allowed to cross barrier
+                if after_info and after_info.opcode in barrier_crossing_opcodes:
+                    continue
                 result.barrier_violations.append(
                     f"@line{after_addr} crossed before barrier @line{barrier_addr}"
                 )
