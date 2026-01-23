@@ -1,4 +1,5 @@
 [
+
   {
     "type": "replace_registers",
     "range_start": 1,
@@ -8,12 +9,21 @@
   },
 
   {
+      "type": "distribute",
+      "block": ".LBB0_2",
+      "opcode": "global_load_dwordx4",
+      "k": 16,
+      "barrier_crossing_opcodes": ["global_load_dwordx4"]
+  },
+
+  {
     "type": "distribute",
     "block": ".LBB0_10",
     "opcode": "global_load_dwordx4",
     "k": 16,
     "barrier_crossing_opcodes": ["global_load_dwordx4"]
   },
+
   {
   }
 ]

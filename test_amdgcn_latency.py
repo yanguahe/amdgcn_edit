@@ -55,6 +55,38 @@ from amdgcn_latency import (
     is_valu_instruction,
     is_memory_read_instruction,
     
+    # Table 11: Software Wait States classification functions
+    is_trans_instruction,
+    is_dpp_instruction,
+    is_opsel_instruction,
+    is_sdwa_instruction,
+    is_vcmpx_instruction,
+    is_readlane_writelane_instr,
+    is_s_setreg,
+    is_s_getreg,
+    is_vmem_instruction,
+    is_large_store_instr,
+    writes_m0,
+    reads_m0,
+    is_gds_instruction,
+    is_s_moverel,
+    is_div_fmas,
+    valu_writes_vcc,
+    valu_writes_exec,
+    valu_writes_sgpr,
+    valu_writes_sgpr_or_vcc,
+    uses_execz_or_vccz,
+    get_setreg_target,
+    get_getreg_target,
+    get_hwreg_target,
+    same_setreg_target,
+    is_vector_instruction,
+    is_vskip_setreg,
+    reads_vgpr_as_lane_select,
+    reads_exec_as_constant,
+    get_store_writedata_vgprs,
+    is_buffer_store_with_sgpr_offset,
+    
     # Register analysis
     parse_agpr_range,
     get_mfma_dst_registers,
@@ -122,6 +154,239 @@ def create_mfma_instruction(
 def create_accvgpr_read(dst: str = "v0", src: str = "a0", address: int = 0) -> Instruction:
     """Create a test v_accvgpr_read instruction."""
     return create_instruction("v_accvgpr_read_b32", f"{dst}, {src}", address)
+
+
+# =============================================================================
+# Table 11: Software Wait States - Test Helpers
+# =============================================================================
+
+def create_dpp_instruction(
+    opcode: str = "v_mov_b32_dpp",
+    dst: str = "v0",
+    src: str = "v0",
+    dpp_ctrl: str = "quad_perm:[2,3,0,1]",
+    address: int = 0
+) -> Instruction:
+    """Create a test DPP instruction."""
+    operands = f"{dst}, {src} {dpp_ctrl} row_mask:0xf bank_mask:0xf"
+    return create_instruction(opcode, operands, address)
+
+
+def create_trans_instruction(
+    opcode: str = "v_exp_f32",
+    dst: str = "v0",
+    src: str = "v1",
+    address: int = 0
+) -> Instruction:
+    """Create a test transcendental instruction."""
+    return create_instruction(opcode, f"{dst}, {src}", address)
+
+
+def create_vcmpx_instruction(
+    variant: str = "eq_f32",
+    src0: str = "v0",
+    src1: str = "v1",
+    address: int = 0
+) -> Instruction:
+    """Create a test v_cmpx instruction."""
+    opcode = f"v_cmpx_{variant}"
+    return create_instruction(opcode, f"{src0}, {src1}", address)
+
+
+def create_vcmp_instruction(
+    variant: str = "eq_f32",
+    dst: str = "vcc",
+    src0: str = "v0",
+    src1: str = "v1",
+    address: int = 0
+) -> Instruction:
+    """Create a test v_cmp instruction."""
+    opcode = f"v_cmp_{variant}"
+    return create_instruction(opcode, f"{dst}, {src0}, {src1}", address)
+
+
+def create_readlane_instruction(
+    dst: str = "s0",
+    vsrc0: str = "v0",
+    lane_select: str = "s1",
+    address: int = 0
+) -> Instruction:
+    """Create a test v_readlane instruction."""
+    return create_instruction("v_readlane_b32", f"{dst}, {vsrc0}, {lane_select}", address)
+
+
+def create_readfirstlane_instruction(
+    dst: str = "s0",
+    src: str = "v0",
+    address: int = 0
+) -> Instruction:
+    """Create a test v_readfirstlane instruction."""
+    return create_instruction("v_readfirstlane_b32", f"{dst}, {src}", address)
+
+
+def create_writelane_instruction(
+    vdst: str = "v0",
+    src: str = "s0",
+    lane_select: str = "s1",
+    address: int = 0
+) -> Instruction:
+    """Create a test v_writelane instruction."""
+    return create_instruction("v_writelane_b32", f"{vdst}, {src}, {lane_select}", address)
+
+
+def create_s_setreg_instruction(
+    hwreg: str = "hw_reg_mode",
+    src: str = "s0",
+    address: int = 0
+) -> Instruction:
+    """Create a test s_setreg instruction."""
+    return create_instruction("s_setreg_b32", f"hwreg({hwreg}), {src}", address)
+
+
+def create_s_getreg_instruction(
+    dst: str = "s0",
+    hwreg: str = "hw_reg_mode",
+    address: int = 0
+) -> Instruction:
+    """Create a test s_getreg instruction."""
+    return create_instruction("s_getreg_b32", f"{dst}, hwreg({hwreg})", address)
+
+
+def create_div_fmas_instruction(
+    dst: str = "v0",
+    src0: str = "v0",
+    src1: str = "v1",
+    src2: str = "v2",
+    address: int = 0
+) -> Instruction:
+    """Create a test v_div_fmas instruction."""
+    return create_instruction("v_div_fmas_f32", f"{dst}, {src0}, {src1}, {src2}", address)
+
+
+def create_div_scale_instruction(
+    vdst: str = "v0",
+    vcc_dst: str = "vcc",
+    src0: str = "v1",
+    src1: str = "v1",
+    src2: str = "1.0",
+    address: int = 0
+) -> Instruction:
+    """Create a test v_div_scale instruction."""
+    return create_instruction("v_div_scale_f32", f"{vdst}, {vcc_dst}, {src0}, {src1}, {src2}", address)
+
+
+def create_large_store_instruction(
+    opcode: str = "global_store_dwordx4",
+    addr: str = "v[0:1]",
+    data: str = "v[2:5]",
+    offset: str = "off",
+    address: int = 0
+) -> Instruction:
+    """Create a test large store instruction (X3, X4, CMPSWAP_X2)."""
+    return create_instruction(opcode, f"{addr}, {data}, {offset}", address)
+
+
+def create_m0_write_instruction(
+    src: str = "s0",
+    address: int = 0
+) -> Instruction:
+    """Create a test instruction that writes M0."""
+    return create_instruction("s_mov_b32", f"m0, {src}", address)
+
+
+def create_gds_instruction(
+    opcode: str = "s_sendmsg",
+    msg: str = "0",
+    address: int = 0
+) -> Instruction:
+    """Create a test GDS/sendmsg instruction."""
+    return create_instruction(opcode, msg, address)
+
+
+def create_s_moverel_instruction(
+    dst: str = "s0",
+    src: str = "s1",
+    address: int = 0
+) -> Instruction:
+    """Create a test s_movrels instruction."""
+    return create_instruction("s_movrels_b32", f"{dst}, {src}", address)
+
+
+def create_opsel_instruction(
+    opcode: str = "v_pk_fma_f32",
+    dst: str = "v[0:1]",
+    src0: str = "v[0:1]",
+    src1: str = "v[2:3]",
+    src2: str = "v[4:5]",
+    opsel: str = "op_sel:[0,0,0] op_sel_hi:[1,0,1]",
+    address: int = 0
+) -> Instruction:
+    """Create a test instruction with OPSEL modifier."""
+    return create_instruction(opcode, f"{dst}, {src0}, {src1}, {src2} {opsel}", address)
+
+
+def create_sdwa_instruction(
+    opcode: str = "v_add_f32_sdwa",
+    dst: str = "v0",
+    src0: str = "v1",
+    src1: str = "v2",
+    sdwa_mods: str = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_1",
+    address: int = 0
+) -> Instruction:
+    """Create a test instruction with SDWA modifier."""
+    return create_instruction(opcode, f"{dst}, {src0}, {src1} {sdwa_mods}", address)
+
+
+def create_valu_vgpr_write(
+    dst: str = "v0",
+    src0: str = "v1",
+    src1: str = "v2",
+    address: int = 0
+) -> Instruction:
+    """Create a simple VALU instruction that writes a VGPR."""
+    return create_instruction("v_add_f32_e32", f"{dst}, {src0}, {src1}", address)
+
+
+def create_valu_vcc_write(
+    variant: str = "eq_f32",
+    src0: str = "v0",
+    src1: str = "v1",
+    address: int = 0
+) -> Instruction:
+    """Create a VALU instruction that writes VCC."""
+    return create_vcmp_instruction(variant, "vcc", src0, src1, address)
+
+
+def create_valu_exec_write(
+    variant: str = "eq_f32",
+    src0: str = "v0",
+    src1: str = "v1",
+    address: int = 0
+) -> Instruction:
+    """Create a VALU instruction that writes EXEC (v_cmpx)."""
+    return create_vcmpx_instruction(variant, src0, src1, address)
+
+
+def create_vmem_instruction(
+    opcode: str = "global_load_dwordx4",
+    vdst: str = "v[0:3]",
+    vaddr: str = "v[4:5]",
+    saddr: str = "off",
+    address: int = 0
+) -> Instruction:
+    """Create a vector memory instruction."""
+    return create_instruction(opcode, f"{vdst}, {vaddr}, {saddr}", address)
+
+
+def create_vmem_with_sgpr(
+    opcode: str = "global_load_dwordx4",
+    vdst: str = "v[0:3]",
+    vaddr: str = "v[4:5]",
+    saddr: str = "s[0:1]",
+    address: int = 0
+) -> Instruction:
+    """Create a vector memory instruction with SGPR address."""
+    return create_instruction(opcode, f"{vdst}, {vaddr}, {saddr}", address)
 
 
 def load_real_assembly() -> Tuple[CFG, dict, AnalysisResult]:
@@ -932,6 +1197,454 @@ class TestInsertLatencyNopsPass(unittest.TestCase):
         changed = pass_.run(result)
         
         self.assertFalse(changed)
+
+
+# =============================================================================
+# Table 11: Software Wait States Tests
+# =============================================================================
+
+class TestSoftwareWaitStates(unittest.TestCase):
+    """Tests for Table 11: Required Software-inserted Wait States."""
+    
+    def setUp(self):
+        self.hw_info = load_hardware_info()
+    
+    # --- S_SETREG rules ---
+    
+    def test_s_setreg_to_s_getreg_same_reg(self):
+        """Test S_SETREG -> S_GETREG same register requires 2 wait states."""
+        setreg = create_s_setreg_instruction(hwreg="hw_reg_mode", src="s0", address=0)
+        getreg = create_s_getreg_instruction(dst="s1", hwreg="hw_reg_mode", address=1)
+        
+        latency = get_required_latency(setreg, getreg, self.hw_info)
+        self.assertEqual(latency, 2)
+    
+    def test_s_setreg_to_s_setreg_same_reg(self):
+        """Test S_SETREG -> S_SETREG same register requires 2 wait states."""
+        setreg1 = create_s_setreg_instruction(hwreg="hw_reg_mode", src="s0", address=0)
+        setreg2 = create_s_setreg_instruction(hwreg="hw_reg_mode", src="s1", address=1)
+        
+        latency = get_required_latency(setreg1, setreg2, self.hw_info)
+        self.assertEqual(latency, 2)
+    
+    def test_s_setreg_to_different_reg_no_wait(self):
+        """Test S_SETREG -> S_GETREG different register requires no wait."""
+        setreg = create_s_setreg_instruction(hwreg="hw_reg_mode", src="s0", address=0)
+        getreg = create_s_getreg_instruction(dst="s1", hwreg="hw_reg_status", address=1)
+        
+        latency = get_required_latency(setreg, getreg, self.hw_info)
+        self.assertEqual(latency, 0)
+    
+    # --- VCC/EXEC -> EXECZ/VCCZ rules ---
+    
+    def test_valu_vcc_to_vccz_requires_5_wait(self):
+        """Test VALU writes VCC -> VALU uses VCCZ requires 5 wait states."""
+        # v_cmp writes VCC
+        vcmp = create_vcmp_instruction(variant="eq_f32", dst="vcc", src0="v0", src1="v1", address=0)
+        # Instruction using VCCZ (simulated with operand containing vccz)
+        vccz_user = create_instruction("v_cndmask_b32", "v0, v1, v2, vccz", address=1)
+        
+        latency = get_required_latency(vcmp, vccz_user, self.hw_info)
+        self.assertEqual(latency, 5)
+    
+    # --- VALU VCC -> V_DIV_FMAS rules ---
+    
+    def test_valu_vcc_to_div_fmas_requires_4_wait(self):
+        """Test VALU writes VCC -> V_DIV_FMAS requires 4 wait states."""
+        div_scale = create_div_scale_instruction(vdst="v0", vcc_dst="vcc", address=0)
+        div_fmas = create_div_fmas_instruction(dst="v0", src0="v0", src1="v1", src2="v2", address=1)
+        
+        latency = get_required_latency(div_scale, div_fmas, self.hw_info)
+        self.assertEqual(latency, 4)
+    
+    def test_vcmp_to_div_fmas_requires_4_wait(self):
+        """Test v_cmp (writes VCC) -> V_DIV_FMAS requires 4 wait states."""
+        vcmp = create_vcmp_instruction(variant="eq_f32", dst="vcc", src0="v0", src1="v1", address=0)
+        div_fmas = create_div_fmas_instruction(dst="v0", src0="v0", src1="v1", src2="v2", address=1)
+        
+        latency = get_required_latency(vcmp, div_fmas, self.hw_info)
+        self.assertEqual(latency, 4)
+    
+    # --- VALU SGPR/VCC -> lane select rules ---
+    
+    def test_valu_sgpr_to_lane_select_requires_4_wait(self):
+        """Test VALU writes SGPR/VCC -> lane select requires 4 wait states."""
+        readfirstlane = create_readfirstlane_instruction(dst="s0", src="v0", address=0)
+        readlane = create_readlane_instruction(dst="s1", vsrc0="v1", lane_select="s0", address=1)
+        
+        latency = get_required_latency(readfirstlane, readlane, self.hw_info)
+        self.assertEqual(latency, 4)
+    
+    # --- DPP rules ---
+    
+    def test_valu_vgpr_to_dpp_requires_2_wait(self):
+        """Test VALU writes VGPR -> DPP reads that VGPR requires 2 wait states."""
+        valu = create_valu_vgpr_write(dst="v0", src0="v1", src1="v2", address=0)
+        dpp = create_dpp_instruction(opcode="v_mov_b32_dpp", dst="v3", src="v0", address=1)
+        
+        latency = get_required_latency(valu, dpp, self.hw_info)
+        self.assertEqual(latency, 2)
+    
+    def test_valu_vgpr_to_dpp_no_dependency_no_wait(self):
+        """Test VALU writes VGPR -> DPP reads different VGPR requires no wait."""
+        valu = create_valu_vgpr_write(dst="v0", src0="v1", src1="v2", address=0)
+        dpp = create_dpp_instruction(opcode="v_mov_b32_dpp", dst="v3", src="v4", address=1)
+        
+        latency = get_required_latency(valu, dpp, self.hw_info)
+        self.assertEqual(latency, 0)
+    
+    def test_valu_exec_to_dpp_requires_5_wait(self):
+        """Test VALU writes EXEC -> DPP requires 5 wait states."""
+        vcmpx = create_vcmpx_instruction(variant="eq_f32", src0="v0", src1="v1", address=0)
+        dpp = create_dpp_instruction(opcode="v_mov_b32_dpp", dst="v3", src="v4", address=1)
+        
+        latency = get_required_latency(vcmpx, dpp, self.hw_info)
+        self.assertEqual(latency, 5)
+    
+    # --- Trans instruction rules ---
+    
+    def test_trans_to_non_trans_requires_1_wait(self):
+        """Test Trans instruction -> non-trans VALU consumer requires 1 wait state."""
+        trans = create_trans_instruction(opcode="v_exp_f32", dst="v0", src="v1", address=0)
+        non_trans = create_valu_vgpr_write(dst="v2", src0="v0", src1="v3", address=1)
+        
+        latency = get_required_latency(trans, non_trans, self.hw_info)
+        self.assertEqual(latency, 1)
+    
+    def test_trans_to_trans_no_extra_wait(self):
+        """Test Trans instruction -> Trans instruction requires no extra wait."""
+        trans1 = create_trans_instruction(opcode="v_exp_f32", dst="v0", src="v1", address=0)
+        trans2 = create_trans_instruction(opcode="v_log_f32", dst="v2", src="v0", address=1)
+        
+        latency = get_required_latency(trans1, trans2, self.hw_info)
+        # Trans to trans doesn't trigger the 1-wait rule (both are trans)
+        self.assertEqual(latency, 0)
+    
+    def test_trans_no_dependency_no_wait(self):
+        """Test Trans instruction with no dependency requires no wait."""
+        trans = create_trans_instruction(opcode="v_exp_f32", dst="v0", src="v1", address=0)
+        non_trans = create_valu_vgpr_write(dst="v2", src0="v3", src1="v4", address=1)
+        
+        latency = get_required_latency(trans, non_trans, self.hw_info)
+        self.assertEqual(latency, 0)
+    
+    # --- OPSEL/SDWA rules ---
+    
+    def test_opsel_to_consumer_requires_1_wait(self):
+        """Test OPSEL instruction -> consumer requires 1 wait state."""
+        opsel = create_opsel_instruction(address=0)
+        consumer = create_valu_vgpr_write(dst="v4", src0="v0", src1="v5", address=1)
+        
+        latency = get_required_latency(opsel, consumer, self.hw_info)
+        self.assertEqual(latency, 1)
+    
+    def test_sdwa_to_consumer_requires_1_wait(self):
+        """Test SDWA instruction -> consumer requires 1 wait state."""
+        sdwa = create_sdwa_instruction(dst="v0", src0="v1", src1="v2", address=0)
+        consumer = create_valu_vgpr_write(dst="v4", src0="v0", src1="v5", address=1)
+        
+        latency = get_required_latency(sdwa, consumer, self.hw_info)
+        self.assertEqual(latency, 1)
+    
+    # --- v_cmpx rules ---
+    
+    def test_vcmpx_to_exec_const_requires_2_wait(self):
+        """Test v_cmpx -> VALU reads EXEC as constant requires 2 wait states."""
+        vcmpx = create_vcmpx_instruction(variant="eq_f32", src0="v0", src1="v1", address=0)
+        exec_reader = create_instruction("v_cndmask_b32", "v0, v1, v2, exec", address=1)
+        
+        latency = get_required_latency(vcmpx, exec_reader, self.hw_info)
+        self.assertEqual(latency, 2)
+    
+    def test_vcmpx_to_readlane_requires_4_wait(self):
+        """Test v_cmpx -> v_readlane requires 4 wait states."""
+        vcmpx = create_vcmpx_instruction(variant="eq_f32", src0="v0", src1="v1", address=0)
+        readlane = create_readlane_instruction(dst="s0", vsrc0="v0", lane_select="s1", address=1)
+        
+        latency = get_required_latency(vcmpx, readlane, self.hw_info)
+        self.assertEqual(latency, 4)
+    
+    def test_vcmpx_to_writelane_requires_4_wait(self):
+        """Test v_cmpx -> v_writelane requires 4 wait states."""
+        vcmpx = create_vcmpx_instruction(variant="eq_f32", src0="v0", src1="v1", address=0)
+        writelane = create_writelane_instruction(vdst="v0", src="s0", lane_select="s1", address=1)
+        
+        latency = get_required_latency(vcmpx, writelane, self.hw_info)
+        self.assertEqual(latency, 4)
+    
+    def test_vcmpx_to_readfirstlane_requires_4_wait(self):
+        """Test v_cmpx -> v_readfirstlane requires 4 wait states."""
+        vcmpx = create_vcmpx_instruction(variant="eq_f32", src0="v0", src1="v1", address=0)
+        readfirstlane = create_readfirstlane_instruction(dst="s0", src="v0", address=1)
+        
+        latency = get_required_latency(vcmpx, readfirstlane, self.hw_info)
+        self.assertEqual(latency, 4)
+    
+    # --- VALU VGPR -> v_readlane vsrc0 rules ---
+    
+    def test_valu_vgpr_to_readlane_vsrc0_requires_1_wait(self):
+        """Test VALU writes VGPR -> v_readlane vsrc0 reads that VGPR requires 1 wait state."""
+        valu = create_valu_vgpr_write(dst="v0", src0="v1", src1="v2", address=0)
+        readlane = create_readlane_instruction(dst="s0", vsrc0="v0", lane_select="s1", address=1)
+        
+        latency = get_required_latency(valu, readlane, self.hw_info)
+        self.assertEqual(latency, 1)
+    
+    def test_valu_vgpr_to_readlane_different_vgpr_no_wait(self):
+        """Test VALU writes VGPR -> v_readlane reads different VGPR requires no wait."""
+        valu = create_valu_vgpr_write(dst="v0", src0="v1", src1="v2", address=0)
+        readlane = create_readlane_instruction(dst="s0", vsrc0="v3", lane_select="s1", address=1)
+        
+        latency = get_required_latency(valu, readlane, self.hw_info)
+        self.assertEqual(latency, 0)
+    
+    # --- SALU M0 rules ---
+    
+    def test_salu_m0_to_gds_requires_1_wait(self):
+        """Test SALU writes M0 -> GDS/S_SENDMSG requires 1 wait state."""
+        m0_write = create_m0_write_instruction(src="s0", address=0)
+        sendmsg = create_gds_instruction(opcode="s_sendmsg", msg="0", address=1)
+        
+        latency = get_required_latency(m0_write, sendmsg, self.hw_info)
+        self.assertEqual(latency, 1)
+    
+    def test_salu_m0_to_s_moverel_requires_1_wait(self):
+        """Test SALU writes M0 -> S_MOVEREL requires 1 wait state."""
+        m0_write = create_m0_write_instruction(src="s0", address=0)
+        moverel = create_s_moverel_instruction(dst="s1", src="s2", address=1)
+        
+        latency = get_required_latency(m0_write, moverel, self.hw_info)
+        self.assertEqual(latency, 1)
+    
+    # --- Classification function tests ---
+    
+    def test_is_trans_instruction(self):
+        """Test is_trans_instruction classification."""
+        trans_opcodes = ["v_exp_f32", "v_log_f32", "v_rcp_f32", "v_sin_f32", "v_cos_f32"]
+        non_trans_opcodes = ["v_add_f32_e32", "v_mul_f32_e32", "v_fma_f32"]
+        
+        for opcode in trans_opcodes:
+            instr = create_instruction(opcode, "v0, v1")
+            self.assertTrue(is_trans_instruction(instr), f"{opcode} should be trans")
+        
+        for opcode in non_trans_opcodes:
+            instr = create_instruction(opcode, "v0, v1, v2")
+            self.assertFalse(is_trans_instruction(instr), f"{opcode} should not be trans")
+    
+    def test_is_dpp_instruction(self):
+        """Test is_dpp_instruction classification."""
+        dpp = create_dpp_instruction()
+        self.assertTrue(is_dpp_instruction(dpp))
+        
+        non_dpp = create_valu_vgpr_write()
+        self.assertFalse(is_dpp_instruction(non_dpp))
+    
+    def test_is_vcmpx_instruction(self):
+        """Test is_vcmpx_instruction classification."""
+        vcmpx = create_vcmpx_instruction()
+        self.assertTrue(is_vcmpx_instruction(vcmpx))
+        
+        vcmp = create_vcmp_instruction()
+        self.assertFalse(is_vcmpx_instruction(vcmp))
+    
+    def test_is_div_fmas(self):
+        """Test is_div_fmas classification."""
+        div_fmas = create_div_fmas_instruction()
+        self.assertTrue(is_div_fmas(div_fmas))
+        
+        regular = create_valu_vgpr_write()
+        self.assertFalse(is_div_fmas(regular))
+    
+    def test_valu_writes_vcc(self):
+        """Test valu_writes_vcc classification."""
+        vcmp = create_vcmp_instruction()
+        self.assertTrue(valu_writes_vcc(vcmp))
+        
+        div_scale = create_div_scale_instruction()
+        self.assertTrue(valu_writes_vcc(div_scale))
+        
+        regular = create_valu_vgpr_write()
+        self.assertFalse(valu_writes_vcc(regular))
+    
+    def test_valu_writes_exec(self):
+        """Test valu_writes_exec classification."""
+        vcmpx = create_vcmpx_instruction()
+        self.assertTrue(valu_writes_exec(vcmpx))
+        
+        vcmp = create_vcmp_instruction()
+        self.assertFalse(valu_writes_exec(vcmp))
+
+
+class TestSoftwareWaitStatesCornerCases(unittest.TestCase):
+    """Corner cases and edge conditions for Table 11 rules."""
+    
+    def setUp(self):
+        self.hw_info = load_hardware_info()
+    
+    def test_multiple_rules_apply_use_max(self):
+        """Test that when multiple rules apply, the maximum latency is used."""
+        # v_cmpx writes EXEC -> DPP requires 5 wait (rule 10)
+        # This is the maximum among potentially applicable rules
+        vcmpx = create_vcmpx_instruction(variant="eq_f32", src0="v0", src1="v1", address=0)
+        dpp = create_dpp_instruction(opcode="v_mov_b32_dpp", dst="v3", src="v4", address=1)
+        
+        latency = get_required_latency(vcmpx, dpp, self.hw_info)
+        # v_cmpx -> DPP should be 5 (highest applicable rule)
+        self.assertEqual(latency, 5)
+    
+    def test_no_dependency_no_wait(self):
+        """Test that instructions with no dependency require no wait."""
+        trans = create_trans_instruction(opcode="v_exp_f32", dst="v0", src="v1", address=0)
+        unrelated = create_instruction("v_add_f32_e32", "v5, v6, v7", address=1)
+        
+        latency = get_required_latency(trans, unrelated, self.hw_info)
+        self.assertEqual(latency, 0)
+    
+    def test_sufficient_independent_instructions(self):
+        """Test that sufficient independent instructions satisfy wait requirements."""
+        block = BasicBlock(label=".test")
+        
+        # v_exp writes v0 -> v_add reads v0 needs 1 wait
+        trans = create_trans_instruction(opcode="v_exp_f32", dst="v0", src="v1", address=0)
+        # Add 1 independent instruction
+        independent = create_instruction("s_nop", "0", address=1)  # 1 cycle
+        consumer = create_valu_vgpr_write(dst="v2", src0="v0", src1="v3", address=2)
+        
+        block.instructions = [trans, independent, consumer]
+        
+        violations = find_latency_violations(block, hw_info=self.hw_info)
+        # s_nop 0 = 1 cycle, which satisfies the 1-wait requirement
+        self.assertEqual(len(violations), 0)
+    
+    def test_s_nop_counts_toward_wait(self):
+        """Test that s_nop instructions count toward wait requirements."""
+        block = BasicBlock(label=".test")
+        
+        # DPP needs 2 wait states from VALU VGPR write
+        valu = create_valu_vgpr_write(dst="v0", src0="v1", src1="v2", address=0)
+        # s_nop 1 = 2 cycles
+        nop = create_snop_instruction(1, address=1)
+        dpp = create_dpp_instruction(opcode="v_mov_b32_dpp", dst="v3", src="v0", address=2)
+        
+        block.instructions = [valu, nop, dpp]
+        
+        violations = find_latency_violations(block, hw_info=self.hw_info)
+        # s_nop 1 provides 2 cycles, which satisfies the 2-wait requirement
+        self.assertEqual(len(violations), 0)
+    
+    def test_insufficient_s_nop_creates_violation(self):
+        """Test that insufficient s_nop creates a violation."""
+        block = BasicBlock(label=".test")
+        
+        # v_cmpx -> DPP needs 5 wait states
+        vcmpx = create_vcmpx_instruction(variant="eq_f32", src0="v0", src1="v1", address=0)
+        # s_nop 2 = 3 cycles (insufficient)
+        nop = create_snop_instruction(2, address=1)
+        dpp = create_dpp_instruction(opcode="v_mov_b32_dpp", dst="v3", src="v4", address=2)
+        
+        block.instructions = [vcmpx, nop, dpp]
+        
+        violations = find_latency_violations(block, hw_info=self.hw_info)
+        # Need 5, have 3, should have violation
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0].nops_needed, 2)  # 5 - 3 = 2 more needed
+    
+    def test_chain_of_dependencies(self):
+        """Test a chain of instructions with multiple dependencies."""
+        block = BasicBlock(label=".test")
+        
+        # trans -> non-trans (1 wait)
+        trans = create_trans_instruction(opcode="v_exp_f32", dst="v0", src="v1", address=0)
+        # This satisfies the 1-wait requirement
+        independent = create_instruction("s_nop", "0", address=1)
+        consumer = create_valu_vgpr_write(dst="v2", src0="v0", src1="v3", address=2)
+        # Then this v2 goes to DPP (2 wait)
+        nop = create_snop_instruction(1, address=3)
+        dpp = create_dpp_instruction(opcode="v_mov_b32_dpp", dst="v4", src="v2", address=4)
+        
+        block.instructions = [trans, independent, consumer, nop, dpp]
+        
+        violations = find_latency_violations(block, hw_info=self.hw_info)
+        # Both dependencies should be satisfied
+        self.assertEqual(len(violations), 0)
+    
+    def test_move_preserves_all_rules(self):
+        """Test that check_move_preserves_latency considers all Table 11 rules."""
+        block = BasicBlock(label=".test")
+        
+        # v_cmpx at 0 -> DPP at 6 (6 instructions between, satisfies 5-wait)
+        vcmpx = create_vcmpx_instruction(variant="eq_f32", src0="v0", src1="v1", address=0)
+        # 5 independent instructions
+        independents = [
+            create_instruction("s_nop", "0", address=i) for i in range(1, 6)
+        ]
+        dpp = create_dpp_instruction(opcode="v_mov_b32_dpp", dst="v3", src="v4", address=6)
+        
+        block.instructions = [vcmpx] + independents + [dpp]
+        
+        # Try to move DPP up to position 3 (only 2 instructions between)
+        # This should NOT preserve latency (need 5, would have only 2)
+        is_safe = check_move_preserves_latency(block, 6, 3, self.hw_info)
+        self.assertFalse(is_safe)
+        
+        # Moving DPP to position 6 (current position) should be safe
+        is_safe = check_move_preserves_latency(block, 6, 6, self.hw_info)
+        self.assertTrue(is_safe)
+    
+    def test_violation_detection_for_table11_rules(self):
+        """Test that find_latency_violations detects Table 11 violations."""
+        block = BasicBlock(label=".test")
+        
+        # v_cmpx -> DPP with insufficient wait
+        vcmpx = create_vcmpx_instruction(variant="eq_f32", src0="v0", src1="v1", address=0)
+        dpp = create_dpp_instruction(opcode="v_mov_b32_dpp", dst="v3", src="v4", address=1)
+        
+        block.instructions = [vcmpx, dpp]
+        
+        violations = find_latency_violations(block, hw_info=self.hw_info)
+        
+        # Should detect the violation
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0].first_idx, 0)
+        self.assertEqual(violations[0].second_idx, 1)
+        self.assertEqual(violations[0].required_latency, 5)
+        self.assertEqual(violations[0].actual_independent, 0)
+        self.assertEqual(violations[0].nops_needed, 5)
+    
+    def test_mixed_mfma_and_table11_violations(self):
+        """Test block with both MFMA and Table 11 violations."""
+        block = BasicBlock(label=".test")
+        
+        # MFMA violation
+        mfma = create_mfma_instruction(dst="a[0:3]", address=0)
+        accvgpr_read = create_accvgpr_read(dst="v0", src="a0", address=1)
+        
+        # Table 11 violation: trans -> non-trans
+        trans = create_trans_instruction(opcode="v_exp_f32", dst="v1", src="v2", address=2)
+        consumer = create_valu_vgpr_write(dst="v3", src0="v1", src1="v4", address=3)
+        
+        block.instructions = [mfma, accvgpr_read, trans, consumer]
+        
+        violations = find_latency_violations(block, hw_info=self.hw_info)
+        
+        # Should detect at least 2 violations (MFMA and trans)
+        self.assertGreaterEqual(len(violations), 2)
+    
+    def test_vcmpx_to_non_readlane_valu_no_extra_wait(self):
+        """Test that v_cmpx -> other VALU (not readlane/writelane) has 0 wait."""
+        vcmpx = create_vcmpx_instruction(variant="eq_f32", src0="v0", src1="v1", address=0)
+        regular_valu = create_valu_vgpr_write(dst="v2", src0="v3", src1="v4", address=1)
+        
+        latency = get_required_latency(vcmpx, regular_valu, self.hw_info)
+        # v_cmpx -> other VALU should be 0 (unless exec is read as constant)
+        self.assertEqual(latency, 0)
+    
+    def test_buffer_store_with_sgpr_offset_no_wait(self):
+        """Test that buffer_store with SGPR offset doesn't require extra wait."""
+        # This is a special case mentioned in Table 11
+        # buffer_store with SGPR offset doesn't need wait states
+        instr = create_instruction("buffer_store_dwordx4", "v[0:3], v4, s[0:3], 0 offen offset:s0", address=0)
+        self.assertTrue(is_buffer_store_with_sgpr_offset(instr) or not is_large_store_instr(instr))
 
 
 # =============================================================================

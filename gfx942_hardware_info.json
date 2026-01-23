@@ -259,6 +259,132 @@
     }
   },
   
+  "software_wait_states": {
+    "description": "Table 11: Required Software-inserted Wait States (hardware does not check these)",
+    
+    "s_setreg_to_s_getreg_same": {
+      "latency": 2,
+      "description": "S_SETREG <*> -> S_GETREG <same reg>"
+    },
+    "s_setreg_to_s_setreg_same": {
+      "latency": 2,
+      "description": "S_SETREG <*> -> S_SETREG <same reg>"
+    },
+    "s_setreg_mode_vskip_to_vector": {
+      "latency": 2,
+      "description": "S_SETREG MODE.vskip -> any vector op",
+      "comment": "Requires two nops or non-vector instructions"
+    },
+    
+    "valu_vcc_exec_to_execz_vccz": {
+      "latency": 5,
+      "description": "VALU that sets VCC or EXEC -> VALU that uses EXECZ or VCCZ as data source"
+    },
+    "valu_sgpr_vcc_to_lane_select": {
+      "latency": 4,
+      "description": "VALU writes SGPR/VCC (readlane, cmp, add/sub, div_scale) -> V_{READ,WRITE}LANE using that SGPR/VCC as lane select"
+    },
+    "valu_vcc_to_div_fmas": {
+      "latency": 4,
+      "description": "VALU writes VCC (including v_div_scale) -> V_DIV_FMAS"
+    },
+    
+    "store_x3_x4_to_vgpr_write": {
+      "latency": 1,
+      "description": "FLAT/GLOBAL/BUFFER_STORE X3/X4/CMPSWAP_X2 -> Write VGPRs holding writedata",
+      "comment": "BUFFER_STORE_* with SGPR offset does not require wait"
+    },
+    "store_x3_x4_to_valu_vgpr_write": {
+      "latency": 2,
+      "description": "FLAT/GLOBAL/BUFFER_STORE X3/X4/CMPSWAP_X2 -> VALU writes VGPRs holding writedata",
+      "comment": "BUFFER_STORE_* with SGPR offset does not require wait"
+    },
+    
+    "valu_sgpr_to_vmem_sgpr": {
+      "latency": 5,
+      "description": "VALU writes SGPR -> VMEM reads that SGPR",
+      "comment": "Hardware assumes no dependency here; user must add wait states"
+    },
+    "salu_m0_to_gds_sendmsg": {
+      "latency": 1,
+      "description": "SALU writes M0 -> GDS, S_SENDMSG"
+    },
+    "salu_m0_to_lds_addtid": {
+      "latency": 1,
+      "description": "SALU writes M0 -> LDS add-TID instruction, buffer_store_LDS_dword, scratch/global with LDS=1"
+    },
+    "salu_m0_to_s_moverel": {
+      "latency": 1,
+      "description": "SALU writes M0 -> S_MOVEREL"
+    },
+    
+    "valu_vgpr_to_dpp": {
+      "latency": 2,
+      "description": "VALU writes VGPR -> VALU DPP reads that VGPR"
+    },
+    "valu_exec_to_dpp": {
+      "latency": 5,
+      "description": "VALU writes EXEC -> VALU DPP op",
+      "comment": "ALU does not forward EXEC to DPP"
+    },
+    
+    "valu_sgpr_vcc_to_valu_const": {
+      "latency": 2,
+      "description": "VALU writes SGPR/VCC -> VALU reads SGPR as constant"
+    },
+    "valu_sgpr_vcc_to_valu_carry": {
+      "latency": 0,
+      "description": "VALU writes SGPR/VCC -> VALU reads SGPR as carry-in"
+    },
+    
+    "vcmpx_to_exec_const": {
+      "latency": 2,
+      "description": "v_cmpx -> VALU reads EXEC as constant"
+    },
+    "vcmpx_to_readlane_writelane": {
+      "latency": 4,
+      "description": "v_cmpx -> V_readlane, v_readfirstlane, v_writelane"
+    },
+    "vcmpx_to_other_valu": {
+      "latency": 0,
+      "description": "v_cmpx -> Other VALU"
+    },
+    
+    "valu_vgpr_to_readlane_vsrc0": {
+      "latency": 1,
+      "description": "VALU writes VGPRn -> v_readlane vsrc0 reads VGPRn"
+    },
+    "valu_opsel_sdwa_to_consumer": {
+      "latency": 1,
+      "description": "VALU op with OPSEL or SDWA that changes bit position -> VALU op consumes result"
+    },
+    "valu_trans_to_non_trans": {
+      "latency": 1,
+      "description": "VALU Trans op -> Non-trans VALU op consumes result"
+    },
+    
+    "vcc_alias_mixed": {
+      "latency": 1,
+      "description": "Mixed use of VCC (alias vs SGPR#) -> v_readlane/v_readfirstlane/v_cmp/v_add*i/v_sub*/v_div_scale/VALU reads VCC as constant",
+      "comment": "VCC can be accessed by name or SGPR#; dependency check logic does not understand they are the same"
+    },
+    
+    "s_setreg_trapsts_to_rfe": {
+      "latency": 1,
+      "description": "S_SETREG TRAPSTS -> RFE, RFE_restore"
+    }
+  },
+  
+  "trans_instructions": {
+    "description": "Table 12: Trans Ops - transcendental instructions requiring extra wait when followed by non-trans consumer",
+    "opcodes": [
+      "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32",
+      "v_rcp_f64", "v_rsq_f64", "v_sqrt_f32", "v_sqrt_f64", "v_sin_f32",
+      "v_cos_f32", "v_rcp_f16", "v_sqrt_f16", "v_rsq_f16", "v_log_f16",
+      "v_exp_f16", "v_sin_f16", "v_cos_f16", "v_exp_legacy_f32", "v_log_legacy_f32"
+    ]
+  },
+  
   "instruction_cycles": {
     "description": "Cycle costs for instruction scheduling",
     "patterns": {

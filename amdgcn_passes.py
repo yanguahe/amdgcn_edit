@@ -701,6 +701,70 @@ def sync_instruction_to_raw_lines(block: BasicBlock, instr: Instruction) -> None
         block.raw_lines[instr.address] = instr.raw_line + '\n'
 
 
+def compute_waitcnt_available_regs(block: BasicBlock, waitcnt_idx: int) -> Set[str]:
+    """
+    Dynamically compute the registers made available by an s_waitcnt instruction.
+    
+    This function computes available_regs based on the CURRENT block state,
+    not relying on pre-computed DDG data which may be stale after instruction moves.
+    
+    For an s_waitcnt with lgkmcnt(N), the available registers are the destination
+    registers of all LGKM operations (ds_read_*, etc.) that precede the waitcnt,
+    up to the N-th most recent one. If N=0, all preceding LGKM ops are waited for.
+    
+    Similarly for vmcnt(N) and VM operations (global_load_*, etc.).
+    
+    Args:
+        block: The basic block
+        waitcnt_idx: Index of the s_waitcnt instruction in the block
+        
+    Returns:
+        Set of register names that become available after this s_waitcnt
+    """
+    if waitcnt_idx >= len(block.instructions):
+        return set()
+    
+    waitcnt_instr = block.instructions[waitcnt_idx]
+    if waitcnt_instr.opcode.lower() != 's_waitcnt':
+        return set()
+    
+    vmcnt, lgkmcnt = parse_waitcnt_operands(waitcnt_instr.operands)
+    
+    available_regs = set()
+    
+    # Collect LGKM operations before the waitcnt
+    if lgkmcnt is not None:
+        lgkm_ops = []
+        for i in range(waitcnt_idx - 1, -1, -1):
+            instr = block.instructions[i]
+            if is_lgkm_op(instr.opcode.lower()):
+                defs, _ = get_instruction_defs_uses(instr)
+                lgkm_ops.append((i, defs))
+        
+        # lgkmcnt(N) means wait for all but the N most recent LGKM ops
+        # So if lgkmcnt=0, all LGKM ops are waited for (all their results are available)
+        # If lgkmcnt=1, the most recent LGKM op is not waited for
+        ops_to_wait = lgkm_ops[lgkmcnt:] if lgkmcnt < len(lgkm_ops) else []
+        for _, defs in ops_to_wait:
+            available_regs.update(defs)
+    
+    # Collect VM operations before the waitcnt
+    if vmcnt is not None:
+        vm_ops = []
+        for i in range(waitcnt_idx - 1, -1, -1):
+            instr = block.instructions[i]
+            if is_vm_op(instr.opcode.lower()):
+                defs, _ = get_instruction_defs_uses(instr)
+                vm_ops.append((i, defs))
+        
+        # vmcnt(N) means wait for all but the N most recent VM ops
+        ops_to_wait = vm_ops[vmcnt:] if vmcnt < len(vm_ops) else []
+        for _, defs in ops_to_wait:
+            available_regs.update(defs)
+    
+    return available_regs
+
+
 # =============================================================================
 # Move Instruction Pass
 # =============================================================================
@@ -754,11 +818,10 @@ def find_dependent_waitcnt(
             if cross_block_regs & uses:
                 return i
             
-            # Check intra-block available registers
-            if i < len(ddg.nodes):
-                intra_block_regs = ddg.nodes[i].available_regs
-                if intra_block_regs & uses:
-                    return i
+            # Check intra-block available registers using dynamic computation
+            intra_block_regs = compute_waitcnt_available_regs(block, i)
+            if intra_block_regs & uses:
+                return i
     
     return None
 
@@ -960,8 +1023,9 @@ def find_immediate_dependency_chain(
                 
                 if instr_before.opcode.lower() == 's_waitcnt':
                     # Check if any chain instruction depends on this s_waitcnt
-                    cross_block_regs = ddg.waitcnt_cross_block_regs.get(before_chain_idx, set())
-                    intra_block_regs = ddg.nodes[before_chain_idx].available_regs if before_chain_idx < len(ddg.nodes) else set()
+                    # Use dynamic computation for accurate available_regs
+                    cross_block_regs = ddg.waitcnt_cross_block_regs.get(before_chain_idx, set()) if ddg else set()
+                    intra_block_regs = compute_waitcnt_available_regs(block, before_chain_idx)
                     all_avail_regs = cross_block_regs | intra_block_regs
                     
                     for idx in chain:
@@ -1037,8 +1101,9 @@ def find_all_dependent_waitcnts(
             prev_instr = block.instructions[prev_idx]
             if prev_instr.opcode.lower() == 's_waitcnt':
                 # Check if we depend on this waitcnt
-                cross_block_regs = ddg.waitcnt_cross_block_regs.get(prev_idx, set())
-                intra_block_regs = ddg.nodes[prev_idx].available_regs if prev_idx < len(ddg.nodes) else set()
+                # Use dynamic computation for accurate available_regs
+                cross_block_regs = ddg.waitcnt_cross_block_regs.get(prev_idx, set()) if ddg else set()
+                intra_block_regs = compute_waitcnt_available_regs(block, prev_idx)
                 all_avail_regs = cross_block_regs | intra_block_regs
                 
                 if all_avail_regs & uses:
@@ -1291,22 +1356,23 @@ class MoveInstructionPass(Pass):
                         break
             
             # Also check for s_waitcnt dependencies (AVAIL)
-            if ddg is not None:
-                for prev_idx in range(idx - 1, -1, -1):
-                    prev_instr = block.instructions[prev_idx]
-                    if prev_instr.opcode.lower() == 's_waitcnt':
-                        cross_block_regs = ddg.waitcnt_cross_block_regs.get(prev_idx, set())
-                        intra_block_regs = ddg.nodes[prev_idx].available_regs if prev_idx < len(ddg.nodes) else set()
-                        all_avail_regs = cross_block_regs | intra_block_regs
-                        
-                        instr_for_check = block.instructions[idx]
-                        _, instr_uses = get_instruction_defs_uses(instr_for_check)
-                        
-                        if all_avail_regs & instr_uses:
-                            if prev_idx not in abt:
-                                abt.add(prev_idx)
-                                to_process.append(prev_idx)
-                            break
+            # Also check for s_waitcnt dependencies (AVAIL)
+            # Use dynamic computation for accurate available_regs
+            for prev_idx in range(idx - 1, -1, -1):
+                prev_instr = block.instructions[prev_idx]
+                if prev_instr.opcode.lower() == 's_waitcnt':
+                    cross_block_regs = ddg.waitcnt_cross_block_regs.get(prev_idx, set()) if ddg else set()
+                    intra_block_regs = compute_waitcnt_available_regs(block, prev_idx)
+                    all_avail_regs = cross_block_regs | intra_block_regs
+                    
+                    instr_for_check = block.instructions[idx]
+                    _, instr_uses = get_instruction_defs_uses(instr_for_check)
+                    
+                    if all_avail_regs & instr_uses:
+                        if prev_idx not in abt:
+                            abt.add(prev_idx)
+                            to_process.append(prev_idx)
+                        break
         
         bb_idx = min(abt) if abt else target_idx
         return abt, bb_idx
@@ -1487,6 +1553,7 @@ class MoveInstructionPass(Pass):
                 else:
                     return False
             
+            
             # WAW: Both write same register -> Usually OK (WAW traversable)
             # But check if B's result is needed later
             waw_conflicts = defs_a & defs_b
@@ -1503,8 +1570,8 @@ class MoveInstructionPass(Pass):
             if opcode_b == 's_waitcnt':
                 vmcnt, lgkmcnt = parse_waitcnt_operands(instr_b.operands)
                 # vm_op/lgkm_op (A) moves DOWN past s_waitcnt (B): B's counter DECREASES by 1
-                # Requirement: counter - 1 >= 0 (i.e., counter > 0 or counter >= 1)
-                # If counter <= 0, cannot move (would become negative)
+                # Rule 1: If N > 0, the move is allowed (N will become N-1 >= 0)
+                # Rule 2: If N = 0, memory op must stay before s_waitcnt (cannot move past)
                 if is_vm_op(opcode_a) and vmcnt is not None and vmcnt <= 0:
                     return False
                 if is_lgkm_op(opcode_a) and lgkmcnt is not None and lgkmcnt <= 0:
@@ -1520,16 +1587,31 @@ class MoveInstructionPass(Pass):
                 if is_lgkm_op(opcode_b) and lgkmcnt is not None and lgkmcnt >= 15:
                     return False
                 
+                # Pre-calculate: count how many vm_op/lgkm_op s_waitcnt will pass from from_idx to to_idx
+                # s_waitcnt cannot move if final counter would exceed max (vmcnt <= 63, lgkmcnt <= 15)
+                vm_ops_to_pass = 0
+                lgkm_ops_to_pass = 0
+                for j in range(from_idx + 1, to_idx + 1):
+                    op_j = block.instructions[j].opcode.lower()
+                    if is_vm_op(op_j):
+                        vm_ops_to_pass += 1
+                    if is_lgkm_op(op_j):
+                        lgkm_ops_to_pass += 1
+                if vmcnt is not None and vmcnt + vm_ops_to_pass > 63:
+                    return False
+                if lgkmcnt is not None and lgkmcnt + lgkm_ops_to_pass > 15:
+                    return False
+                
                 # Check s_waitcnt AVAIL dependency: if B depends on A (s_waitcnt) result,
                 # A cannot move past B (A needs to stay before B)
-                if ddg is not None:
-                    cross_block_regs = ddg.waitcnt_cross_block_regs.get(from_idx, set())
-                    intra_block_regs = ddg.nodes[from_idx].available_regs if from_idx < len(ddg.nodes) else set()
-                    all_avail_regs = cross_block_regs | intra_block_regs
-                    if all_avail_regs & uses_b:
-                        # B depends on s_waitcnt's available registers
-                        # s_waitcnt (A) cannot move past B
-                        return False
+                # Use dynamic computation to get accurate available_regs for current block state
+                cross_block_regs = ddg.waitcnt_cross_block_regs.get(from_idx, set()) if ddg else set()
+                intra_block_regs = compute_waitcnt_available_regs(block, from_idx)
+                all_avail_regs = cross_block_regs | intra_block_regs
+                if all_avail_regs & uses_b:
+                    # B depends on s_waitcnt's available registers
+                    # s_waitcnt (A) cannot move past B
+                    return False
             
             # Don't cross branch/terminator
             if instr_b.is_branch or instr_b.is_terminator:
@@ -1667,11 +1749,27 @@ class MoveInstructionPass(Pass):
                     return False
                 if is_lgkm_op(opcode_b) and lgkmcnt is not None and lgkmcnt <= 0:
                     return False
+                
+                # Pre-calculate: count how many vm_op/lgkm_op s_waitcnt will pass from from_idx to to_idx
+                # s_waitcnt cannot move if it would pass more ops than its counter allows
+                vm_ops_to_pass = 0
+                lgkm_ops_to_pass = 0
+                for j in range(from_idx - 1, to_idx - 1, -1):
+                    op_j = block.instructions[j].opcode.lower()
+                    if is_vm_op(op_j):
+                        vm_ops_to_pass += 1
+                    if is_lgkm_op(op_j):
+                        lgkm_ops_to_pass += 1
+                if vmcnt is not None and vm_ops_to_pass > vmcnt:
+                    return False
+                if lgkmcnt is not None and lgkm_ops_to_pass > lgkmcnt:
+                    return False
             
             # Check s_waitcnt AVAIL dependency
-            if opcode_b == 's_waitcnt' and ddg is not None:
-                cross_block_regs = ddg.waitcnt_cross_block_regs.get(check_idx, set())
-                intra_block_regs = ddg.nodes[check_idx].available_regs if check_idx < len(ddg.nodes) else set()
+            # Use dynamic computation to get accurate available_regs for current block state
+            if opcode_b == 's_waitcnt':
+                cross_block_regs = ddg.waitcnt_cross_block_regs.get(check_idx, set()) if ddg else set()
+                intra_block_regs = compute_waitcnt_available_regs(block, check_idx)
                 all_avail_regs = cross_block_regs | intra_block_regs
                 if all_avail_regs & uses_a:
                     return False
@@ -1718,6 +1816,72 @@ class MoveInstructionPass(Pass):
         Returns:
             The final index of the moved instruction
         """
+        # === New design: Pre-move s_waitcnt adjustment for memory ops moving down ===
+        # When A (vm_op/lgkm_op) moves down, find the s_waitcnt sA that waits for A,
+        # count how many same-type memory ops A will pass through (k),
+        # then decrement sA's counter by k.
+        instr_a = block.instructions[from_idx]
+        opcode_a_initial = instr_a.opcode.lower()
+        is_vm = is_vm_op(opcode_a_initial)
+        is_lgkm = is_lgkm_op(opcode_a_initial)
+        
+        if is_vm or is_lgkm:
+            # Find sA: the first s_waitcnt below A that waits for A
+            sA_idx = -1
+            for i in range(from_idx + 1, len(block.instructions)):
+                if block.instructions[i].opcode.lower() == 's_waitcnt':
+                    vmcnt_i, lgkmcnt_i = parse_waitcnt_operands(block.instructions[i].operands)
+                    # Count memory ops between A and this s_waitcnt
+                    vm_count = 0
+                    lgkm_count = 0
+                    for j in range(from_idx + 1, i):
+                        op_j = block.instructions[j].opcode.lower()
+                        if is_vm_op(op_j):
+                            vm_count += 1
+                        if is_lgkm_op(op_j):
+                            lgkm_count += 1
+                    
+                    # A is the (count + 1)-th op. If counter <= count, A is waited for.
+                    waits_for_a = False
+                    if is_vm and vmcnt_i is not None and vmcnt_i <= vm_count:
+                        waits_for_a = True
+                    if is_lgkm and lgkmcnt_i is not None and lgkmcnt_i <= lgkm_count:
+                        waits_for_a = True
+                    
+                    if waits_for_a:
+                        sA_idx = i
+                        break
+            
+            # If we found sA, count how many same-type memory ops A will pass through
+            # from from_idx to min(to_idx, sA_idx - 1)
+            if sA_idx > from_idx:
+                # Count same-type memory ops between from_idx and to_idx (exclusive of A)
+                # that are also before sA
+                end_idx = min(to_idx, sA_idx - 1)
+                k_vm = 0
+                k_lgkm = 0
+                for j in range(from_idx + 1, end_idx + 1):
+                    op_j = block.instructions[j].opcode.lower()
+                    if is_vm and is_vm_op(op_j):
+                        k_vm += 1
+                    if is_lgkm and is_lgkm_op(op_j):
+                        k_lgkm += 1
+                
+                # Update sA's counter: N - k
+                if k_vm > 0 or k_lgkm > 0:
+                    vmcnt_sA, lgkmcnt_sA = parse_waitcnt_operands(block.instructions[sA_idx].operands)
+                    if is_vm and k_vm > 0 and vmcnt_sA is not None:
+                        new_vmcnt = vmcnt_sA - k_vm
+                        assert new_vmcnt >= 0, f"s_waitcnt at idx {sA_idx} would have vmcnt={new_vmcnt} < 0 after adjustment"
+                        update_waitcnt_instruction(block.instructions[sA_idx], vmcnt_delta=-k_vm)
+                        sync_instruction_to_raw_lines(block, block.instructions[sA_idx])
+                    if is_lgkm and k_lgkm > 0 and lgkmcnt_sA is not None:
+                        new_lgkmcnt = lgkmcnt_sA - k_lgkm
+                        assert new_lgkmcnt >= 0, f"s_waitcnt at idx {sA_idx} would have lgkmcnt={new_lgkmcnt} < 0 after adjustment"
+                        update_waitcnt_instruction(block.instructions[sA_idx], lgkmcnt_delta=-k_lgkm)
+                        sync_instruction_to_raw_lines(block, block.instructions[sA_idx])
+        
+        # === Now do the actual swaps ===
         current_idx = from_idx
         while current_idx < to_idx:
             instr_a = block.instructions[current_idx]
@@ -1730,12 +1894,13 @@ class MoveInstructionPass(Pass):
             # Update s_waitcnt counts
             # Case 1: A (vm_op/lgkm_op) moves DOWN past B (s_waitcnt)
             # A goes from BEFORE s_waitcnt to AFTER -> DECREASE count
+            # SAFETY CHECK: Do not decrease if counter would become negative
             if opcode_b == 's_waitcnt':
                 vmcnt, lgkmcnt = parse_waitcnt_operands(instr_b.operands)
-                if is_vm_op(opcode_a) and vmcnt is not None:
+                if is_vm_op(opcode_a) and vmcnt is not None and vmcnt > 0:
                     update_waitcnt_instruction(instr_b, vmcnt_delta=-1)
                     sync_instruction_to_raw_lines(block, instr_b)
-                if is_lgkm_op(opcode_a) and lgkmcnt is not None:
+                if is_lgkm_op(opcode_a) and lgkmcnt is not None and lgkmcnt > 0:
                     update_waitcnt_instruction(instr_b, lgkmcnt_delta=-1)
                     sync_instruction_to_raw_lines(block, instr_b)
             
@@ -1778,6 +1943,61 @@ class MoveInstructionPass(Pass):
         Returns:
             The final index of the moved instruction
         """
+        # === New design: Pre-move s_waitcnt adjustment for memory ops moving up ===
+        # When A (vm_op/lgkm_op) moves up, find the s_waitcnt sA that waits for A,
+        # then for all s_waitcnt instructions between A and sA (excluding sA),
+        # decrement their counters by 1.
+        instr_a = block.instructions[from_idx]
+        opcode_a_initial = instr_a.opcode.lower()
+        is_vm = is_vm_op(opcode_a_initial)
+        is_lgkm = is_lgkm_op(opcode_a_initial)
+        
+        if is_vm or is_lgkm:
+            # Find sA: the first s_waitcnt below A that waits for A
+            sA_idx = -1
+            for i in range(from_idx + 1, len(block.instructions)):
+                if block.instructions[i].opcode.lower() == 's_waitcnt':
+                    vmcnt_i, lgkmcnt_i = parse_waitcnt_operands(block.instructions[i].operands)
+                    # Check if this s_waitcnt waits for A (not just skips it)
+                    # Count memory ops between A and this s_waitcnt
+                    vm_count = 0
+                    lgkm_count = 0
+                    for j in range(from_idx + 1, i):
+                        op_j = block.instructions[j].opcode.lower()
+                        if is_vm_op(op_j):
+                            vm_count += 1
+                        if is_lgkm_op(op_j):
+                            lgkm_count += 1
+                    
+                    # A is the (count + 1)-th op. If counter < count + 1, A is waited for.
+                    # For vm_op: vmcnt <= vm_count means A is waited for
+                    # For lgkm_op: lgkmcnt <= lgkm_count means A is waited for
+                    waits_for_a = False
+                    if is_vm and vmcnt_i is not None and vmcnt_i <= vm_count:
+                        waits_for_a = True
+                    if is_lgkm and lgkmcnt_i is not None and lgkmcnt_i <= lgkm_count:
+                        waits_for_a = True
+                    
+                    if waits_for_a:
+                        sA_idx = i
+                        break
+            
+            # Now find all s_waitcnt between A and sA (excluding sA), decrement their counters
+            if sA_idx > from_idx + 1:
+                for i in range(from_idx + 1, sA_idx):
+                    if block.instructions[i].opcode.lower() == 's_waitcnt':
+                        vmcnt_i, lgkmcnt_i = parse_waitcnt_operands(block.instructions[i].operands)
+                        # Assert counter > 0 and decrement
+                        if is_vm and vmcnt_i is not None:
+                            assert vmcnt_i > 0, f"s_waitcnt at idx {i} has vmcnt=0, cannot decrement"
+                            update_waitcnt_instruction(block.instructions[i], vmcnt_delta=-1)
+                            sync_instruction_to_raw_lines(block, block.instructions[i])
+                        if is_lgkm and lgkmcnt_i is not None:
+                            assert lgkmcnt_i > 0, f"s_waitcnt at idx {i} has lgkmcnt=0, cannot decrement"
+                            update_waitcnt_instruction(block.instructions[i], lgkmcnt_delta=-1)
+                            sync_instruction_to_raw_lines(block, block.instructions[i])
+        
+        # === Now do the actual swaps ===
         current_idx = from_idx
         while current_idx > to_idx:
             instr_a = block.instructions[current_idx]
@@ -1785,7 +2005,6 @@ class MoveInstructionPass(Pass):
             
             opcode_a = instr_a.opcode.lower()
             opcode_b = instr_b.opcode.lower()
-            
             
             # Update s_waitcnt counts
             # Case 1: A (vm_op/lgkm_op) moves UP past B (s_waitcnt)
@@ -1801,12 +2020,13 @@ class MoveInstructionPass(Pass):
             
             # Case 2: A (s_waitcnt) moves UP past B (vm_op/lgkm_op)
             # B goes from BEFORE s_waitcnt to AFTER -> DECREASE count
+            # SAFETY CHECK: Do not decrease if counter would become negative
             if opcode_a == 's_waitcnt':
                 vmcnt, lgkmcnt = parse_waitcnt_operands(instr_a.operands)
-                if is_vm_op(opcode_b) and vmcnt is not None:
+                if is_vm_op(opcode_b) and vmcnt is not None and vmcnt > 0:
                     update_waitcnt_instruction(instr_a, vmcnt_delta=-1)
                     sync_instruction_to_raw_lines(block, instr_a)
-                if is_lgkm_op(opcode_b) and lgkmcnt is not None:
+                if is_lgkm_op(opcode_b) and lgkmcnt is not None and lgkmcnt > 0:
                     update_waitcnt_instruction(instr_a, lgkmcnt_delta=-1)
                     sync_instruction_to_raw_lines(block, instr_a)
             
@@ -2210,10 +2430,11 @@ class MoveInstructionPass(Pass):
         
         # Check if we need to cascade move with s_waitcnt
         cascaded = []
-        if instr_b.opcode.lower() == 's_waitcnt' and ddg:
+        if instr_b.opcode.lower() == 's_waitcnt':
             _, uses_a = get_instruction_defs_uses(instr_a)
-            cross_block_regs = ddg.waitcnt_cross_block_regs.get(prev_idx, set())
-            intra_block_regs = ddg.nodes[prev_idx].available_regs if prev_idx < len(ddg.nodes) else set()
+            # Use dynamic computation for accurate available_regs
+            cross_block_regs = ddg.waitcnt_cross_block_regs.get(prev_idx, set()) if ddg else set()
+            intra_block_regs = compute_waitcnt_available_regs(block, prev_idx)
             all_avail_regs = cross_block_regs | intra_block_regs
             
             if all_avail_regs & uses_a:
@@ -2362,9 +2583,10 @@ class MoveInstructionPass(Pass):
             can_skip = False
             
             # Check if it's s_waitcnt - if any instruction in ORIGINAL chain depends on it
-            if instr_before.opcode.lower() == 's_waitcnt' and ddg:
-                cross_block_regs = ddg.waitcnt_cross_block_regs.get(before_chain_idx, set())
-                intra_block_regs = ddg.nodes[before_chain_idx].available_regs if before_chain_idx < len(ddg.nodes) else set()
+            if instr_before.opcode.lower() == 's_waitcnt':
+                # Use dynamic computation for accurate available_regs
+                cross_block_regs = ddg.waitcnt_cross_block_regs.get(before_chain_idx, set()) if ddg else set()
+                intra_block_regs = compute_waitcnt_available_regs(block, before_chain_idx)
                 all_avail_regs = cross_block_regs | intra_block_regs
                 
                 # Check if any instruction in the ORIGINAL chain uses these registers
@@ -2618,8 +2840,9 @@ class MoveInstructionPass(Pass):
             
             if instr_before_before.opcode.lower() == 's_waitcnt':
                 # Check if instr_before depends on this s_waitcnt (AVAIL dependency)
-                cross_block_regs = ddg.waitcnt_cross_block_regs.get(instr_before_before_idx, set())
-                intra_block_regs = ddg.nodes[instr_before_before_idx].available_regs if instr_before_before_idx < len(ddg.nodes) else set()
+                # Use dynamic computation for accurate available_regs
+                cross_block_regs = ddg.waitcnt_cross_block_regs.get(instr_before_before_idx, set()) if ddg else set()
+                intra_block_regs = compute_waitcnt_available_regs(block, instr_before_before_idx)
                 all_avail_regs = cross_block_regs | intra_block_regs
                 
                 _, uses_before = get_instruction_defs_uses(instr_before)

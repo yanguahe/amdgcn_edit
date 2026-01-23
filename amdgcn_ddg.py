@@ -313,12 +313,198 @@ VCC_READERS = {
 # Instructions that write to EXEC
 EXEC_WRITERS = {
     's_and_saveexec_b64', 's_or_saveexec_b64', 's_xor_saveexec_b64',
+    's_andn2_saveexec_b64', 's_orn2_saveexec_b64', 's_nand_saveexec_b64',
+    's_nor_saveexec_b64', 's_xnor_saveexec_b64', 's_not_saveexec_b64',
+    's_andn1_saveexec_b64', 's_orn1_saveexec_b64',
+    's_andn1_wrexec_b64', 's_andn2_wrexec_b64',
 }
 
 # Instructions that read EXEC
 EXEC_READERS = {
     's_cbranch_execz', 's_cbranch_execnz',
 }
+
+# =============================================================================
+# Table 11: Software Wait States - Additional Instruction Sets
+# =============================================================================
+
+# VALU instructions that write SGPR or VCC (for Table 11 latency rules)
+# These require special wait states before certain consumers
+VALU_SGPR_WRITERS = {
+    # v_readlane/v_readfirstlane - write SGPR
+    'v_readlane_b32', 'v_readfirstlane_b32',
+    
+    # v_cmp* - write VCC (or SGPR in VOP3 encoding)
+    'v_cmp_eq_f32', 'v_cmp_lt_f32', 'v_cmp_le_f32', 'v_cmp_gt_f32', 'v_cmp_ge_f32',
+    'v_cmp_ne_f32', 'v_cmp_neq_f32', 'v_cmp_nlt_f32', 'v_cmp_nle_f32', 'v_cmp_ngt_f32',
+    'v_cmp_nge_f32', 'v_cmp_o_f32', 'v_cmp_u_f32',
+    'v_cmp_eq_f64', 'v_cmp_lt_f64', 'v_cmp_le_f64', 'v_cmp_gt_f64', 'v_cmp_ge_f64',
+    'v_cmp_ne_f64', 'v_cmp_neq_f64', 'v_cmp_nlt_f64', 'v_cmp_nle_f64', 'v_cmp_ngt_f64',
+    'v_cmp_nge_f64', 'v_cmp_o_f64', 'v_cmp_u_f64',
+    'v_cmp_eq_i32', 'v_cmp_lt_i32', 'v_cmp_le_i32', 'v_cmp_gt_i32', 'v_cmp_ge_i32', 'v_cmp_ne_i32',
+    'v_cmp_eq_u32', 'v_cmp_lt_u32', 'v_cmp_le_u32', 'v_cmp_gt_u32', 'v_cmp_ge_u32', 'v_cmp_ne_u32',
+    'v_cmp_eq_i64', 'v_cmp_lt_i64', 'v_cmp_le_i64', 'v_cmp_gt_i64', 'v_cmp_ge_i64', 'v_cmp_ne_i64',
+    'v_cmp_eq_u64', 'v_cmp_lt_u64', 'v_cmp_le_u64', 'v_cmp_gt_u64', 'v_cmp_ge_u64', 'v_cmp_ne_u64',
+    'v_cmp_eq_f16', 'v_cmp_lt_f16', 'v_cmp_le_f16', 'v_cmp_gt_f16', 'v_cmp_ge_f16', 'v_cmp_ne_f16',
+    'v_cmp_class_f32', 'v_cmp_class_f64', 'v_cmp_class_f16',
+    
+    # v_add/sub with carry - write VCC
+    'v_add_co_u32', 'v_sub_co_u32', 'v_addc_co_u32', 'v_subb_co_u32',
+    'v_add_co_ci_u32', 'v_sub_co_ci_u32',
+    
+    # v_div_scale - writes both VGPR and VCC
+    'v_div_scale_f32', 'v_div_scale_f64',
+}
+
+# v_cmpx instructions - write EXEC (for Table 11 latency rules)
+VCMPX_INSTRUCTIONS = {
+    'v_cmpx_eq_f32', 'v_cmpx_lt_f32', 'v_cmpx_le_f32', 'v_cmpx_gt_f32', 'v_cmpx_ge_f32',
+    'v_cmpx_ne_f32', 'v_cmpx_neq_f32', 'v_cmpx_nlt_f32', 'v_cmpx_nle_f32', 'v_cmpx_ngt_f32',
+    'v_cmpx_nge_f32', 'v_cmpx_o_f32', 'v_cmpx_u_f32',
+    'v_cmpx_eq_f64', 'v_cmpx_lt_f64', 'v_cmpx_le_f64', 'v_cmpx_gt_f64', 'v_cmpx_ge_f64',
+    'v_cmpx_ne_f64', 'v_cmpx_neq_f64', 'v_cmpx_nlt_f64', 'v_cmpx_nle_f64', 'v_cmpx_ngt_f64',
+    'v_cmpx_nge_f64', 'v_cmpx_o_f64', 'v_cmpx_u_f64',
+    'v_cmpx_eq_i32', 'v_cmpx_lt_i32', 'v_cmpx_le_i32', 'v_cmpx_gt_i32', 'v_cmpx_ge_i32', 'v_cmpx_ne_i32',
+    'v_cmpx_eq_u32', 'v_cmpx_lt_u32', 'v_cmpx_le_u32', 'v_cmpx_gt_u32', 'v_cmpx_ge_u32', 'v_cmpx_ne_u32',
+    'v_cmpx_eq_i64', 'v_cmpx_lt_i64', 'v_cmpx_le_i64', 'v_cmpx_gt_i64', 'v_cmpx_ge_i64', 'v_cmpx_ne_i64',
+    'v_cmpx_eq_u64', 'v_cmpx_lt_u64', 'v_cmpx_le_u64', 'v_cmpx_gt_u64', 'v_cmpx_ge_u64', 'v_cmpx_ne_u64',
+    'v_cmpx_eq_f16', 'v_cmpx_lt_f16', 'v_cmpx_le_f16', 'v_cmpx_gt_f16', 'v_cmpx_ge_f16', 'v_cmpx_ne_f16',
+    'v_cmpx_class_f32', 'v_cmpx_class_f64', 'v_cmpx_class_f16',
+}
+
+# Transcendental instructions (Table 12) - require extra wait when followed by non-trans consumer
+TRANS_INSTRUCTIONS = {
+    'v_exp_f32', 'v_log_f32', 'v_rcp_f32', 'v_rcp_iflag_f32', 'v_rsq_f32',
+    'v_rcp_f64', 'v_rsq_f64', 'v_sqrt_f32', 'v_sqrt_f64', 'v_sin_f32',
+    'v_cos_f32', 'v_rcp_f16', 'v_sqrt_f16', 'v_rsq_f16', 'v_log_f16',
+    'v_exp_f16', 'v_sin_f16', 'v_cos_f16', 'v_exp_legacy_f32', 'v_log_legacy_f32',
+}
+
+# Large store instructions that require extra wait states (X3, X4, CMPSWAP_X2)
+LARGE_STORE_INSTRUCTIONS = {
+    # FLAT stores
+    'flat_store_dwordx3', 'flat_store_dwordx4',
+    'flat_atomic_cmpswap_x2', 'flat_atomic_fcmpswap_x2',
+    # GLOBAL stores
+    'global_store_dwordx3', 'global_store_dwordx4',
+    'global_atomic_cmpswap_x2', 'global_atomic_fcmpswap_x2',
+    # SCRATCH stores
+    'scratch_store_dwordx3', 'scratch_store_dwordx4',
+    # BUFFER stores
+    'buffer_store_dwordx3', 'buffer_store_dwordx4',
+    'buffer_store_format_xyz', 'buffer_store_format_xyzw',
+    'buffer_atomic_cmpswap_x2', 'buffer_atomic_fcmpswap_x2',
+}
+
+# Instructions that read EXECZ or VCCZ as data source
+EXECZ_VCCZ_READERS = {
+    # These are rare but can occur in specialized code
+    # VALU that explicitly reads EXECZ or VCCZ
+    # Usually these flags are read via s_cbranch, but they can also be used as data
+}
+
+# Instructions that read/write M0 register
+M0_WRITERS = {
+    's_mov_b32',  # When dst is m0
+    's_movk_i32',  # When dst is m0
+}
+
+M0_READERS = {
+    # LDS add-TID instructions
+    'ds_add_u32', 'ds_sub_u32', 'ds_rsub_u32', 'ds_inc_u32', 'ds_dec_u32',
+    'ds_min_i32', 'ds_max_i32', 'ds_min_u32', 'ds_max_u32',
+    'ds_and_b32', 'ds_or_b32', 'ds_xor_b32',
+    'ds_mskor_b32', 'ds_write_b32', 'ds_write2_b32', 'ds_write2st64_b32',
+    'ds_cmpst_b32', 'ds_cmpst_f32', 'ds_min_f32', 'ds_max_f32',
+    'ds_add_f32', 'ds_add_rtn_u32', 'ds_sub_rtn_u32',
+    # GDS instructions
+    's_sendmsg', 's_sendmsghalt',
+    # S_MOVEREL
+    's_movrels_b32', 's_movrels_b64', 's_movreld_b32', 's_movreld_b64',
+}
+
+
+def is_valu_sgpr_writer(opcode: str) -> bool:
+    """Check if VALU instruction writes SGPR/VCC."""
+    opcode_lower = opcode.lower()
+    if opcode_lower in VALU_SGPR_WRITERS:
+        return True
+    # Pattern matching for v_cmp* variants
+    if opcode_lower.startswith('v_cmp_') and not opcode_lower.startswith('v_cmpx_'):
+        return True
+    return False
+
+
+def is_vcmpx_instruction(opcode: str) -> bool:
+    """Check if instruction is v_cmpx* (writes EXEC)."""
+    opcode_lower = opcode.lower()
+    if opcode_lower in VCMPX_INSTRUCTIONS:
+        return True
+    return opcode_lower.startswith('v_cmpx_')
+
+
+def is_trans_instruction(opcode: str) -> bool:
+    """Check if instruction is a transcendental instruction (Table 12)."""
+    return opcode.lower() in TRANS_INSTRUCTIONS
+
+
+def is_large_store_instruction(opcode: str) -> bool:
+    """Check if instruction is a large store (X3, X4, CMPSWAP_X2)."""
+    opcode_lower = opcode.lower()
+    if opcode_lower in LARGE_STORE_INSTRUCTIONS:
+        return True
+    # Pattern matching for other variants
+    if 'store' in opcode_lower and ('x3' in opcode_lower or 'x4' in opcode_lower):
+        return True
+    if 'atomic' in opcode_lower and 'cmpswap' in opcode_lower and 'x2' in opcode_lower:
+        return True
+    return False
+
+
+def is_dpp_instruction(instr) -> bool:
+    """Check if instruction uses DPP (Data Parallel Primitive) modifier."""
+    # DPP is indicated by _dpp suffix or dpp modifier in operands
+    opcode_lower = instr.opcode.lower()
+    if '_dpp' in opcode_lower:
+        return True
+    # Check operands for DPP modifiers
+    operands_lower = instr.operands.lower()
+    if 'quad_perm' in operands_lower or 'row_' in operands_lower or 'dpp' in operands_lower:
+        return True
+    return False
+
+
+def is_sdwa_instruction(instr) -> bool:
+    """Check if instruction uses SDWA (Sub-Dword Addressing) modifier."""
+    opcode_lower = instr.opcode.lower()
+    if '_sdwa' in opcode_lower:
+        return True
+    operands_lower = instr.operands.lower()
+    if 'dst_sel' in operands_lower or 'src0_sel' in operands_lower or 'src1_sel' in operands_lower:
+        return True
+    return False
+
+
+def is_opsel_instruction(instr) -> bool:
+    """Check if instruction uses OPSEL modifier that changes bit position."""
+    operands_lower = instr.operands.lower()
+    return 'op_sel' in operands_lower or 'opsel' in operands_lower
+
+
+def is_readlane_instruction(opcode: str) -> bool:
+    """Check if instruction is v_readlane or v_readfirstlane."""
+    opcode_lower = opcode.lower()
+    return opcode_lower.startswith('v_readlane') or opcode_lower.startswith('v_readfirstlane')
+
+
+def is_writelane_instruction(opcode: str) -> bool:
+    """Check if instruction is v_writelane."""
+    return opcode.lower().startswith('v_writelane')
+
+
+def is_readlane_or_writelane(opcode: str) -> bool:
+    """Check if instruction is v_readlane, v_readfirstlane, or v_writelane."""
+    return is_readlane_instruction(opcode) or is_writelane_instruction(opcode)
 
 
 # =============================================================================

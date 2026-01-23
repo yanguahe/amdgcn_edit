@@ -39,6 +39,27 @@ from amdgcn_ddg import (
     DDG,
     InstructionNode,
     parse_instruction_registers,
+    # Table 11 instruction sets
+    VALU_SGPR_WRITERS,
+    VCMPX_INSTRUCTIONS,
+    TRANS_INSTRUCTIONS,
+    LARGE_STORE_INSTRUCTIONS,
+    M0_WRITERS,
+    M0_READERS,
+    VCC_WRITERS,
+    VCC_READERS,
+    EXEC_WRITERS,
+    # Table 11 helper functions
+    is_valu_sgpr_writer,
+    is_vcmpx_instruction as ddg_is_vcmpx_instruction,
+    is_trans_instruction as ddg_is_trans_instruction,
+    is_large_store_instruction as ddg_is_large_store_instruction,
+    is_dpp_instruction as ddg_is_dpp_instruction,
+    is_sdwa_instruction as ddg_is_sdwa_instruction,
+    is_opsel_instruction as ddg_is_opsel_instruction,
+    is_readlane_instruction,
+    is_writelane_instruction,
+    is_readlane_or_writelane,
 )
 
 
@@ -398,6 +419,314 @@ def is_memory_read_instruction(instr: Instruction) -> bool:
 
 
 # =============================================================================
+# Table 11: Software Wait States - Classification Functions
+# =============================================================================
+
+def is_trans_instruction(instr: Instruction, hw_info: Optional['HardwareInfo'] = None) -> bool:
+    """
+    Check if instruction is a transcendental instruction (Table 12).
+    
+    Trans ops require 1 extra wait state when followed by non-trans VALU consumer.
+    """
+    return ddg_is_trans_instruction(instr.opcode)
+
+
+def is_dpp_instruction(instr: Instruction) -> bool:
+    """
+    Check if instruction uses DPP (Data Parallel Primitive) modifier.
+    
+    DPP instructions have special wait state requirements:
+    - VALU writes VGPR -> DPP reads that VGPR: 2 wait states
+    - VALU writes EXEC -> DPP op: 5 wait states
+    """
+    return ddg_is_dpp_instruction(instr)
+
+
+def is_opsel_instruction(instr: Instruction) -> bool:
+    """
+    Check if instruction uses OPSEL modifier that changes bit position.
+    
+    OPSEL instructions require 1 wait state before consumer.
+    """
+    return ddg_is_opsel_instruction(instr)
+
+
+def is_sdwa_instruction(instr: Instruction) -> bool:
+    """
+    Check if instruction uses SDWA (Sub-Dword Addressing) modifier.
+    
+    SDWA instructions that change bit position require 1 wait state before consumer.
+    """
+    return ddg_is_sdwa_instruction(instr)
+
+
+def is_vcmpx_instruction(instr: Instruction) -> bool:
+    """
+    Check if instruction is v_cmpx* (writes EXEC).
+    
+    v_cmpx has special wait state requirements:
+    - v_cmpx -> VALU reads EXEC as constant: 2 wait states
+    - v_cmpx -> v_readlane/v_readfirstlane/v_writelane: 4 wait states
+    """
+    return ddg_is_vcmpx_instruction(instr.opcode)
+
+
+def is_readlane_writelane_instr(instr: Instruction) -> bool:
+    """Check if instruction is v_readlane, v_readfirstlane, or v_writelane."""
+    return is_readlane_or_writelane(instr.opcode)
+
+
+def is_s_setreg(instr: Instruction) -> bool:
+    """Check if instruction is s_setreg_*."""
+    return instr.opcode.lower().startswith('s_setreg')
+
+
+def is_s_getreg(instr: Instruction) -> bool:
+    """Check if instruction is s_getreg_*."""
+    return instr.opcode.lower().startswith('s_getreg')
+
+
+def is_vmem_instruction(instr: Instruction) -> bool:
+    """Check if instruction is a vector memory instruction."""
+    opcode = instr.opcode.lower()
+    return opcode.startswith(('global_', 'buffer_', 'flat_', 'scratch_'))
+
+
+def is_large_store_instr(instr: Instruction) -> bool:
+    """
+    Check if instruction is a large store (X3, X4, CMPSWAP_X2).
+    
+    Large stores have special wait state requirements when followed by
+    writes to VGPRs holding the writedata.
+    """
+    return ddg_is_large_store_instruction(instr.opcode)
+
+
+def writes_m0(instr: Instruction) -> bool:
+    """
+    Check if instruction writes to M0 register.
+    
+    M0 writes require wait states before GDS, S_SENDMSG, LDS add-TID, and S_MOVEREL.
+    """
+    opcode = instr.opcode.lower()
+    if opcode not in ('s_mov_b32', 's_movk_i32'):
+        return False
+    # Check if destination is m0
+    operands = instr.operands.lower()
+    return operands.strip().startswith('m0')
+
+
+def reads_m0(instr: Instruction) -> bool:
+    """Check if instruction reads M0 register."""
+    opcode = instr.opcode.lower()
+    # Check explicit M0 readers
+    if opcode in M0_READERS:
+        return True
+    # Check if operands contain m0
+    return 'm0' in instr.operands.lower()
+
+
+def is_gds_instruction(instr: Instruction) -> bool:
+    """Check if instruction is a GDS instruction."""
+    opcode = instr.opcode.lower()
+    return opcode.startswith('gds_') or opcode == 's_sendmsg' or opcode == 's_sendmsghalt'
+
+
+def is_s_moverel(instr: Instruction) -> bool:
+    """Check if instruction is s_movrels or s_movreld."""
+    opcode = instr.opcode.lower()
+    return opcode.startswith('s_movrels') or opcode.startswith('s_movreld')
+
+
+def is_div_fmas(instr: Instruction) -> bool:
+    """Check if instruction is v_div_fmas (reads VCC)."""
+    opcode = instr.opcode.lower()
+    return opcode.startswith('v_div_fmas')
+
+
+def valu_writes_vcc(instr: Instruction) -> bool:
+    """Check if VALU instruction writes VCC."""
+    opcode = instr.opcode.lower()
+    if opcode in VCC_WRITERS:
+        return True
+    # v_cmp* instructions write VCC
+    if opcode.startswith('v_cmp_') and not opcode.startswith('v_cmpx_'):
+        return True
+    # v_add_co_u32, v_sub_co_u32, etc. write VCC
+    if 'co_u32' in opcode or 'co_ci_u32' in opcode:
+        return True
+    return False
+
+
+def valu_writes_exec(instr: Instruction) -> bool:
+    """Check if VALU instruction writes EXEC (v_cmpx*)."""
+    return is_vcmpx_instruction(instr)
+
+
+def valu_writes_sgpr(instr: Instruction) -> bool:
+    """
+    Check if VALU instruction writes SGPR.
+    
+    Only v_readlane and v_readfirstlane write SGPR directly.
+    """
+    opcode = instr.opcode.lower()
+    return opcode.startswith('v_readlane') or opcode.startswith('v_readfirstlane')
+
+
+def valu_writes_sgpr_or_vcc(instr: Instruction) -> bool:
+    """Check if VALU instruction writes SGPR or VCC."""
+    return valu_writes_sgpr(instr) or valu_writes_vcc(instr)
+
+
+def uses_execz_or_vccz(instr: Instruction) -> bool:
+    """
+    Check if instruction uses EXECZ or VCCZ as data source.
+    
+    This is rare but can occur in specialized code.
+    """
+    operands = instr.operands.lower()
+    return 'execz' in operands or 'vccz' in operands
+
+
+def get_setreg_target(instr: Instruction) -> Optional[str]:
+    """
+    Extract the target register from s_setreg instruction.
+    
+    Returns the register name or None if not applicable.
+    """
+    if not is_s_setreg(instr):
+        return None
+    # s_setreg_b32 hwreg(HW_REG_MODE), s0
+    # Extract the hwreg part
+    operands = instr.operands.lower()
+    if 'hwreg' in operands:
+        start = operands.find('hwreg(')
+        if start >= 0:
+            end = operands.find(')', start)
+            if end > start:
+                return operands[start+6:end].strip()
+    return None
+
+
+def get_getreg_target(instr: Instruction) -> Optional[str]:
+    """
+    Extract the target register from s_getreg instruction.
+    
+    Returns the register name or None if not applicable.
+    """
+    if not is_s_getreg(instr):
+        return None
+    # s_getreg_b32 s0, hwreg(HW_REG_MODE)
+    # Extract the hwreg part
+    operands = instr.operands.lower()
+    if 'hwreg' in operands:
+        start = operands.find('hwreg(')
+        if start >= 0:
+            end = operands.find(')', start)
+            if end > start:
+                return operands[start+6:end].strip()
+    return None
+
+
+def get_hwreg_target(instr: Instruction) -> Optional[str]:
+    """
+    Extract the hwreg target from s_setreg or s_getreg instruction.
+    
+    Returns the register name or None if not applicable.
+    """
+    if is_s_setreg(instr):
+        return get_setreg_target(instr)
+    elif is_s_getreg(instr):
+        return get_getreg_target(instr)
+    return None
+
+
+def same_setreg_target(first_instr: Instruction, second_instr: Instruction) -> bool:
+    """Check if two s_setreg/s_getreg instructions target the same register."""
+    target1 = get_hwreg_target(first_instr)
+    target2 = get_hwreg_target(second_instr)
+    if target1 is None or target2 is None:
+        return False
+    return target1 == target2
+
+
+def is_vector_instruction(instr: Instruction) -> bool:
+    """Check if instruction is a vector instruction."""
+    opcode = instr.opcode.lower()
+    return opcode.startswith('v_') or opcode.startswith('global_') or opcode.startswith('flat_')
+
+
+def is_vskip_setreg(instr: Instruction) -> bool:
+    """Check if instruction is s_setreg that sets MODE.vskip."""
+    if not is_s_setreg(instr):
+        return False
+    target = get_setreg_target(instr)
+    return target is not None and 'mode' in target.lower()
+
+
+def reads_vgpr_as_lane_select(instr: Instruction, written_regs: Set[str]) -> bool:
+    """
+    Check if instruction reads a register as lane select.
+    
+    v_readlane and v_writelane use an SGPR/VCC as lane select (operand 2).
+    """
+    opcode = instr.opcode.lower()
+    if not (opcode.startswith('v_readlane') or opcode.startswith('v_writelane')):
+        return False
+    
+    # v_readlane_b32 dst, vsrc0, lane_select
+    # v_writelane_b32 vdst, src0, lane_select
+    operands = instr.operands.split(',')
+    if len(operands) >= 3:
+        lane_select = operands[2].strip().lower()
+        # Check if lane_select is one of the written registers
+        for reg in written_regs:
+            if reg.lower() in lane_select or lane_select in reg.lower():
+                return True
+    return False
+
+
+def reads_exec_as_constant(instr: Instruction) -> bool:
+    """
+    Check if instruction reads EXEC as a constant (not as execution mask).
+    
+    This is distinct from normal EXEC usage for masking vector operations.
+    """
+    operands = instr.operands.lower()
+    # EXEC as explicit operand
+    return 'exec' in operands
+
+
+def get_store_writedata_vgprs(instr: Instruction) -> Set[str]:
+    """
+    Get the VGPR(s) that hold the writedata for a store instruction.
+    
+    For stores, the data operand is typically the first VGPR operand.
+    """
+    if not is_large_store_instr(instr):
+        return set()
+    
+    defs, uses = parse_instruction_registers(instr)
+    # For stores, the uses typically include the data VGPRs
+    return {r for r in uses if r.startswith('v')}
+
+
+def is_buffer_store_with_sgpr_offset(instr: Instruction) -> bool:
+    """
+    Check if instruction is a buffer_store with SGPR offset.
+    
+    Buffer stores with SGPR offset do not require wait states.
+    """
+    opcode = instr.opcode.lower()
+    if not opcode.startswith('buffer_store'):
+        return False
+    # Check if offset is an SGPR
+    operands = instr.operands.lower()
+    # This is a simplified check - actual format varies
+    return 'offset:s' in operands or 'offen' not in operands
+
+
+# =============================================================================
 # Register Dependency Analysis
 # =============================================================================
 
@@ -646,7 +975,147 @@ def get_required_latency(
             pass_to_latency = {2: 5, 4: 7, 8: 11, 16: 19}
             return pass_to_latency.get(passes, 7)
     
-    return 0
+    # =========================================================================
+    # Table 11: Required Software-inserted Wait States
+    # =========================================================================
+    # These rules are NOT checked by hardware and must be enforced by software.
+    # We return the maximum latency from all applicable rules.
+    
+    max_latency = 0
+    first_dst = get_instruction_dst_registers(first_instr)
+    second_src = get_instruction_src_registers(second_instr)
+    
+    # --- Rule 1: S_SETREG rules (2 wait states) ---
+    if is_s_setreg(first_instr):
+        # S_SETREG <*> -> S_GETREG <same reg>
+        if is_s_getreg(second_instr) and same_setreg_target(first_instr, second_instr):
+            max_latency = max(max_latency, 2)
+        # S_SETREG <*> -> S_SETREG <same reg>
+        if is_s_setreg(second_instr) and same_setreg_target(first_instr, second_instr):
+            max_latency = max(max_latency, 2)
+        # S_SETREG MODE.vskip -> any vector op
+        if is_vskip_setreg(first_instr) and is_vector_instruction(second_instr):
+            max_latency = max(max_latency, 2)
+    
+    # --- Rule 2: VALU VCC/EXEC -> EXECZ/VCCZ (5 wait states) ---
+    if (valu_writes_vcc(first_instr) or valu_writes_exec(first_instr)):
+        if uses_execz_or_vccz(second_instr):
+            max_latency = max(max_latency, 5)
+    
+    # --- Rule 3: VALU SGPR/VCC -> lane select (4 wait states) ---
+    if valu_writes_sgpr_or_vcc(first_instr):
+        if reads_vgpr_as_lane_select(second_instr, first_dst):
+            max_latency = max(max_latency, 4)
+    
+    # --- Rule 4: VALU VCC -> V_DIV_FMAS (4 wait states) ---
+    if valu_writes_vcc(first_instr) and is_div_fmas(second_instr):
+        max_latency = max(max_latency, 4)
+    
+    # --- Rule 5: Large store -> VGPR write (1-2 wait states) ---
+    if is_large_store_instr(first_instr):
+        # Skip if buffer_store with SGPR offset (no wait required)
+        if not is_buffer_store_with_sgpr_offset(first_instr):
+            store_vgprs = get_store_writedata_vgprs(first_instr)
+            second_dst = get_instruction_dst_registers(second_instr)
+            if check_register_overlap(store_vgprs, second_dst):
+                # VALU writes VGPRs holding writedata: 2 wait
+                if is_valu_instruction(second_instr):
+                    max_latency = max(max_latency, 2)
+                # Other writes VGPRs holding writedata: 1 wait
+                else:
+                    max_latency = max(max_latency, 1)
+    
+    # --- Rule 6: VALU SGPR -> VMEM SGPR (5 wait states) ---
+    if valu_writes_sgpr(first_instr):
+        if is_vmem_instruction(second_instr):
+            # Check if VMEM reads an SGPR that VALU wrote
+            if check_register_overlap(first_dst, second_src):
+                max_latency = max(max_latency, 5)
+    
+    # --- Rule 7: SALU M0 -> GDS/S_SENDMSG (1 wait state) ---
+    if writes_m0(first_instr):
+        if is_gds_instruction(second_instr):
+            max_latency = max(max_latency, 1)
+    
+    # --- Rule 8: SALU M0 -> LDS add-TID/S_MOVEREL (1 wait state) ---
+    if writes_m0(first_instr):
+        if is_s_moverel(second_instr) or reads_m0(second_instr):
+            max_latency = max(max_latency, 1)
+    
+    # --- Rule 9: VALU VGPR -> DPP (2 wait states) ---
+    if is_valu_instruction(first_instr) and is_dpp_instruction(second_instr):
+        # Check VGPR dependency
+        vgpr_written = {r for r in first_dst if r.startswith('v')}
+        vgpr_read = {r for r in second_src if r.startswith('v')}
+        if check_register_overlap(vgpr_written, vgpr_read):
+            max_latency = max(max_latency, 2)
+    
+    # --- Rule 10: VALU EXEC -> DPP (5 wait states) ---
+    if valu_writes_exec(first_instr) and is_dpp_instruction(second_instr):
+        max_latency = max(max_latency, 5)
+    
+    # --- Rule 11: VALU SGPR/VCC -> VALU const (2 wait states) ---
+    # Note: carry-in is 0 wait states, handled by not entering this branch
+    if valu_writes_sgpr_or_vcc(first_instr) and is_valu_instruction(second_instr):
+        # Check if VALU reads SGPR as constant (not as carry-in)
+        second_opcode = second_instr.opcode.lower()
+        # Carry-in instructions read VCC as carry, not constant
+        is_carry_consumer = 'addc' in second_opcode or 'subb' in second_opcode
+        if not is_carry_consumer and check_register_overlap(first_dst, second_src):
+            max_latency = max(max_latency, 2)
+    
+    # --- Rule 12: v_cmpx -> VALU EXEC const (2 wait states) ---
+    if is_vcmpx_instruction(first_instr):
+        if reads_exec_as_constant(second_instr):
+            max_latency = max(max_latency, 2)
+        # v_cmpx -> v_readlane/v_readfirstlane/v_writelane (4 wait states)
+        if is_readlane_writelane_instr(second_instr):
+            max_latency = max(max_latency, 4)
+    
+    # --- Rule 13: VALU VGPR -> v_readlane vsrc0 (1 wait state) ---
+    if is_valu_instruction(first_instr):
+        second_opcode = second_instr.opcode.lower()
+        if second_opcode.startswith('v_readlane'):
+            # v_readlane_b32 dst, vsrc0, lane_select
+            # Check if first writes VGPR that readlane reads as vsrc0
+            operands = second_instr.operands.split(',')
+            if len(operands) >= 2:
+                vsrc0 = operands[1].strip().lower()
+                vgpr_written = {r for r in first_dst if r.startswith('v')}
+                for vgpr in vgpr_written:
+                    if vgpr in vsrc0:
+                        max_latency = max(max_latency, 1)
+                        break
+    
+    # --- Rule 14: VALU OPSEL/SDWA -> consumer (1 wait state) ---
+    if is_opsel_instruction(first_instr) or is_sdwa_instruction(first_instr):
+        if is_valu_instruction(second_instr):
+            if check_register_overlap(first_dst, second_src):
+                max_latency = max(max_latency, 1)
+    
+    # --- Rule 15: VALU Trans -> non-trans consumer (1 wait state) ---
+    if is_trans_instruction(first_instr):
+        if is_valu_instruction(second_instr) and not is_trans_instruction(second_instr):
+            if check_register_overlap(first_dst, second_src):
+                max_latency = max(max_latency, 1)
+    
+    # --- Rule 16: VCC alias mixed (1 wait state) ---
+    # Mixed use of VCC (alias vs SGPR#) -> certain consumers
+    # This is complex to detect precisely; we approximate by checking
+    # if first writes VCC and second reads VCC-related SGPR
+    if valu_writes_vcc(first_instr):
+        second_opcode = second_instr.opcode.lower()
+        # v_readlane/v_readfirstlane/v_cmp/v_add*i/v_sub*/v_div_scale/VALU reads VCC as constant
+        if (second_opcode.startswith('v_readlane') or 
+            second_opcode.startswith('v_readfirstlane') or
+            second_opcode.startswith('v_cmp_') or
+            'add' in second_opcode or 'sub' in second_opcode or
+            second_opcode.startswith('v_div_scale')):
+            # Check for potential VCC read as constant
+            if 'vcc' in second_instr.operands.lower():
+                max_latency = max(max_latency, 1)
+    
+    return max_latency
 
 
 def count_independent_instructions(
@@ -738,8 +1207,9 @@ def find_latency_violations(
     """
     Find all latency constraint violations in a basic block.
     
-    This scans for MFMA instructions and checks if subsequent instructions
-    that depend on their outputs have sufficient distance.
+    This scans for:
+    1. MFMA instructions and checks if subsequent instructions have sufficient distance
+    2. Table 11 software wait state violations
     
     Args:
         block: The basic block to analyze
@@ -753,30 +1223,23 @@ def find_latency_violations(
         hw_info = load_hardware_info()
     
     violations = []
+    checked_pairs = set()  # Track (first_idx, second_idx) pairs already checked
     
     for i, instr in enumerate(block.instructions):
-        if not is_mfma_instruction(instr):
-            continue
-        
-        mfma_dst = get_mfma_dst_registers(instr)
-        if not mfma_dst:
-            continue
-        
-        # Check all subsequent instructions
+        # Check all subsequent instructions for potential latency requirements
         for j in range(i + 1, len(block.instructions)):
-            reader = block.instructions[j]
-            reader_src = get_instruction_src_registers(reader)
-            
-            # Skip if no register dependency
-            if not check_register_overlap(mfma_dst, reader_src):
+            # Skip if already checked
+            if (i, j) in checked_pairs:
                 continue
             
-            # Calculate required latency
+            reader = block.instructions[j]
+            
+            # Calculate required latency (handles both MFMA and Table 11 rules)
             required = get_required_latency(instr, reader, hw_info)
             if required == 0:
                 continue
             
-            # Count actual independent instructions
+            # Count actual independent instructions/cycles between them
             actual = count_independent_instructions(block, i + 1, j, instr, hw_info)
             
             if actual < required:
@@ -790,9 +1253,12 @@ def find_latency_violations(
                     actual_independent=actual,
                     nops_needed=nops_needed
                 ))
-            
-            # Only check the first dependent instruction for each MFMA
-            break
+                checked_pairs.add((i, j))
+                
+                # For MFMA instructions, only check the first dependent instruction
+                # to avoid redundant violations (other rules may have multiple)
+                if is_mfma_instruction(instr):
+                    break
     
     return violations
 
@@ -801,7 +1267,32 @@ def find_latency_violations(
 # s_nop Instruction Creation
 # =============================================================================
 
-def create_snop_instruction(count: int, address: int = 0) -> Instruction:
+# Counter for generating unique negative addresses for synthetic instructions.
+# Negative addresses are used to distinguish synthetic (inserted) instructions
+# from original instructions, and to ensure verification skips them.
+_synthetic_address_counter = -1
+
+
+def get_next_synthetic_address() -> int:
+    """Get the next unique synthetic address (negative value)."""
+    global _synthetic_address_counter
+    addr = _synthetic_address_counter
+    _synthetic_address_counter -= 1
+    return addr
+
+
+def reset_synthetic_address_counter():
+    """Reset the synthetic address counter (useful for testing)."""
+    global _synthetic_address_counter
+    _synthetic_address_counter = -1
+
+
+def is_synthetic_address(address: int) -> bool:
+    """Check if an address is synthetic (negative or zero)."""
+    return address <= 0
+
+
+def create_snop_instruction(count: int, address: int = None) -> Instruction:
     """
     Create an s_nop instruction.
     
@@ -809,7 +1300,9 @@ def create_snop_instruction(count: int, address: int = 0) -> Instruction:
     
     Args:
         count: The operand for s_nop (0-15)
-        address: The address/line number for the instruction
+        address: The address/line number for the instruction.
+                 If None, a unique negative address is assigned to mark
+                 this as a synthetic (inserted) instruction.
         
     Returns:
         Instruction object for s_nop
@@ -818,6 +1311,10 @@ def create_snop_instruction(count: int, address: int = 0) -> Instruction:
         count = 0
     elif count > 15:
         count = 15
+    
+    # Use synthetic address if not specified
+    if address is None:
+        address = get_next_synthetic_address()
     
     return Instruction(
         address=address,
@@ -960,7 +1457,7 @@ class InsertLatencyNopsPass:
         insert_idx = violation.second_idx
         
         for count in snop_counts:
-            snop = create_snop_instruction(count, address=0)
+            snop = create_snop_instruction(count)  # Use synthetic address
             block.instructions.insert(insert_idx, snop)
             insert_idx += 1
         
@@ -1038,6 +1535,8 @@ def check_move_preserves_latency(
     """
     Check if moving an instruction would violate latency constraints.
     
+    This checks both MFMA latency rules (Table 37) and software wait states (Table 11).
+    
     Args:
         block: The basic block
         from_idx: Current index of instruction
@@ -1051,39 +1550,52 @@ def check_move_preserves_latency(
         hw_info = load_hardware_info()
     
     instr = block.instructions[from_idx]
-    
-    # Check if instruction is MFMA
-    if is_mfma_instruction(instr):
-        mfma_dst = get_mfma_dst_registers(instr)
-        
-        # If moving down, check distance to dependent instructions
-        if to_idx > from_idx:
-            for j in range(from_idx + 1, len(block.instructions)):
-                reader = block.instructions[j]
-                reader_src = get_instruction_src_registers(reader)
-                
-                if check_register_overlap(mfma_dst, reader_src):
-                    required = get_required_latency(instr, reader, hw_info)
-                    # New distance after move
-                    new_distance = j - to_idx - 1 if j > to_idx else j - from_idx - 1
-                    if new_distance < required:
-                        return False
-                    break
-    
-    # Check if instruction reads MFMA output
+    instr_dst = get_instruction_dst_registers(instr)
     instr_src = get_instruction_src_registers(instr)
     
-    # If moving up, check distance from preceding MFMAs
+    # === Moving down ===
+    if to_idx > from_idx:
+        # Check if the instruction being moved requires wait states before any
+        # subsequent instruction that it will now be closer to
+        for j in range(from_idx + 1, len(block.instructions)):
+            reader = block.instructions[j]
+            
+            # Calculate required latency (handles both MFMA and Table 11 rules)
+            required = get_required_latency(instr, reader, hw_info)
+            if required > 0:
+                # Calculate new distance after move
+                new_distance = j - to_idx - 1 if j > to_idx else j - from_idx - 1
+                if new_distance < required:
+                    return False
+        
+        # Also check if any preceding instruction requires wait states before
+        # the instruction being moved (since other instructions may shift)
+        # This is handled by check_move_side_effects_on_latency
+    
+    # === Moving up ===
     if to_idx < from_idx:
+        # Check if any preceding instruction requires wait states before
+        # the instruction being moved (which will now be closer)
         for i in range(to_idx - 1, -1, -1):
             prev_instr = block.instructions[i]
-            if is_mfma_instruction(prev_instr):
-                mfma_dst = get_mfma_dst_registers(prev_instr)
-                if check_register_overlap(mfma_dst, instr_src):
-                    required = get_required_latency(prev_instr, instr, hw_info)
-                    new_distance = to_idx - i - 1
-                    if new_distance < required:
-                        return False
+            
+            # Calculate required latency (handles both MFMA and Table 11 rules)
+            required = get_required_latency(prev_instr, instr, hw_info)
+            if required > 0:
+                new_distance = to_idx - i - 1
+                if new_distance < required:
+                    return False
+        
+        # Also check if the instruction being moved requires wait states
+        # before any instruction that will now follow it
+        for j in range(from_idx + 1, len(block.instructions)):
+            reader = block.instructions[j]
+            required = get_required_latency(instr, reader, hw_info)
+            if required > 0:
+                # After move, instr is at to_idx, reader stays at j
+                new_distance = j - to_idx - 1
+                if new_distance < required:
+                    return False
     
     return True
 

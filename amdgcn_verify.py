@@ -558,6 +558,11 @@ def verify_optimization(
         
         # Check that "before" instructions are still before the barrier
         for before_addr in region.before_addrs:
+            # Skip synthetic instructions (address <= 0)
+            # These are inserted instructions (like s_nop) that don't need barrier checking
+            if before_addr <= 0:
+                continue
+            
             if before_addr not in new_positions:
                 continue  # Instruction might have been in a different block
             
@@ -581,6 +586,10 @@ def verify_optimization(
         
         # Check that "after" instructions are still after the barrier
         for after_addr in region.after_addrs:
+            # Skip synthetic instructions (address <= 0)
+            if after_addr <= 0:
+                continue
+            
             if after_addr not in new_positions:
                 continue  # Instruction might have been in a different block
             
@@ -739,6 +748,9 @@ def verify_and_report(
         barrier_pos = new_positions[barrier_addr]
         
         for before_addr in region.before_addrs:
+            # Skip synthetic instructions (address <= 0)
+            if before_addr <= 0:
+                continue
             if before_addr not in new_positions:
                 continue
             before_pos = new_positions[before_addr]
@@ -753,6 +765,9 @@ def verify_and_report(
                 result.success = False
         
         for after_addr in region.after_addrs:
+            # Skip synthetic instructions (address <= 0)
+            if after_addr <= 0:
+                continue
             if after_addr not in new_positions:
                 continue
             after_pos = new_positions[after_addr]
