@@ -195,7 +195,7 @@ def load_pass_list(pass_list_path: str) -> list:
                 'block': pass_config['block'],
                 'index': pass_config['index'],
                 'cycles': pass_config['cycles'],
-                'barrier_crossing_opcodes': set(pass_config.get('barrier_crossing_opcodes', []))
+                'is_move_s_barrier': pass_config.get('is_move_s_barrier', False)
             })
         elif pass_type == 'distribute':
             passes.append({
@@ -203,7 +203,7 @@ def load_pass_list(pass_list_path: str) -> list:
                 'block': pass_config['block'],
                 'opcode': pass_config['opcode'],
                 'k': pass_config['k'],
-                'barrier_crossing_opcodes': set(pass_config.get('barrier_crossing_opcodes', []))
+                'is_move_s_barrier': pass_config.get('is_move_s_barrier', False)
             })
         elif pass_type == 'replace_registers':
             passes.append({
@@ -258,7 +258,7 @@ class PassListDebugger:
         self.ideal_cycles = []
         self.frozen_boundary = 0
         self.protected_instructions = []
-        self.barrier_crossing_opcodes = set()
+        self.is_move_s_barrier = False
         
     def log(self, msg, force=False):
         """Print message if verbose or forced."""
@@ -341,7 +341,7 @@ class PassListDebugger:
                     instr_index=pass_config['index'],
                     cycles=pass_config['cycles'],
                     verbose=self.verbose,
-                    barrier_crossing_opcodes=pass_config.get('barrier_crossing_opcodes', set())
+                    is_move_s_barrier=pass_config.get('is_move_s_barrier', False)
                 )
                 move_pass.run(self.result)
                 return True, None
@@ -352,7 +352,7 @@ class PassListDebugger:
                     target_opcode=pass_config['opcode'],
                     distribute_count=pass_config['k'],
                     verbose=self.verbose,
-                    barrier_crossing_opcodes=pass_config.get('barrier_crossing_opcodes', set())
+                    is_move_s_barrier=pass_config.get('is_move_s_barrier', False)
                 )
                 dist_pass.run(self.result)
                 return True, None
@@ -387,7 +387,7 @@ class PassListDebugger:
         self.block_label = pass_config['block']
         self.target_opcode = pass_config['opcode']
         self.K = pass_config['k']
-        self.barrier_crossing_opcodes = pass_config.get('barrier_crossing_opcodes', set())
+        self.is_move_s_barrier = pass_config.get('is_move_s_barrier', False)
         
         self.block = self.result.cfg.blocks.get(self.block_label)
         if not self.block:
@@ -497,7 +497,7 @@ class PassListDebugger:
                 verbose=False,
                 frozen_boundary=self.frozen_boundary,
                 protected_instructions=protected_instrs,
-                barrier_crossing_opcodes=self.barrier_crossing_opcodes
+                is_move_s_barrier=self.is_move_s_barrier
             )
             move_pass.run(self.result)
             
@@ -568,8 +568,7 @@ class PassListDebugger:
             # Additional verification after this step (in case apply_distribute_step doesn't use MoveInstructionPass)
             print("Verifying...", end=" ", flush=True)
             try:
-                verify_optimization(original_gdg, self.result.cfg, 
-                                   barrier_crossing_opcodes=self.barrier_crossing_opcodes)
+                verify_optimization(original_gdg, self.result.cfg)
                 print("✓ PASS")
             except SchedulingVerificationError as e:
                 print("✗ VERIFICATION FAILED")
@@ -710,7 +709,7 @@ class PassListDebugger:
                 verbose=False,
                 frozen_boundary=self.frozen_boundary,
                 protected_instructions=level2_protected,  # Use same protected list as apply_distribute_step
-                barrier_crossing_opcodes=self.barrier_crossing_opcodes
+                is_move_s_barrier=self.is_move_s_barrier
             )
             
             # Try to run the move - MoveInstructionPass.run() calls verify_optimization internally
@@ -1015,10 +1014,8 @@ class DistributeDebugger:
         self.verbose = args.verbose
         self.test_cmd = args.test_cmd
         
-        if hasattr(args, 'barrier_crossing') and args.barrier_crossing:
-            self.barrier_crossing_opcodes = set(args.barrier_crossing.split(','))
-        else:
-            self.barrier_crossing_opcodes = set()
+        # Use is_move_s_barrier instead of barrier_crossing_opcodes
+        self.is_move_s_barrier = getattr(args, 'is_move_s_barrier', False)
         
         self.skip_test = args.skip_test
         
@@ -1168,7 +1165,7 @@ class DistributeDebugger:
                 verbose=False,
                 frozen_boundary=self.frozen_boundary,
                 protected_instructions=self.protected_instructions,
-                barrier_crossing_opcodes=self.barrier_crossing_opcodes
+                is_move_s_barrier=self.is_move_s_barrier
             )
             move_pass.run(self.result)
             
@@ -1299,7 +1296,7 @@ class DistributeDebugger:
                 verbose=False,
                 frozen_boundary=self.frozen_boundary,
                 protected_instructions=self.protected_instructions,
-                barrier_crossing_opcodes=self.barrier_crossing_opcodes
+                is_move_s_barrier=self.is_move_s_barrier
             )
             success = move_pass.run(self.result)
             

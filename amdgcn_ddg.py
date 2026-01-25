@@ -3317,16 +3317,15 @@ def main():
                             '(e.g., 267 1000 v[40:45] 2 s[37:40] 1)')
     parser.add_argument('--transform-json', '-t', default=None,
                        help='Load transform passes from JSON file. Format: [{"type": "move", ...}, ...]')
-    parser.add_argument('--barrier-crossing', default=None,
-                       help='Comma-separated opcodes allowed to cross s_barrier (e.g., global_load_dwordx4,global_store_dwordx4)')
+    parser.add_argument('--is-move-s-barrier', action='store_true',
+                       help='Allow moving s_barrier along with gap instructions when processing gaps')
     
     args = parser.parse_args()
     
-    # Parse barrier_crossing_opcodes
-    barrier_crossing_opcodes = None
-    if args.barrier_crossing:
-        barrier_crossing_opcodes = set(args.barrier_crossing.split(','))
-        print(f"Barrier crossing opcodes: {barrier_crossing_opcodes}")
+    # Parse is_move_s_barrier flag
+    is_move_s_barrier = args.is_move_s_barrier
+    if is_move_s_barrier:
+        print(f"is_move_s_barrier: True (s_barrier can be moved with gap instructions)")
     
     # Check input arguments
     if args.load_json is None and args.input is None:
@@ -3361,7 +3360,7 @@ def main():
                         'block': pass_config['block'],
                         'index': pass_config['index'],
                         'cycles': pass_config['cycles'],
-                        'barrier_crossing_opcodes': set(pass_config.get('barrier_crossing_opcodes', []))
+                        'is_move_s_barrier': pass_config.get('is_move_s_barrier', False)
                     })
                 elif pass_type == 'distribute':
                     transform_pass_list.append({
@@ -3369,7 +3368,7 @@ def main():
                         'block': pass_config['block'],
                         'opcode': pass_config['opcode'],
                         'k': pass_config['k'],
-                        'barrier_crossing_opcodes': set(pass_config.get('barrier_crossing_opcodes', []))
+                        'is_move_s_barrier': pass_config.get('is_move_s_barrier', False)
                     })
                 elif pass_type == 'replace_registers':
                     transform_pass_list.append({
@@ -3454,15 +3453,15 @@ def main():
                     instr_index = pass_config['index']
                     cycles = pass_config['cycles']
                     
-                    # Use pass-specific barrier_crossing_opcodes if provided, otherwise use global
-                    pass_barrier_crossing = pass_config.get('barrier_crossing_opcodes', barrier_crossing_opcodes)
+                    # Use pass-specific is_move_s_barrier if provided, otherwise use global
+                    pass_is_move_s_barrier = pass_config.get('is_move_s_barrier', is_move_s_barrier)
                     
                     dir_str = "up" if cycles > 0 else "down"
                     print(f"  Moving instruction {instr_index} in {block_label} {dir_str} by {abs(cycles)} cycles...")
-                    if pass_barrier_crossing:
-                        print(f"    Barrier crossing opcodes: {pass_barrier_crossing}")
+                    if pass_is_move_s_barrier:
+                        print(f"    is_move_s_barrier: True")
                     move_result = move_instruction(result, block_label, instr_index, cycles, verbose=True,
-                                                   barrier_crossing_opcodes=pass_barrier_crossing)
+                                                   is_move_s_barrier=pass_is_move_s_barrier)
                     
                     if move_result.success:
                         print(f"  Success: {move_result.message}")
@@ -3477,14 +3476,14 @@ def main():
                     target_opcode = pass_config['opcode']
                     distribute_count = pass_config['k']
                     
-                    # Use pass-specific barrier_crossing_opcodes if provided, otherwise use global
-                    pass_barrier_crossing = pass_config.get('barrier_crossing_opcodes', barrier_crossing_opcodes)
+                    # Use pass-specific is_move_s_barrier if provided, otherwise use global
+                    pass_is_move_s_barrier = pass_config.get('is_move_s_barrier', is_move_s_barrier)
                     
                     print(f"  Distributing {target_opcode} in {block_label} (K={distribute_count})...")
-                    if pass_barrier_crossing:
-                        print(f"    Barrier crossing opcodes: {pass_barrier_crossing}")
+                    if pass_is_move_s_barrier:
+                        print(f"    is_move_s_barrier: True")
                     success = distribute_instructions(result, block_label, target_opcode, distribute_count, verbose=True,
-                                                      barrier_crossing_opcodes=pass_barrier_crossing)
+                                                      is_move_s_barrier=pass_is_move_s_barrier)
                     
                     if success:
                         print(f"  Distribution completed successfully")

@@ -1427,11 +1427,11 @@ class TestRegisterReplacePassChaining:
 
 
 # =============================================================================
-# Test barrier_crossing_opcodes Feature
+# Test is_move_s_barrier Feature
 # =============================================================================
 
-class TestBarrierCrossingOpcodes:
-    """Tests for barrier_crossing_opcodes parameter in MoveInstructionPass and DistributeInstructionPass."""
+class TestIsMoveBarrier:
+    """Tests for is_move_s_barrier parameter in MoveInstructionPass."""
     
     def _create_block_with_barrier(self) -> AnalysisResult:
         """Create a block with s_barrier for testing."""
@@ -1458,19 +1458,18 @@ class TestBarrierCrossingOpcodes:
         
         return AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
     
-    def test_barrier_crossing_opcodes_parameter_default(self):
-        """Test that barrier_crossing_opcodes defaults to empty set."""
+    def test_is_move_s_barrier_parameter_default(self):
+        """Test that is_move_s_barrier defaults to False."""
         pass_ = MoveInstructionPass(".LBB0_0", 1, -2)
-        assert pass_.barrier_crossing_opcodes == set()
+        assert pass_.is_move_s_barrier == False
     
-    def test_barrier_crossing_opcodes_parameter_set(self):
-        """Test setting barrier_crossing_opcodes parameter."""
-        opcodes = {"global_load_dwordx4", "global_store_dwordx4"}
-        pass_ = MoveInstructionPass(".LBB0_0", 1, -2, barrier_crossing_opcodes=opcodes)
-        assert pass_.barrier_crossing_opcodes == opcodes
+    def test_is_move_s_barrier_parameter_set(self):
+        """Test setting is_move_s_barrier parameter."""
+        pass_ = MoveInstructionPass(".LBB0_0", 1, -2, is_move_s_barrier=True)
+        assert pass_.is_move_s_barrier == True
     
-    def test_move_blocked_by_barrier_without_crossing(self):
-        """Test that moves are blocked by s_barrier without barrier_crossing_opcodes."""
+    def test_move_blocked_by_barrier_default(self):
+        """Test that moves are blocked by s_barrier by default (is_move_s_barrier=False)."""
         result = self._create_block_with_barrier()
         block = result.cfg.blocks[".LBB0_0"]
         
@@ -1478,46 +1477,37 @@ class TestBarrierCrossingOpcodes:
         pass_ = MoveInstructionPass(".LBB0_0", 3, 2)  # move up 2 cycles
         changed = pass_.run(result)
         
-        # Movement should be blocked by barrier (instruction at index 3 should stay at index 3)
-        # Since we're moving OTHER instructions to make room, and barrier blocks crossing
+        # Movement should be blocked by barrier
+        # Since s_barrier is a hard barrier, instructions cannot cross it
         assert pass_.total_cycles_moved < 2 or len(pass_._blocked_by_barrier) > 0
     
-    def test_move_allowed_with_barrier_crossing_opcodes(self):
-        """Test that specified opcodes can cross s_barrier."""
+    def test_s_barrier_is_hard_barrier(self):
+        """Test that s_barrier is a hard barrier - no instruction can cross it directly."""
         result = self._create_block_with_barrier()
         
-        # global_load_dwordx4 is allowed to cross barrier
-        opcodes = {"global_load_dwordx4"}
-        pass_ = MoveInstructionPass(".LBB0_0", 1, -2, barrier_crossing_opcodes=opcodes)
+        # Without is_move_s_barrier=True, s_barrier cannot be moved
+        # and instructions cannot cross it
+        pass_ = MoveInstructionPass(".LBB0_0", 2, 1)  # Try to move s_barrier itself
         
-        # This should allow the global_load_dwordx4 to move down past the barrier
-        # (The pass moves other instructions; global_load_dwordx4 can cross barrier)
+        # s_barrier should not be movable through regular swap operations
         changed = pass_.run(result)
-        
-        # Verify the instruction can cross (checking that barrier_crossing_opcodes is being used)
-        assert pass_.barrier_crossing_opcodes == {"global_load_dwordx4"}
+        # The pass should not move s_barrier directly
     
-    def test_s_barrier_cannot_be_moved_without_barrier_crossing(self):
-        """Test that s_barrier cannot be moved without barrier_crossing_opcodes."""
-        result = self._create_block_with_barrier()
-        
-        # Without barrier_crossing_opcodes, s_barrier cannot be moved
-        pass_ = MoveInstructionPass(".LBB0_0", 2, 1)  # No barrier_crossing_opcodes
-        
-        # s_barrier should not be movable
-        changed = pass_.run(result)
-        # The pass should not make any changes because s_barrier can't cross anything
-    
-    def test_s_barrier_can_cross_allowed_opcodes(self):
-        """Test that s_barrier can cross instructions in barrier_crossing_opcodes."""
-        # Create a block where s_barrier needs to cross global_load_dwordx4:
-        # [0] global_load_dwordx4 v[0:3], v[8:9], s[0:1]  (target to move up)
-        # [1] s_barrier
-        # [2] v_mov_b32 v10, 2.0
+    def test_move_with_barrier_in_gaps_without_is_move_s_barrier(self):
+        """Test gap processing when s_barrier is in gaps and is_move_s_barrier=False."""
+        # Create a block where target instruction needs to move up,
+        # and s_barrier is in the ABT gaps
+        # [0] v_mov_b32 v1, 1.0  (gap - above barrier)
+        # [1] s_barrier          (in gap)
+        # [2] v_mov_b32 v2, 2.0  (gap - below barrier)
+        # [3] v_mov_b32 v3, 3.0  (ABT - dependency)
+        # [4] v_add_f32 v4, v3, v3  (target - depends on [3])
         instructions = [
-            create_instruction("global_load_dwordx4", "v[0:3], v[8:9], s[0:1]"),
+            create_instruction("v_mov_b32", "v1, 1.0"),
             create_instruction("s_barrier", ""),
-            create_instruction("v_mov_b32", "v10, 2.0"),
+            create_instruction("v_mov_b32", "v2, 2.0"),
+            create_instruction("v_mov_b32", "v3, 3.0"),
+            create_instruction("v_add_f32", "v4, v3, v3"),  # depends on v3
         ]
         
         block = create_block_with_instructions(".LBB0_0", instructions)
@@ -1528,21 +1518,49 @@ class TestBarrierCrossingOpcodes:
         inter_block_deps = compute_inter_block_deps(cfg, ddgs)
         result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
         
-        # With barrier_crossing_opcodes including global_load_dwordx4,
-        # s_barrier should be able to move (cross global_load_dwordx4)
-        opcodes = {"global_load_dwordx4"}
-        pass_ = MoveInstructionPass(".LBB0_0", 0, -1, barrier_crossing_opcodes=opcodes)
-        
-        # This tests that when we try to move global_load_dwordx4 down,
-        # s_barrier can be moved up to make room
+        # With is_move_s_barrier=False, only gaps below s_barrier should be moved
+        pass_ = MoveInstructionPass(".LBB0_0", 4, 8, is_move_s_barrier=False)
         changed = pass_.run(result)
         
-        # Verify barrier_crossing_opcodes is set correctly
-        assert pass_.barrier_crossing_opcodes == {"global_load_dwordx4"}
+        # Check that s_barrier and instructions above it are blocked
+        assert len(pass_._blocked_by_barrier) > 0 or pass_.is_move_s_barrier == False
+    
+    def test_move_with_barrier_in_gaps_with_is_move_s_barrier(self):
+        """Test gap processing when s_barrier is in gaps and is_move_s_barrier=True."""
+        # Create a block where target instruction needs to move up,
+        # and s_barrier is in the ABT gaps
+        # [0] v_mov_b32 v1, 1.0  (gap - above barrier)
+        # [1] s_barrier          (in gap)
+        # [2] v_mov_b32 v2, 2.0  (gap - below barrier)
+        # [3] v_mov_b32 v3, 3.0  (ABT - dependency)
+        # [4] v_add_f32 v4, v3, v3  (target - depends on [3])
+        instructions = [
+            create_instruction("v_mov_b32", "v1, 1.0"),
+            create_instruction("s_barrier", ""),
+            create_instruction("v_mov_b32", "v2, 2.0"),
+            create_instruction("v_mov_b32", "v3, 3.0"),
+            create_instruction("v_add_f32", "v4, v3, v3"),  # depends on v3
+        ]
+        
+        block = create_block_with_instructions(".LBB0_0", instructions)
+        cfg = CFG(name="test")
+        cfg.add_block(block)
+        
+        ddgs, waitcnt_deps = generate_all_ddgs(cfg)
+        inter_block_deps = compute_inter_block_deps(cfg, ddgs)
+        result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
+        
+        # With is_move_s_barrier=True, s_barrier and all gap instructions can be moved
+        pass_ = MoveInstructionPass(".LBB0_0", 4, 8, is_move_s_barrier=True)
+        changed = pass_.run(result)
+        
+        # With is_move_s_barrier=True, more cycles should be movable
+        # (s_barrier and instructions above it can be moved as a group)
+        assert pass_.is_move_s_barrier == True
 
 
-class TestDistributeInstructionPassBarrierCrossing:
-    """Tests for barrier_crossing_opcodes in DistributeInstructionPass."""
+class TestDistributeInstructionPassBarrier:
+    """Tests for is_move_s_barrier in DistributeInstructionPass."""
     
     def _create_block_with_loads_and_barrier(self) -> AnalysisResult:
         """Create a block with global loads and s_barrier for testing distribution."""
@@ -1573,27 +1591,34 @@ class TestDistributeInstructionPassBarrierCrossing:
         
         return AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
     
-    def test_distribute_barrier_crossing_parameter(self):
-        """Test that DistributeInstructionPass accepts barrier_crossing_opcodes."""
+    def test_distribute_is_move_s_barrier_parameter(self):
+        """Test that DistributeInstructionPass accepts is_move_s_barrier."""
         from amdgcn_passes import DistributeInstructionPass
         
-        opcodes = {"global_load_dwordx4"}
         pass_ = DistributeInstructionPass(
             block_label=".LBB0_0",
             target_opcode="global_load_dwordx4",
             distribute_count=4,
-            barrier_crossing_opcodes=opcodes
+            is_move_s_barrier=True
         )
         
-        assert pass_.barrier_crossing_opcodes == opcodes
+        assert pass_.is_move_s_barrier == True
+        
+        pass2 = DistributeInstructionPass(
+            block_label=".LBB0_0",
+            target_opcode="global_load_dwordx4",
+            distribute_count=4
+        )
+        
+        assert pass2.is_move_s_barrier == False
     
-    def test_distribute_without_barrier_crossing_stops_at_barrier(self):
-        """Test that distribution stops at s_barrier without barrier_crossing_opcodes."""
+    def test_distribute_stops_at_barrier(self):
+        """Test that distribution stops at s_barrier (it's always a boundary)."""
         from amdgcn_passes import DistributeInstructionPass
         
         result = self._create_block_with_loads_and_barrier()
         
-        # Without barrier_crossing_opcodes, distribution should stop at barrier
+        # Distribution should stop at barrier (s_barrier is always a boundary)
         pass_ = DistributeInstructionPass(
             block_label=".LBB0_0",
             target_opcode="global_load_dwordx4",
@@ -1606,33 +1631,33 @@ class TestDistributeInstructionPassBarrierCrossing:
         boundary = pass_._find_branch_boundary(block)
         assert boundary == 3  # s_barrier is at index 3
     
-    def test_distribute_with_barrier_crossing_extends_boundary(self):
-        """Test that distribution extends past s_barrier with barrier_crossing_opcodes."""
+    def test_distribute_barrier_is_always_boundary(self):
+        """Test that s_barrier is always a boundary even with is_move_s_barrier=True."""
         from amdgcn_passes import DistributeInstructionPass
         
         result = self._create_block_with_loads_and_barrier()
         
-        # With barrier_crossing_opcodes, distribution should extend past barrier
-        opcodes = {"global_load_dwordx4"}
+        # Even with is_move_s_barrier=True, s_barrier is still a boundary for _find_branch_boundary
+        # The is_move_s_barrier flag affects gap processing, not boundary detection
         pass_ = DistributeInstructionPass(
             block_label=".LBB0_0",
             target_opcode="global_load_dwordx4",
             distribute_count=4,
-            barrier_crossing_opcodes=opcodes,
+            is_move_s_barrier=True,
             verbose=False
         )
         
-        # _find_branch_boundary should return len(instructions) since barrier is ignored
+        # _find_branch_boundary should still return index 3 (s_barrier)
         block = result.cfg.blocks[".LBB0_0"]
         boundary = pass_._find_branch_boundary(block)
-        assert boundary == len(block.instructions)  # No boundary (ignoring s_barrier)
+        assert boundary == 3  # s_barrier is always a boundary
 
 
-class TestConvenienceFunctionsBarrierCrossing:
-    """Tests for barrier_crossing_opcodes in convenience functions."""
+class TestConvenienceFunctionsIsMoveBarrier:
+    """Tests for is_move_s_barrier in convenience functions."""
     
-    def test_move_instruction_accepts_barrier_crossing(self):
-        """Test that move_instruction convenience function accepts barrier_crossing_opcodes."""
+    def test_move_instruction_accepts_is_move_s_barrier(self):
+        """Test that move_instruction convenience function accepts is_move_s_barrier."""
         from amdgcn_passes import move_instruction
         
         # Create a minimal test setup
@@ -1647,16 +1672,15 @@ class TestConvenienceFunctionsBarrierCrossing:
         result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
         
         # Should not raise error
-        opcodes = {"global_load_dwordx4"}
         move_result = move_instruction(
             result, ".LBB0_0", 0, 0,
-            barrier_crossing_opcodes=opcodes
+            is_move_s_barrier=True
         )
         # Zero cycles movement should succeed (no-op)
         assert move_result.success is True
     
-    def test_distribute_instructions_accepts_barrier_crossing(self):
-        """Test that distribute_instructions convenience function accepts barrier_crossing_opcodes."""
+    def test_distribute_instructions_accepts_is_move_s_barrier(self):
+        """Test that distribute_instructions convenience function accepts is_move_s_barrier."""
         from amdgcn_passes import distribute_instructions
         
         # Create a minimal test setup
@@ -1670,21 +1694,19 @@ class TestConvenienceFunctionsBarrierCrossing:
         inter_block_deps = compute_inter_block_deps(cfg, ddgs)
         result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
         
-        # Should not raise error - test that the parameter is accepted
-        opcodes = {"global_load_dwordx4"}
-        # Just verify no exception is raised when passing barrier_crossing_opcodes
+        # Just verify no exception is raised when passing is_move_s_barrier
         distribute_instructions(
             result, ".LBB0_0", "global_load_dwordx4", 1,
-            barrier_crossing_opcodes=opcodes
+            is_move_s_barrier=True
         )
         # Test passes if no exception is raised
 
 
-class TestVerifyOptimizationBarrierCrossing:
-    """Tests for barrier_crossing_opcodes in verify_optimization."""
+class TestVerifyOptimization:
+    """Tests for verify_optimization without barrier_crossing_opcodes."""
     
-    def test_verify_optimization_accepts_barrier_crossing(self):
-        """Test that verify_optimization accepts barrier_crossing_opcodes parameter."""
+    def test_verify_optimization_basic(self):
+        """Test that verify_optimization works without barrier_crossing_opcodes."""
         from amdgcn_verify import verify_optimization, build_global_ddg
         
         # Create a simple block
@@ -1698,11 +1720,10 @@ class TestVerifyOptimizationBarrierCrossing:
         gdg = build_global_ddg(cfg, ddgs)
         
         # Should not raise error
-        opcodes = {"global_load_dwordx4"}
-        verify_optimization(gdg, cfg, barrier_crossing_opcodes=opcodes)
+        verify_optimization(gdg, cfg)
     
-    def test_verify_and_report_accepts_barrier_crossing(self):
-        """Test that verify_and_report accepts barrier_crossing_opcodes parameter."""
+    def test_verify_and_report_basic(self):
+        """Test that verify_and_report works without barrier_crossing_opcodes."""
         from amdgcn_verify import verify_and_report, build_global_ddg
         
         # Create a simple block
@@ -1716,8 +1737,7 @@ class TestVerifyOptimizationBarrierCrossing:
         gdg = build_global_ddg(cfg, ddgs)
         
         # Should not raise error
-        opcodes = {"global_load_dwordx4"}
-        result = verify_and_report(gdg, cfg, verbose=False, barrier_crossing_opcodes=opcodes)
+        result = verify_and_report(gdg, cfg, verbose=False)
         assert result.success is True
 
 

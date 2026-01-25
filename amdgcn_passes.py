@@ -1152,7 +1152,7 @@ class MoveInstructionPass(Pass):
         frozen_boundary: int = 0,
         protected_instructions: Optional[List['Instruction']] = None,
         auto_insert_nops: bool = True,
-        barrier_crossing_opcodes: Optional[Set[str]] = None
+        is_move_s_barrier: bool = False
     ):
         """
         Initialize the pass.
@@ -1169,9 +1169,12 @@ class MoveInstructionPass(Pass):
             auto_insert_nops: If True (default), automatically insert s_nop instructions
                              when a move would violate MFMA latency constraints.
                              If False, such moves are blocked.
-            barrier_crossing_opcodes: Set of opcodes that can cross s_barrier instructions.
-                                     If specified, instructions with these opcodes can move
-                                     past s_barrier (e.g., {"global_load_dwordx4"}).
+            is_move_s_barrier: If True, when processing gaps that contain s_barrier,
+                              move s_barrier along with other gap instructions while
+                              preserving relative order (instructions above s_barrier
+                              stay above, instructions below stay below).
+                              If False (default), only move gap instructions that don't
+                              require crossing s_barrier.
         """
         self.block_label = block_label
         self.instr_index = instr_index
@@ -1180,7 +1183,7 @@ class MoveInstructionPass(Pass):
         self.frozen_boundary = frozen_boundary
         self.protected_instructions = protected_instructions or []
         self.auto_insert_nops = auto_insert_nops
-        self.barrier_crossing_opcodes = barrier_crossing_opcodes or set()
+        self.is_move_s_barrier = is_move_s_barrier
         self._last_result: Optional[MoveResult] = None
         self._total_cycles_moved: int = 0
         # Detailed tracking of why movement stopped (use sets of instruction object IDs to track unique instructions)
@@ -1294,7 +1297,7 @@ class MoveInstructionPass(Pass):
         )
         
         # Mandatory verification: raises SchedulingVerificationError on failure
-        verify_optimization(original_gdg, result.cfg, barrier_crossing_opcodes=self.barrier_crossing_opcodes)
+        verify_optimization(original_gdg, result.cfg)
         
         return success
     
@@ -1503,13 +1506,13 @@ class MoveInstructionPass(Pass):
         defs_a, uses_a = get_instruction_defs_uses(instr_a)
         opcode_a = instr_a.opcode.lower()
         
-        # Check if this instruction can cross s_barrier (instruction A is in allowed set)
-        instr_a_can_cross_barrier = instr_a.opcode in self.barrier_crossing_opcodes
-        # Check if s_barrier can cross this instruction (when A is s_barrier moving past allowed instructions)
+        # s_barrier is a hard barrier - no instructions can cross it by default
+        # The is_move_s_barrier flag controls whether we move s_barrier as a group,
+        # but individual instructions still cannot cross s_barrier
         is_barrier_moving = opcode_a == 's_barrier'
         
-        # s_barrier can only be moved if barrier_crossing_opcodes is set
-        if is_barrier_moving and not self.barrier_crossing_opcodes:
+        # s_barrier cannot be moved through swap operations (it's handled specially in gap processing)
+        if is_barrier_moving:
             return False
         
         # Check all instructions we would pass
@@ -1521,21 +1524,9 @@ class MoveInstructionPass(Pass):
             defs_b, uses_b = get_instruction_defs_uses(instr_b)
             opcode_b = instr_b.opcode.lower()
             
-            # Handle barrier crossing logic:
-            # Case 1: A is s_barrier, B is some instruction -> s_barrier can cross B if B is in allowed set
-            # Case 2: A is some instruction, B is s_barrier -> A can cross s_barrier if A is in allowed set
+            # s_barrier is a hard barrier - no instructions can cross it
             if opcode_b == 's_barrier':
-                if not instr_a_can_cross_barrier:
-                    return False
-                # s_barrier doesn't have register dependencies, skip other checks for this iteration
-                continue
-            
-            if is_barrier_moving:
-                # s_barrier is moving past instr_b, check if B is in allowed set
-                if instr_b.opcode not in self.barrier_crossing_opcodes:
-                    return False
-                # s_barrier doesn't have register dependencies, skip other checks for this iteration
-                continue
+                return False
             
             # RAW: B reads what A writes -> BLOCKED (A must stay before B)
             raw_conflicts = defs_a & uses_b
@@ -1686,13 +1677,13 @@ class MoveInstructionPass(Pass):
         defs_a, uses_a = get_instruction_defs_uses(instr_a)
         opcode_a = instr_a.opcode.lower()
         
-        # Check if this instruction can cross s_barrier (instruction A is in allowed set)
-        instr_a_can_cross_barrier = instr_a.opcode in self.barrier_crossing_opcodes
-        # Check if s_barrier can cross this instruction (when A is s_barrier moving past allowed instructions)
+        # s_barrier is a hard barrier - no instructions can cross it by default
+        # The is_move_s_barrier flag controls whether we move s_barrier as a group,
+        # but individual instructions still cannot cross s_barrier
         is_barrier_moving = opcode_a == 's_barrier'
         
-        # s_barrier can only be moved if barrier_crossing_opcodes is set
-        if is_barrier_moving and not self.barrier_crossing_opcodes:
+        # s_barrier cannot be moved through swap operations (it's handled specially in gap processing)
+        if is_barrier_moving:
             return False
         
         # Check all instructions we would pass
@@ -1704,21 +1695,9 @@ class MoveInstructionPass(Pass):
             defs_b, uses_b = get_instruction_defs_uses(instr_b)
             opcode_b = instr_b.opcode.lower()
             
-            # Handle barrier crossing logic:
-            # Case 1: A is s_barrier, B is some instruction -> s_barrier can cross B if B is in allowed set
-            # Case 2: A is some instruction, B is s_barrier -> A can cross s_barrier if A is in allowed set
+            # s_barrier is a hard barrier - no instructions can cross it
             if opcode_b == 's_barrier':
-                if not instr_a_can_cross_barrier:
-                    return False
-                # s_barrier doesn't have register dependencies, skip other checks for this iteration
-                continue
-            
-            if is_barrier_moving:
-                # s_barrier is moving past instr_b, check if B is in allowed set
-                if instr_b.opcode not in self.barrier_crossing_opcodes:
-                    return False
-                # s_barrier doesn't have register dependencies, skip other checks for this iteration
-                continue
+                return False
             
             # RAW: A reads what B writes -> BLOCKED (A depends on B)
             raw_conflicts = defs_b & uses_a
@@ -2070,6 +2049,13 @@ class MoveInstructionPass(Pass):
         
         This works by moving other instructions from above the dependency tree
         to below the target instruction.
+        
+        s_barrier handling:
+        - In Phase 2 (above ABT): s_barrier is a hard barrier, instructions above it cannot be moved
+        - In Phase 3 (gaps): 
+          - If is_move_s_barrier=False: only move gaps below s_barrier
+          - If is_move_s_barrier=True: move gaps below s_barrier first, then s_barrier, 
+            then gaps above s_barrier (preserving relative order)
         """
         cycles_to_move = self.cycles
         any_moved = False
@@ -2094,12 +2080,11 @@ class MoveInstructionPass(Pass):
                 print(f"  ABT: {sorted(abt)}, BB at index {bb_idx}, target at {target_idx}")
             
             # Step 2: Move instructions from above BB to below target
+            # s_barrier is a hard barrier - stop when encountered
             moved_in_phase2 = False
             
             # Find instructions above BB, sorted by distance from target (closest first)
-            # Closest to target means highest index below bb_idx
-            # IMPORTANT: Store instruction objects, not indices, because indices shift after moves!
-            # Track reasons for skipping (use sets of id(instr) for unique counting)
+            # Stop at s_barrier (it's a hard barrier for phase 2)
             above_bb_instrs = []
             for idx in range(bb_idx - 1, -1, -1):
                 instr = block.instructions[idx]
@@ -2109,13 +2094,10 @@ class MoveInstructionPass(Pass):
                 # Skip branch/terminator - they are boundaries
                 if instr.is_branch or instr.is_terminator:
                     continue
-                # s_barrier can be moved if barrier_crossing_opcodes is set
-                # (it can cross instructions in the allowed set)
+                # s_barrier is a hard barrier - stop collecting candidates here
                 if instr.opcode.lower() == 's_barrier':
-                    if not self.barrier_crossing_opcodes:
-                        self._blocked_by_barrier.add(id(instr))
-                        continue
-                    # s_barrier is allowed to be moved, add to candidates
+                    self._blocked_by_barrier.add(id(instr))
+                    break  # Stop - don't look for more candidates above s_barrier
                 if instr in self.protected_instructions:
                     self._blocked_by_protected.add(id(instr))
                 else:
@@ -2162,72 +2144,207 @@ class MoveInstructionPass(Pass):
                 break
             
             # Step 3: Move instructions from ABT gaps to below target
+            # Handle s_barrier specially based on is_move_s_barrier flag
             if not moved_in_phase2 or self._total_cycles_moved < cycles_to_move:
-                # Re-find target and ABT
-                current_target_idx = self._find_instruction_index(block, target_instr)
-                if current_target_idx < 0:
-                    break
-                
-                current_abt, current_bb_idx = self._find_upward_dependency_tree(block, ddg, current_target_idx)
-                gaps = self._get_abt_gaps(current_abt, current_bb_idx, current_target_idx)
-                
-                moved_from_gaps = False
-                for gap_idx in gaps:
-                    if self._total_cycles_moved >= cycles_to_move:
-                        break
-                    
-                    # Find the current index of the gap instruction
-                    # (gaps was computed before, need to re-locate)
-                    if gap_idx >= len(block.instructions):
-                        continue
-                    
-                    gap_instr = block.instructions[gap_idx]
-                    
-                    # Skip gap instructions in frozen region
-                    if gap_idx < self.frozen_boundary:
-                        self._blocked_by_frozen.add(id(gap_instr))
-                        continue
-                    
-                    # Re-find positions
-                    current_target_idx = self._find_instruction_index(block, target_instr)
-                    if current_target_idx < 0:
-                        break
-                    
-                    # Skip protected instructions
-                    if gap_instr in self.protected_instructions:
-                        self._blocked_by_protected.add(id(gap_instr))
-                        continue
-                    
-                    current_gap_idx = self._find_instruction_index(block, gap_instr)
-                    if current_gap_idx < 0 or current_gap_idx >= current_target_idx:
-                        continue
-                    
-                    # Also skip if current position is in frozen region
-                    if current_gap_idx < self.frozen_boundary:
-                        self._blocked_by_frozen.add(id(gap_instr))
-                        continue
-                    
-                    dest_idx = current_target_idx
-                    # For gap instructions, don't use protected_indices either
-                    if self._can_move_single_instruction_down(block, ddg, current_gap_idx, dest_idx, set()):
-                        instr_cycles = get_instruction_cycles(gap_instr.opcode)
-                        self._move_single_instruction_down_impl(block, ddg, current_gap_idx, dest_idx)
-                        self._total_cycles_moved += instr_cycles
-                        any_moved = True
-                        moved_from_gaps = True
-                        
-                        if self.verbose:
-                            print(f"    Moved gap [{current_gap_idx}] {gap_instr.opcode} down to [{dest_idx}] (+{instr_cycles} cycles)")
-                    else:
-                        self._blocked_by_dependencies.add(id(gap_instr))
+                moved_from_gaps = self._process_gaps_with_barrier_up(
+                    block, ddg, target_instr, cycles_to_move
+                )
+                any_moved = any_moved or moved_from_gaps
                 
                 if not moved_from_gaps and not moved_in_phase2:
                     # No more instructions can be moved
-                    if len(above_bb_instrs) == 0 and len(gaps) == 0:
-                        self._no_candidates = True
+                    self._no_candidates = True
                     break
         
         return any_moved
+    
+    def _process_gaps_with_barrier_up(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        target_instr: Instruction,
+        cycles_to_move: int
+    ) -> bool:
+        """
+        Process gap instructions when moving up, handling s_barrier specially.
+        
+        When gaps contain s_barrier:
+        - If is_move_s_barrier=False: only move gaps below s_barrier to target's below
+        - If is_move_s_barrier=True: move gaps below s_barrier first, then s_barrier,
+          then gaps above s_barrier (preserving relative order)
+        
+        Returns:
+            True if any instruction was moved
+        """
+        any_moved = False
+        
+        # Re-find target and ABT
+        current_target_idx = self._find_instruction_index(block, target_instr)
+        if current_target_idx < 0:
+            return False
+        
+        current_abt, current_bb_idx = self._find_upward_dependency_tree(block, ddg, current_target_idx)
+        gaps = self._get_abt_gaps(current_abt, current_bb_idx, current_target_idx)
+        
+        if not gaps:
+            return False
+        
+        # Find s_barrier in gaps (if any)
+        barrier_idx = None
+        barrier_instr = None
+        for gap_idx in gaps:
+            if gap_idx < len(block.instructions):
+                instr = block.instructions[gap_idx]
+                if instr.opcode.lower() == 's_barrier':
+                    barrier_idx = gap_idx
+                    barrier_instr = instr
+                    break
+        
+        # Split gaps into: above_barrier, barrier, below_barrier
+        # Note: gaps are sorted by distance from target (closest first = highest index first)
+        # So gaps closer to target come first in the list
+        gaps_below_barrier = []  # Between s_barrier and target (will be moved first)
+        gaps_above_barrier = []  # Above s_barrier (moved last if is_move_s_barrier=True)
+        
+        for gap_idx in gaps:
+            if gap_idx >= len(block.instructions):
+                continue
+            gap_instr = block.instructions[gap_idx]
+            if gap_instr.opcode.lower() == 's_barrier':
+                continue  # Skip barrier itself in this pass
+            if barrier_idx is not None:
+                if gap_idx > barrier_idx:
+                    # Gap is below barrier (between barrier and target)
+                    gaps_below_barrier.append(gap_instr)
+                else:
+                    # Gap is above barrier
+                    gaps_above_barrier.append(gap_instr)
+            else:
+                # No barrier in gaps, treat all as below
+                gaps_below_barrier.append(gap_instr)
+        
+        # Step 1: Move gaps below s_barrier to target's below
+        for gap_instr in gaps_below_barrier:
+            if self._total_cycles_moved >= cycles_to_move:
+                break
+            
+            moved = self._try_move_gap_instruction_down(block, ddg, gap_instr, target_instr)
+            any_moved = any_moved or moved
+        
+        if self._total_cycles_moved >= cycles_to_move:
+            return any_moved
+        
+        # Step 2 & 3: If is_move_s_barrier=True, move s_barrier and gaps above it
+        if self.is_move_s_barrier and barrier_instr is not None:
+            # Move s_barrier to target's below
+            moved = self._try_move_gap_instruction_down(block, ddg, barrier_instr, target_instr, is_barrier=True)
+            any_moved = any_moved or moved
+            
+            if self._total_cycles_moved >= cycles_to_move:
+                return any_moved
+            
+            # Move gaps above s_barrier (preserving their relative order)
+            # Since we want to preserve order: gaps_above_barrier should end up
+            # above s_barrier in the final position. Move them in reverse order
+            # (furthest from target first) so they stack correctly.
+            for gap_instr in reversed(gaps_above_barrier):
+                if self._total_cycles_moved >= cycles_to_move:
+                    break
+                
+                moved = self._try_move_gap_instruction_down(block, ddg, gap_instr, target_instr)
+                any_moved = any_moved or moved
+        else:
+            # is_move_s_barrier=False: just mark gaps above barrier as blocked
+            if barrier_instr is not None:
+                self._blocked_by_barrier.add(id(barrier_instr))
+                for gap_instr in gaps_above_barrier:
+                    self._blocked_by_barrier.add(id(gap_instr))
+        
+        return any_moved
+    
+    def _try_move_gap_instruction_down(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        gap_instr: Instruction,
+        target_instr: Instruction,
+        is_barrier: bool = False
+    ) -> bool:
+        """
+        Try to move a single gap instruction down to below the target instruction.
+        
+        Args:
+            block: The basic block
+            ddg: The DDG
+            gap_instr: The instruction to move
+            target_instr: The target instruction
+            is_barrier: True if gap_instr is s_barrier (special handling)
+            
+        Returns:
+            True if the instruction was moved
+        """
+        current_gap_idx = self._find_instruction_index(block, gap_instr)
+        current_target_idx = self._find_instruction_index(block, target_instr)
+        
+        if current_gap_idx < 0 or current_target_idx < 0:
+            return False
+        
+        if current_gap_idx >= current_target_idx:
+            return False
+        
+        # Skip gap instructions in frozen region
+        if current_gap_idx < self.frozen_boundary:
+            self._blocked_by_frozen.add(id(gap_instr))
+            return False
+        
+        # Skip protected instructions
+        if gap_instr in self.protected_instructions:
+            self._blocked_by_protected.add(id(gap_instr))
+            return False
+        
+        dest_idx = current_target_idx
+        
+        # For s_barrier, we need special handling since _can_move_single_instruction_down
+        # returns False for s_barrier. We manually check if the path is clear.
+        if is_barrier:
+            # Check if we can move s_barrier down to dest_idx
+            # s_barrier can only move if there are no other barriers in the way
+            # and no branch/terminator
+            can_move = True
+            for check_idx in range(current_gap_idx + 1, dest_idx + 1):
+                check_instr = block.instructions[check_idx]
+                if check_instr.is_branch or check_instr.is_terminator:
+                    can_move = False
+                    break
+                if check_instr.opcode.lower() == 's_barrier':
+                    can_move = False
+                    break
+            
+            if can_move:
+                instr_cycles = get_instruction_cycles(gap_instr.opcode)
+                # Move s_barrier using swap operations
+                self._move_single_instruction_down_impl(block, ddg, current_gap_idx, dest_idx)
+                self._total_cycles_moved += instr_cycles
+                
+                if self.verbose:
+                    print(f"    Moved s_barrier [{current_gap_idx}] down to [{dest_idx}] (+{instr_cycles} cycles)")
+                return True
+            else:
+                self._blocked_by_barrier.add(id(gap_instr))
+                return False
+        else:
+            # Normal instruction
+            if self._can_move_single_instruction_down(block, ddg, current_gap_idx, dest_idx, set()):
+                instr_cycles = get_instruction_cycles(gap_instr.opcode)
+                self._move_single_instruction_down_impl(block, ddg, current_gap_idx, dest_idx)
+                self._total_cycles_moved += instr_cycles
+                
+                if self.verbose:
+                    print(f"    Moved gap [{current_gap_idx}] {gap_instr.opcode} down to [{dest_idx}] (+{instr_cycles} cycles)")
+                return True
+            else:
+                self._blocked_by_dependencies.add(id(gap_instr))
+                return False
     
     def _move_down_by_cycles(
         self,
@@ -2241,6 +2358,13 @@ class MoveInstructionPass(Pass):
         
         This works by moving other instructions from below the dependency tree
         to above the target instruction.
+        
+        s_barrier handling:
+        - In Phase 2 (below ACT): s_barrier is a hard barrier, instructions below it cannot be moved
+        - In Phase 3 (gaps): 
+          - If is_move_s_barrier=False: only move gaps above s_barrier
+          - If is_move_s_barrier=True: move gaps above s_barrier first, then s_barrier, 
+            then gaps below s_barrier (preserving relative order)
         """
         cycles_to_move = abs(self.cycles)
         any_moved = False
@@ -2252,20 +2376,15 @@ class MoveInstructionPass(Pass):
         self._blocked_by_protected = set()
         self._no_candidates = False
 
-        # Find branch boundary (excluding s_barrier if barrier_crossing_opcodes is set)
-        # s_barrier is a synchronization barrier that acts as a boundary line
+        # Find branch boundary - s_barrier is always a boundary now
         branch_boundary = len(block.instructions)
-        boundary_is_barrier = False  # Track if boundary is s_barrier
-        has_barrier_crossing = len(self.barrier_crossing_opcodes) > 0
         for i, instr in enumerate(block.instructions):
             if instr.is_branch or instr.is_terminator:
                 branch_boundary = i
-                boundary_is_barrier = False
                 break
-            # Only treat s_barrier as boundary if no barrier_crossing_opcodes specified
-            if instr.opcode.lower() == 's_barrier' and not has_barrier_crossing:
+            # s_barrier is always a boundary for phase 2
+            if instr.opcode.lower() == 's_barrier':
                 branch_boundary = i
-                boundary_is_barrier = True
                 break
         
         while self._total_cycles_moved < cycles_to_move:
@@ -2281,32 +2400,24 @@ class MoveInstructionPass(Pass):
                 print(f"  ACT: {sorted(act)}, CC at index {cc_idx}, target at {target_idx}")
             
             # Step 2: Move instructions from below CC to above target
+            # s_barrier is a hard barrier - stop when encountered
             moved_in_phase2 = False
             
             # Find instructions below CC, sorted by distance from target (closest first)
-            # Closest to target means lowest index above cc_idx
-            # IMPORTANT: Store instruction objects, not indices, because indices shift after moves!
-            # Track reasons for skipping (use sets of id(instr) for unique counting)
+            # Stop at s_barrier or branch boundary
             below_cc_instrs = []
             for idx in range(cc_idx + 1, len(block.instructions)):
                 instr = block.instructions[idx]
                 if idx >= branch_boundary:
-                    # Count based on what type of boundary we hit
-                    if boundary_is_barrier:
-                        self._blocked_by_barrier.add(id(instr))
-                    else:
-                        self._blocked_by_branch.add(id(instr))
+                    self._blocked_by_branch.add(id(instr))
                     continue
                 # Skip branch/terminator - they are boundaries
                 if instr.is_branch or instr.is_terminator:
                     continue
-                # s_barrier can be moved if barrier_crossing_opcodes is set
-                # (it can cross instructions in the allowed set)
+                # s_barrier is a hard barrier - stop collecting candidates here
                 if instr.opcode.lower() == 's_barrier':
-                    if not self.barrier_crossing_opcodes:
-                        self._blocked_by_barrier.add(id(instr))
-                        continue
-                    # s_barrier is allowed to be moved, add to candidates
+                    self._blocked_by_barrier.add(id(instr))
+                    break  # Stop - don't look for more candidates below s_barrier
                 if instr in self.protected_instructions:
                     self._blocked_by_protected.add(id(instr))
                 else:
@@ -2354,68 +2465,208 @@ class MoveInstructionPass(Pass):
                 break
             
             # Step 3: Move instructions from ACT gaps to above target
+            # Handle s_barrier specially based on is_move_s_barrier flag
             if not moved_in_phase2 or self._total_cycles_moved < cycles_to_move:
-                # Re-find target and ACT
-                current_target_idx = self._find_instruction_index(block, target_instr)
-                if current_target_idx < 0:
-                    break
-                
-                current_act, current_cc_idx = self._find_downward_dependency_tree(block, ddg, current_target_idx)
-                gaps = self._get_act_gaps(current_act, current_target_idx, current_cc_idx)
-                
-                moved_from_gaps = False
-                for gap_idx in gaps:
-                    if self._total_cycles_moved >= cycles_to_move:
-                        break
-                    
-                    # Find the current index of the gap instruction
-                    if gap_idx >= len(block.instructions):
-                        continue
-                    
-                    gap_instr = block.instructions[gap_idx]
-                    
-                    # Re-find positions
-                    current_target_idx = self._find_instruction_index(block, target_instr)
-                    if current_target_idx < 0:
-                        break
-                    
-                    # Skip protected instructions
-                    if gap_instr in self.protected_instructions:
-                        self._blocked_by_protected.add(id(gap_instr))
-                        continue
-                    
-                    current_gap_idx = self._find_instruction_index(block, gap_instr)
-                    if current_gap_idx < 0 or current_gap_idx <= current_target_idx:
-                        continue
-                    
-                    # Respect frozen boundary - don't move instruction into frozen region
-                    dest_idx = max(current_target_idx, self.frozen_boundary)
-                    
-                    # If dest_idx is same or greater than current_gap_idx, can't move (blocked by frozen boundary)
-                    if dest_idx >= current_gap_idx:
-                        self._blocked_by_frozen.add(id(gap_instr))
-                        continue
-                    
-                    # For gap instructions, don't use protected_indices either
-                    if self._can_move_single_instruction_up(block, ddg, current_gap_idx, dest_idx, set()):
-                        instr_cycles = get_instruction_cycles(gap_instr.opcode)
-                        self._move_single_instruction_up_impl(block, ddg, current_gap_idx, dest_idx)
-                        self._total_cycles_moved += instr_cycles
-                        any_moved = True
-                        moved_from_gaps = True
-                        
-                        if self.verbose:
-                            print(f"    Moved gap [{current_gap_idx}] {gap_instr.opcode} up to [{dest_idx}] (+{instr_cycles} cycles)")
-                    else:
-                        self._blocked_by_dependencies.add(id(gap_instr))
+                moved_from_gaps = self._process_gaps_with_barrier_down(
+                    block, ddg, target_instr, cycles_to_move
+                )
+                any_moved = any_moved or moved_from_gaps
                 
                 if not moved_from_gaps and not moved_in_phase2:
                     # No more instructions can be moved
-                    if len(below_cc_instrs) == 0 and len(gaps) == 0:
-                        self._no_candidates = True
+                    self._no_candidates = True
                     break
         
         return any_moved
+    
+    def _process_gaps_with_barrier_down(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        target_instr: Instruction,
+        cycles_to_move: int
+    ) -> bool:
+        """
+        Process gap instructions when moving down, handling s_barrier specially.
+        
+        When gaps contain s_barrier:
+        - If is_move_s_barrier=False: only move gaps above s_barrier to target's above
+        - If is_move_s_barrier=True: move gaps above s_barrier first, then s_barrier,
+          then gaps below s_barrier (preserving relative order)
+        
+        Returns:
+            True if any instruction was moved
+        """
+        any_moved = False
+        
+        # Re-find target and ACT
+        current_target_idx = self._find_instruction_index(block, target_instr)
+        if current_target_idx < 0:
+            return False
+        
+        current_act, current_cc_idx = self._find_downward_dependency_tree(block, ddg, current_target_idx)
+        gaps = self._get_act_gaps(current_act, current_target_idx, current_cc_idx)
+        
+        if not gaps:
+            return False
+        
+        # Find s_barrier in gaps (if any)
+        barrier_idx = None
+        barrier_instr = None
+        for gap_idx in gaps:
+            if gap_idx < len(block.instructions):
+                instr = block.instructions[gap_idx]
+                if instr.opcode.lower() == 's_barrier':
+                    barrier_idx = gap_idx
+                    barrier_instr = instr
+                    break
+        
+        # Split gaps into: above_barrier (between target and s_barrier), barrier, below_barrier
+        # Note: gaps are sorted by distance from target (closest first = lowest index first)
+        # So gaps closer to target come first in the list
+        gaps_above_barrier = []  # Between target and s_barrier (will be moved first)
+        gaps_below_barrier = []  # Below s_barrier (moved last if is_move_s_barrier=True)
+        
+        for gap_idx in gaps:
+            if gap_idx >= len(block.instructions):
+                continue
+            gap_instr = block.instructions[gap_idx]
+            if gap_instr.opcode.lower() == 's_barrier':
+                continue  # Skip barrier itself in this pass
+            if barrier_idx is not None:
+                if gap_idx < barrier_idx:
+                    # Gap is above barrier (between target and barrier)
+                    gaps_above_barrier.append(gap_instr)
+                else:
+                    # Gap is below barrier
+                    gaps_below_barrier.append(gap_instr)
+            else:
+                # No barrier in gaps, treat all as above
+                gaps_above_barrier.append(gap_instr)
+        
+        # Step 1: Move gaps above s_barrier to target's above
+        for gap_instr in gaps_above_barrier:
+            if self._total_cycles_moved >= cycles_to_move:
+                break
+            
+            moved = self._try_move_gap_instruction_up(block, ddg, gap_instr, target_instr)
+            any_moved = any_moved or moved
+        
+        if self._total_cycles_moved >= cycles_to_move:
+            return any_moved
+        
+        # Step 2 & 3: If is_move_s_barrier=True, move s_barrier and gaps below it
+        if self.is_move_s_barrier and barrier_instr is not None:
+            # Move s_barrier to target's above
+            moved = self._try_move_gap_instruction_up(block, ddg, barrier_instr, target_instr, is_barrier=True)
+            any_moved = any_moved or moved
+            
+            if self._total_cycles_moved >= cycles_to_move:
+                return any_moved
+            
+            # Move gaps below s_barrier (preserving their relative order)
+            # Since we want to preserve order: gaps_below_barrier should end up
+            # below s_barrier in the final position. Move them in reverse order
+            # (furthest from target first) so they stack correctly.
+            for gap_instr in reversed(gaps_below_barrier):
+                if self._total_cycles_moved >= cycles_to_move:
+                    break
+                
+                moved = self._try_move_gap_instruction_up(block, ddg, gap_instr, target_instr)
+                any_moved = any_moved or moved
+        else:
+            # is_move_s_barrier=False: just mark gaps below barrier as blocked
+            if barrier_instr is not None:
+                self._blocked_by_barrier.add(id(barrier_instr))
+                for gap_instr in gaps_below_barrier:
+                    self._blocked_by_barrier.add(id(gap_instr))
+        
+        return any_moved
+    
+    def _try_move_gap_instruction_up(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        gap_instr: Instruction,
+        target_instr: Instruction,
+        is_barrier: bool = False
+    ) -> bool:
+        """
+        Try to move a single gap instruction up to above the target instruction.
+        
+        Args:
+            block: The basic block
+            ddg: The DDG
+            gap_instr: The instruction to move
+            target_instr: The target instruction
+            is_barrier: True if gap_instr is s_barrier (special handling)
+            
+        Returns:
+            True if the instruction was moved
+        """
+        current_gap_idx = self._find_instruction_index(block, gap_instr)
+        current_target_idx = self._find_instruction_index(block, target_instr)
+        
+        if current_gap_idx < 0 or current_target_idx < 0:
+            return False
+        
+        if current_gap_idx <= current_target_idx:
+            return False
+        
+        # Respect frozen boundary - don't move instruction into frozen region
+        dest_idx = max(current_target_idx, self.frozen_boundary)
+        
+        # If dest_idx is same or greater than current_gap_idx, can't move (blocked by frozen boundary)
+        if dest_idx >= current_gap_idx:
+            self._blocked_by_frozen.add(id(gap_instr))
+            return False
+        
+        # Skip protected instructions
+        if gap_instr in self.protected_instructions:
+            self._blocked_by_protected.add(id(gap_instr))
+            return False
+        
+        # For s_barrier, we need special handling since _can_move_single_instruction_up
+        # returns False for s_barrier. We manually check if the path is clear.
+        if is_barrier:
+            # Check if we can move s_barrier up to dest_idx
+            # s_barrier can only move if there are no other barriers in the way
+            # and no branch/terminator
+            can_move = True
+            for check_idx in range(current_gap_idx - 1, dest_idx - 1, -1):
+                check_instr = block.instructions[check_idx]
+                if check_instr.is_branch or check_instr.is_terminator:
+                    can_move = False
+                    break
+                if check_instr.opcode.lower() == 's_barrier':
+                    can_move = False
+                    break
+            
+            if can_move:
+                instr_cycles = get_instruction_cycles(gap_instr.opcode)
+                # Move s_barrier using swap operations
+                self._move_single_instruction_up_impl(block, ddg, current_gap_idx, dest_idx)
+                self._total_cycles_moved += instr_cycles
+                
+                if self.verbose:
+                    print(f"    Moved s_barrier [{current_gap_idx}] up to [{dest_idx}] (+{instr_cycles} cycles)")
+                return True
+            else:
+                self._blocked_by_barrier.add(id(gap_instr))
+                return False
+        else:
+            # Normal instruction
+            if self._can_move_single_instruction_up(block, ddg, current_gap_idx, dest_idx, set()):
+                instr_cycles = get_instruction_cycles(gap_instr.opcode)
+                self._move_single_instruction_up_impl(block, ddg, current_gap_idx, dest_idx)
+                self._total_cycles_moved += instr_cycles
+                
+                if self.verbose:
+                    print(f"    Moved gap [{current_gap_idx}] {gap_instr.opcode} up to [{dest_idx}] (+{instr_cycles} cycles)")
+                return True
+            else:
+                self._blocked_by_dependencies.add(id(gap_instr))
+                return False
     
     # =========================================================================
     # Legacy methods (kept for compatibility and internal use)
@@ -3337,7 +3588,7 @@ class DistributeInstructionPass(Pass):
         target_opcode: Exact opcode to match (e.g., "global_load_dwordx4")
         distribute_count: K, number of instructions to distribute evenly
         verbose: Print detailed information during execution
-        barrier_crossing_opcodes: Set of opcodes that can cross s_barrier
+        is_move_s_barrier: If True, move s_barrier along with gap instructions
     """
     
     def __init__(
@@ -3346,7 +3597,7 @@ class DistributeInstructionPass(Pass):
         target_opcode: str,
         distribute_count: int,
         verbose: bool = False,
-        barrier_crossing_opcodes: Optional[Set[str]] = None
+        is_move_s_barrier: bool = False
     ):
         """
         Initialize the pass.
@@ -3356,15 +3607,14 @@ class DistributeInstructionPass(Pass):
             target_opcode: Exact opcode to match (e.g., "global_load_dwordx4")
             distribute_count: K, number of instructions to distribute evenly
             verbose: Print detailed information during execution
-            barrier_crossing_opcodes: Set of opcodes that can cross s_barrier instructions.
-                                     If specified, instructions with these opcodes can move
-                                     past s_barrier (e.g., {"global_load_dwordx4"}).
+            is_move_s_barrier: If True, move s_barrier along with gap instructions
+                              when processing gaps that contain s_barrier.
         """
         self.block_label = block_label
         self.target_opcode = target_opcode
         self.distribute_count = distribute_count
         self.verbose = verbose
-        self.barrier_crossing_opcodes = barrier_crossing_opcodes or set()
+        self.is_move_s_barrier = is_move_s_barrier
         self._moved_count = 0
     
     @property
@@ -3414,21 +3664,20 @@ class DistributeInstructionPass(Pass):
     def _find_branch_boundary(self, block: BasicBlock) -> int:
         """
         Find index of first branch/terminator instruction.
-        If barrier_crossing_opcodes is not set, also treat s_barrier as boundary.
+        s_barrier is always treated as a boundary.
         Instructions cannot be moved past this boundary.
         
         s_barrier is a synchronization barrier that acts as a boundary line -
-        instructions before and after it cannot cross the boundary (unless allowed).
+        instructions before and after it cannot cross the boundary.
         
         Returns:
-            Index of first branch/terminator (or s_barrier if no barrier crossing), or len(instructions) if none
+            Index of first branch/terminator or s_barrier, or len(instructions) if none
         """
-        has_barrier_crossing = len(self.barrier_crossing_opcodes) > 0
         for i, instr in enumerate(block.instructions):
             if instr.is_branch or instr.is_terminator:
                 return i
-            # Only treat s_barrier as boundary if no barrier_crossing_opcodes specified
-            if instr.opcode.lower() == 's_barrier' and not has_barrier_crossing:
+            # s_barrier is always a boundary
+            if instr.opcode.lower() == 's_barrier':
                 return i
         return len(block.instructions)
     
@@ -3561,7 +3810,7 @@ class DistributeInstructionPass(Pass):
             verbose=False,
             frozen_boundary=frozen_boundary,
             protected_instructions=protected_instructions,
-            barrier_crossing_opcodes=self.barrier_crossing_opcodes
+            is_move_s_barrier=self.is_move_s_barrier
         )
         
         success = move_pass.run(result)
@@ -3834,7 +4083,7 @@ class DistributeInstructionPass(Pass):
             print(f"===============================================\n")
         
         # Mandatory verification: raises SchedulingVerificationError on failure
-        verify_optimization(original_gdg, result.cfg, barrier_crossing_opcodes=self.barrier_crossing_opcodes)
+        verify_optimization(original_gdg, result.cfg)
         
         return self._moved_count > 0
 
@@ -3870,7 +4119,7 @@ def move_instruction(
     verbose: bool = False,
     frozen_boundary: int = 0,
     protected_instructions: Optional[List['Instruction']] = None,
-    barrier_crossing_opcodes: Optional[Set[str]] = None
+    is_move_s_barrier: bool = False
 ) -> MoveResult:
     """
     Convenience function to move a single instruction by a specified number of cycles.
@@ -3883,7 +4132,7 @@ def move_instruction(
         verbose: Print progress information
         frozen_boundary: Instructions at idx < frozen_boundary cannot be moved
         protected_instructions: List of instruction objects that should never be moved
-        barrier_crossing_opcodes: Set of opcodes that can cross s_barrier instructions
+        is_move_s_barrier: If True, move s_barrier along with gap instructions
         
     Returns:
         MoveResult with success status and message
@@ -3895,7 +4144,7 @@ def move_instruction(
         verbose=verbose,
         frozen_boundary=frozen_boundary,
         protected_instructions=protected_instructions,
-        barrier_crossing_opcodes=barrier_crossing_opcodes
+        is_move_s_barrier=is_move_s_barrier
     )
     
     pm = PassManager()
@@ -3913,7 +4162,7 @@ def distribute_instructions(
     distribute_count: int,
     verbose: bool = False,
     auto_fix_latency: bool = True,
-    barrier_crossing_opcodes: Optional[Set[str]] = None
+    is_move_s_barrier: bool = False
 ) -> bool:
     """
     Convenience function to distribute instructions evenly across a basic block.
@@ -3930,7 +4179,7 @@ def distribute_instructions(
         verbose: Print progress information
         auto_fix_latency: If True, automatically run InsertLatencyNopsPass after
                          distribution to fix any MFMA latency violations
-        barrier_crossing_opcodes: Set of opcodes that can cross s_barrier instructions
+        is_move_s_barrier: If True, move s_barrier along with gap instructions
         
     Returns:
         True if any changes were made, False otherwise
@@ -3940,7 +4189,7 @@ def distribute_instructions(
         target_opcode=target_opcode,
         distribute_count=distribute_count,
         verbose=verbose,
-        barrier_crossing_opcodes=barrier_crossing_opcodes
+        is_move_s_barrier=is_move_s_barrier
     )
     
     pm = PassManager()
