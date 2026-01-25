@@ -1854,8 +1854,9 @@ def generate_ddg_dot(ddg: DDG, max_label_len: int = 50, show_live_nodes: bool = 
         elif node.instr.is_branch or node.instr.is_terminator:
             color = "lightcoral"  # Control flow
         
-        # Build label
-        label = f"[{node.node_id}] {instr_text}\\nW:{defs_str}\\nR:{uses_str}"
+        # Build label - use instruction's global address for display
+        global_id = node.instr.address
+        label = f"[{global_id}] {instr_text}\\nW:{defs_str}\\nR:{uses_str}"
         
         # For s_waitcnt, add cross-block waited instructions
         if opcode_lower == 's_waitcnt' and node.node_id in ddg.waitcnt_cross_block_ops:
@@ -2079,7 +2080,9 @@ def generate_combined_cfg_ddg_dot(cfg: CFG, ddgs: Dict[str, DDG], inter_deps: Li
                 elif node.instr.opcode.startswith(('s_waitcnt', 's_barrier')):
                     color = "lightgray"
                 
-                lines.append(f'        {cluster_id}_n{node.node_id} [label="{instr_text}", shape=box, style=filled, fillcolor={color}, fontsize=8];')
+                # Use global address for display
+                global_id = node.instr.address
+                lines.append(f'        {cluster_id}_n{node.node_id} [label="[{global_id}] {instr_text}", shape=box, style=filled, fillcolor={color}, fontsize=8];')
             
             # Add DDG edges inside the cluster
             for from_id, to_id, dep_type in ddg.edges:
@@ -3376,7 +3379,8 @@ def main():
                         'range_start': pass_config['range_start'],
                         'range_end': pass_config['range_end'],
                         'registers': pass_config['registers'],
-                        'alignments': pass_config.get('alignments', [1] * len(pass_config['registers']))
+                        'alignments': pass_config.get('alignments', [1] * len(pass_config['registers'])),
+                        'target_opcodes': pass_config.get('target_opcodes', [])
                     })
                 else:
                     print(f"Warning: Unknown pass type '{pass_type}', skipping")
@@ -3496,13 +3500,17 @@ def main():
                     range_end = pass_config['range_end']
                     registers = pass_config['registers']
                     alignments = pass_config['alignments']
+                    target_opcodes = pass_config.get('target_opcodes', [])
                     
                     print(f"  Replacing registers in range [{range_start}, {range_end}]:")
                     print(f"    Registers: {registers}")
                     print(f"    Alignments: {alignments}")
+                    if target_opcodes:
+                        print(f"    Target opcodes: {target_opcodes}")
                     
                     success, mapping = replace_registers(
-                        result, range_start, range_end, registers, alignments, verbose=True
+                        result, range_start, range_end, registers, alignments, 
+                        target_opcodes=target_opcodes, verbose=True
                     )
                     
                     if success:

@@ -211,7 +211,8 @@ def load_pass_list(pass_list_path: str) -> list:
                 'range_start': pass_config['range_start'],
                 'range_end': pass_config['range_end'],
                 'registers': pass_config['registers'],
-                'alignments': pass_config.get('alignments', [1] * len(pass_config['registers']))
+                'alignments': pass_config.get('alignments', [1] * len(pass_config['registers'])),
+                'target_opcodes': pass_config.get('target_opcodes', [])
             })
         else:
             print(f"Warning: Unknown pass type '{pass_type}', skipping")
@@ -228,7 +229,9 @@ def format_pass_info(pass_config: dict) -> str:
     elif pass_type == 'distribute':
         return f"distribute(block={pass_config['block']}, opcode={pass_config['opcode']}, k={pass_config['k']})"
     elif pass_type == 'replace_registers':
-        return f"replace_registers(range={pass_config['range_start']}-{pass_config['range_end']}, regs={pass_config['registers']})"
+        target_ops = pass_config.get('target_opcodes', [])
+        ops_str = f", opcodes={target_ops}" if target_ops else ""
+        return f"replace_registers(range={pass_config['range_start']}-{pass_config['range_end']}, regs={pass_config['registers']}{ops_str})"
     else:
         return f"{pass_type}(?)"
 
@@ -363,6 +366,7 @@ class PassListDebugger:
                     range_end=pass_config['range_end'],
                     registers_to_replace=pass_config['registers'],
                     alignments=pass_config['alignments'],
+                    target_opcodes=pass_config.get('target_opcodes', []),
                     verbose=self.verbose
                 )
                 replace_pass.run(self.result)

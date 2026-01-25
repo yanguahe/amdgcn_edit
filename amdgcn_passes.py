@@ -1524,9 +1524,13 @@ class MoveInstructionPass(Pass):
             defs_b, uses_b = get_instruction_defs_uses(instr_b)
             opcode_b = instr_b.opcode.lower()
             
-            # s_barrier is a hard barrier - no instructions can cross it
+            # s_barrier handling:
+            # - is_move_s_barrier=False: s_barrier is a hard barrier, no instructions can cross
+            # - is_move_s_barrier=True: allow crossing s_barrier (user has enabled this mode)
             if opcode_b == 's_barrier':
-                return False
+                if not self.is_move_s_barrier:
+                    return False
+                # When is_move_s_barrier=True, continue checking other dependencies
             
             # RAW: B reads what A writes -> BLOCKED (A must stay before B)
             raw_conflicts = defs_a & uses_b
@@ -1695,9 +1699,13 @@ class MoveInstructionPass(Pass):
             defs_b, uses_b = get_instruction_defs_uses(instr_b)
             opcode_b = instr_b.opcode.lower()
             
-            # s_barrier is a hard barrier - no instructions can cross it
+            # s_barrier handling:
+            # - is_move_s_barrier=False: s_barrier is a hard barrier, no instructions can cross
+            # - is_move_s_barrier=True: allow crossing s_barrier (user has enabled this mode)
             if opcode_b == 's_barrier':
-                return False
+                if not self.is_move_s_barrier:
+                    return False
+                # When is_move_s_barrier=True, continue checking other dependencies
             
             # RAW: A reads what B writes -> BLOCKED (A depends on B)
             raw_conflicts = defs_b & uses_a
@@ -2084,7 +2092,7 @@ class MoveInstructionPass(Pass):
             moved_in_phase2 = False
             
             # Find instructions above BB, sorted by distance from target (closest first)
-            # Stop at s_barrier (it's a hard barrier for phase 2)
+            # s_barrier handling depends on is_move_s_barrier flag
             above_bb_instrs = []
             for idx in range(bb_idx - 1, -1, -1):
                 instr = block.instructions[idx]
@@ -2094,10 +2102,15 @@ class MoveInstructionPass(Pass):
                 # Skip branch/terminator - they are boundaries
                 if instr.is_branch or instr.is_terminator:
                     continue
-                # s_barrier is a hard barrier - stop collecting candidates here
+                # s_barrier handling:
+                # - is_move_s_barrier=False: stop collecting candidates here
+                # - is_move_s_barrier=True: continue past intermediate s_barriers
                 if instr.opcode.lower() == 's_barrier':
-                    self._blocked_by_barrier.add(id(instr))
-                    break  # Stop - don't look for more candidates above s_barrier
+                    if not self.is_move_s_barrier:
+                        self._blocked_by_barrier.add(id(instr))
+                        break  # Stop - don't look for more candidates above s_barrier
+                    # When is_move_s_barrier=True, skip s_barrier but continue looking
+                    continue
                 if instr in self.protected_instructions:
                     self._blocked_by_protected.add(id(instr))
                 else:
@@ -2376,16 +2389,46 @@ class MoveInstructionPass(Pass):
         self._blocked_by_protected = set()
         self._no_candidates = False
 
-        # Find branch boundary - s_barrier is always a boundary now
-        branch_boundary = len(block.instructions)
+        # Find branch boundary
+        # s_barrier handling depends on is_move_s_barrier flag:
+        # - is_move_s_barrier=False: s_barrier is always a boundary
+        # - is_move_s_barrier=True: only s_barrier immediately before branch/terminator is a boundary
+        n = len(block.instructions)
+        branch_boundary = n
+        
+        # First, find the branch/terminator position
+        branch_pos = n
         for i, instr in enumerate(block.instructions):
             if instr.is_branch or instr.is_terminator:
-                branch_boundary = i
+                branch_pos = i
                 break
-            # s_barrier is always a boundary for phase 2
-            if instr.opcode.lower() == 's_barrier':
-                branch_boundary = i
-                break
+        
+        if not self.is_move_s_barrier:
+            # Original behavior: first s_barrier (before branch) is a boundary
+            for i in range(branch_pos):
+                if block.instructions[i].opcode.lower() == 's_barrier':
+                    branch_boundary = i
+                    break
+            else:
+                branch_boundary = branch_pos
+        else:
+            # is_move_s_barrier=True: only s_barrier immediately before branch is a boundary
+            if branch_pos > 0 and branch_pos < n:
+                check_idx = branch_pos - 1
+                while check_idx >= 0:
+                    check_instr = block.instructions[check_idx]
+                    opcode_lower = check_instr.opcode.lower()
+                    if opcode_lower == 's_barrier':
+                        branch_boundary = check_idx
+                        break
+                    elif opcode_lower.startswith('s_nop'):
+                        check_idx -= 1
+                    else:
+                        break
+                else:
+                    branch_boundary = branch_pos
+            else:
+                branch_boundary = branch_pos
         
         while self._total_cycles_moved < cycles_to_move:
             # Get current position of target
@@ -2404,7 +2447,7 @@ class MoveInstructionPass(Pass):
             moved_in_phase2 = False
             
             # Find instructions below CC, sorted by distance from target (closest first)
-            # Stop at s_barrier or branch boundary
+            # s_barrier handling depends on is_move_s_barrier flag
             below_cc_instrs = []
             for idx in range(cc_idx + 1, len(block.instructions)):
                 instr = block.instructions[idx]
@@ -2414,10 +2457,15 @@ class MoveInstructionPass(Pass):
                 # Skip branch/terminator - they are boundaries
                 if instr.is_branch or instr.is_terminator:
                     continue
-                # s_barrier is a hard barrier - stop collecting candidates here
+                # s_barrier handling:
+                # - is_move_s_barrier=False: stop collecting candidates here
+                # - is_move_s_barrier=True: continue past intermediate s_barriers
                 if instr.opcode.lower() == 's_barrier':
-                    self._blocked_by_barrier.add(id(instr))
-                    break  # Stop - don't look for more candidates below s_barrier
+                    if not self.is_move_s_barrier:
+                        self._blocked_by_barrier.add(id(instr))
+                        break  # Stop - don't look for more candidates below s_barrier
+                    # When is_move_s_barrier=True, skip s_barrier but continue looking
+                    continue
                 if instr in self.protected_instructions:
                     self._blocked_by_protected.add(id(instr))
                 else:
@@ -3664,22 +3712,47 @@ class DistributeInstructionPass(Pass):
     def _find_branch_boundary(self, block: BasicBlock) -> int:
         """
         Find index of first branch/terminator instruction.
-        s_barrier is always treated as a boundary.
-        Instructions cannot be moved past this boundary.
         
-        s_barrier is a synchronization barrier that acts as a boundary line -
-        instructions before and after it cannot cross the boundary.
+        s_barrier handling depends on is_move_s_barrier flag:
+        - is_move_s_barrier=False: s_barrier is always treated as boundary (original behavior)
+        - is_move_s_barrier=True: only s_barrier immediately before branch/terminator is a boundary
+          (this protects synchronization barriers that guard control flow changes)
         
         Returns:
-            Index of first branch/terminator or s_barrier, or len(instructions) if none
+            Index of first boundary, or len(instructions) if none
         """
+        n = len(block.instructions)
+        
+        # First, find the branch/terminator position
+        branch_pos = n
         for i, instr in enumerate(block.instructions):
             if instr.is_branch or instr.is_terminator:
-                return i
-            # s_barrier is always a boundary
-            if instr.opcode.lower() == 's_barrier':
-                return i
-        return len(block.instructions)
+                branch_pos = i
+                break
+        
+        if not self.is_move_s_barrier:
+            # Original behavior: first s_barrier (before branch) is a boundary
+            for i in range(branch_pos):
+                if block.instructions[i].opcode.lower() == 's_barrier':
+                    return i
+        else:
+            # is_move_s_barrier=True: only s_barrier immediately before branch is a boundary
+            # This protects s_barrier that guards control flow (e.g., s_barrier right before s_cbranch)
+            if branch_pos > 0 and branch_pos < n:
+                # Check if instruction(s) immediately before branch are s_barrier/s_nop
+                # (s_nop often follows s_barrier for timing)
+                check_idx = branch_pos - 1
+                while check_idx >= 0:
+                    check_instr = block.instructions[check_idx]
+                    opcode_lower = check_instr.opcode.lower()
+                    if opcode_lower == 's_barrier':
+                        return check_idx  # Found protecting s_barrier
+                    elif opcode_lower.startswith('s_nop'):
+                        check_idx -= 1  # Skip s_nop, continue checking
+                    else:
+                        break  # Not s_barrier or s_nop, stop
+        
+        return branch_pos
     
     def _cycle_to_index(self, block: BasicBlock, target_cycle: int) -> int:
         """
@@ -3980,12 +4053,36 @@ class DistributeInstructionPass(Pass):
             if idx >= 0:
                 all_target_instrs.append(block.instructions[idx])
         
-        # 6. Move first K instructions to ideal positions (in order)
-        # Track frozen boundary: after each instruction is placed, freeze that position and above
-        frozen_boundary = 0
+        # 6. Two-pass distribution strategy:
+        # Pass 1: Move instructions that need to go UP (in order, from first to last)
+        # Pass 2: Move instructions that need to go DOWN (in reverse order, from last to first)
+        # This minimizes the protected instruction count during moves
+        
+        # First, categorize which instructions need to move up vs down
+        move_up_indices = []
+        move_down_indices = []
         
         for i in range(K):
-            # Re-find the nth target instruction (index may have changed)
+            current_idx = self._find_nth_target(block, i)
+            if current_idx < 0:
+                continue
+            current_cycle = self._get_instruction_cycle_position(block, current_idx)
+            ideal_cycle = ideal_cycles[i]
+            if current_cycle > ideal_cycle:
+                move_up_indices.append(i)
+            elif current_cycle < ideal_cycle:
+                move_down_indices.append(i)
+            # If current_cycle == ideal_cycle, no move needed
+        
+        if self.verbose:
+            print(f"Move strategy: {len(move_up_indices)} up, {len(move_down_indices)} down")
+        
+        # Track final positions: maps instruction index i to its final idx
+        final_positions = {}
+        
+        # Pass 1: Move up instructions in order (0, 1, 2, ...)
+        frozen_boundary = 0
+        for i in move_up_indices:
             current_idx = self._find_nth_target(block, i)
             if current_idx < 0:
                 if self.verbose:
@@ -3995,18 +4092,16 @@ class DistributeInstructionPass(Pass):
             ideal_cycle = ideal_cycles[i]
             target_idx = self._cycle_to_index(block, ideal_cycle)
             
-            # Don't move past already-placed instructions
-            # (they should stay in order)
+            # Don't move past already-placed instructions (they should stay in order)
             if i > 0:
                 prev_target_idx = self._find_nth_target(block, i - 1)
                 if prev_target_idx >= 0 and target_idx <= prev_target_idx:
                     target_idx = prev_target_idx + 1
             
-            # Ensure target is at least at frozen_boundary (can't place into frozen region)
+            # Ensure target is at least at frozen_boundary
             target_idx = max(target_idx, frozen_boundary)
             
-            # Create protected list: all remaining target instructions (i+1, i+2, ..., M-1)
-            # These should never be moved when moving instruction i
+            # Protected: all target instructions that will be processed later (i+1, ..., K-1)
             protected_instrs = all_target_instrs[i+1:]
             
             if self.verbose:
@@ -4014,20 +4109,56 @@ class DistributeInstructionPass(Pass):
                 print(f"  [{i}] Moving from idx={current_idx} (cycle={current_cycle}) to idx={target_idx} (ideal cycle={ideal_cycle})")
             
             final_idx = self._move_instruction_toward(result, current_idx, target_idx, branch_boundary, frozen_boundary, protected_instrs)
+            final_positions[i] = final_idx
             
             if self.verbose:
                 final_cycle = self._get_instruction_cycle_position(block, final_idx)
                 print(f"      Final position: idx={final_idx} (cycle={final_cycle})")
             
-            # Update frozen boundary: everything at or above final_idx is now frozen
+            # Update frozen boundary
             frozen_boundary = final_idx + 1
         
-        # 7. Move remaining M-K instructions toward the end
+        # Pass 2: Move down instructions in REVERSE order (K-1, K-2, ..., last of move_up + 1)
+        # This way, when moving instruction i down, instructions i+1, i+2, ... are NOT protected
+        for i in reversed(move_down_indices):
+            current_idx = self._find_nth_target(block, i)
+            if current_idx < 0:
+                if self.verbose:
+                    print(f"  Could not find target instruction {i}")
+                continue
+            
+            ideal_cycle = ideal_cycles[i]
+            target_idx = self._cycle_to_index(block, ideal_cycle)
+            
+            # For downward moves, clamp to branch boundary
+            target_idx = min(target_idx, branch_boundary - 1)
+            
+            # Ensure we don't go below already-placed instructions (next higher index that was placed)
+            if i < K - 1:
+                next_target_idx = self._find_nth_target(block, i + 1)
+                if next_target_idx >= 0 and target_idx >= next_target_idx:
+                    target_idx = next_target_idx - 1
+            
+            # Protected: only instructions 0..i-1 (not i+1..K-1, they were already processed)
+            protected_instrs = all_target_instrs[:i]
+            
+            if self.verbose:
+                current_cycle = self._get_instruction_cycle_position(block, current_idx)
+                print(f"  [{i}] Moving from idx={current_idx} (cycle={current_cycle}) to idx={target_idx} (ideal cycle={ideal_cycle})")
+            
+            final_idx = self._move_instruction_toward(result, current_idx, target_idx, branch_boundary, frozen_boundary, protected_instrs)
+            final_positions[i] = final_idx
+            
+            if self.verbose:
+                final_cycle = self._get_instruction_cycle_position(block, final_idx)
+                print(f"      Final position: idx={final_idx} (cycle={final_cycle})")
+        
+        # 7. Move remaining M-K instructions toward the end (in reverse order since they're all moving down)
         if M > K:
             if self.verbose:
-                print(f"Moving {M - K} remaining instructions to block end")
+                print(f"Moving {M - K} remaining instructions to block end (in reverse order)")
             
-            for i in range(K, M):
+            for i in reversed(range(K, M)):
                 current_idx = self._find_nth_target(block, i)
                 if current_idx < 0:
                     continue
@@ -4035,11 +4166,14 @@ class DistributeInstructionPass(Pass):
                 # Target is just before branch boundary
                 target_idx = branch_boundary - 1
                 
-                # Ensure target is at least at frozen_boundary
-                target_idx = max(target_idx, frozen_boundary)
+                # Ensure we don't go below already-placed instructions (next higher index that was placed)
+                if i < M - 1:
+                    next_target_idx = self._find_nth_target(block, i + 1)
+                    if next_target_idx >= 0 and target_idx >= next_target_idx:
+                        target_idx = next_target_idx - 1
                 
-                # Create protected list: all remaining target instructions
-                protected_instrs = all_target_instrs[i+1:]
+                # Protected: only instructions before this one (0..i-1), not those after
+                protected_instrs = all_target_instrs[:i]
                 
                 if self.verbose:
                     print(f"  [{i}] Moving from idx={current_idx} to end (target={target_idx})")
@@ -4048,9 +4182,6 @@ class DistributeInstructionPass(Pass):
                 
                 if self.verbose:
                     print(f"      Final position: idx={final_idx}")
-                
-                # Update frozen boundary for remaining instructions
-                frozen_boundary = final_idx + 1
         
         if self.verbose:
             print(f"Total moves made: {self._moved_count}")
@@ -4325,6 +4456,7 @@ class RegisterReplacePass(Pass):
         range_end: Ending instruction address (global ID, inclusive)
         registers_to_replace: List of register segment strings (e.g., ["v[40:45]", "s[37:40]"])
         alignments: List of alignment requirements for each segment
+        target_opcodes: List of opcodes to apply replacement to (if empty, apply to all)
         verbose: Print detailed information during execution
     """
     
@@ -4334,6 +4466,7 @@ class RegisterReplacePass(Pass):
         range_end: int,
         registers_to_replace: List[str],
         alignments: Optional[List[int]] = None,
+        target_opcodes: Optional[List[str]] = None,
         verbose: bool = False
     ):
         """
@@ -4344,17 +4477,22 @@ class RegisterReplacePass(Pass):
             range_end: Ending instruction address (global ID, inclusive)
             registers_to_replace: List of register segment strings
             alignments: List of alignment values (default: [1] * len(registers_to_replace))
+            target_opcodes: List of opcodes to apply replacement to (e.g., ["v_lshl_add_u64", "global_load_dwordx4"]).
+                           If empty or None, replacement applies to all instructions in range.
             verbose: Print detailed information
         """
         self.range_start = range_start
         self.range_end = range_end
         self.registers_to_replace = registers_to_replace
         self.alignments = alignments or [1] * len(registers_to_replace)
+        # Normalize opcodes to lowercase for case-insensitive matching
+        self.target_opcodes: Set[str] = set(op.lower() for op in target_opcodes) if target_opcodes else set()
         self.verbose = verbose
         
         # Computed during run
         self._register_mapping: Dict[str, str] = {}  # old_reg -> new_reg
         self._instructions_modified: int = 0
+        self._instructions_skipped: int = 0  # Count of non-target instructions
         self._error_message: Optional[str] = None
     
     @property
@@ -4363,7 +4501,10 @@ class RegisterReplacePass(Pass):
     
     @property
     def description(self) -> str:
-        return f"Replace registers {self.registers_to_replace} in range [{self.range_start}, {self.range_end}]"
+        desc = f"Replace registers {self.registers_to_replace} in range [{self.range_start}, {self.range_end}]"
+        if self.target_opcodes:
+            desc += f" (only opcodes: {list(self.target_opcodes)})"
+        return desc
     
     @property
     def register_mapping(self) -> Dict[str, str]:
@@ -4483,6 +4624,12 @@ class RegisterReplacePass(Pass):
                 if not (self.range_start <= instr.address <= self.range_end):
                     continue
                 
+                # Check if instruction opcode matches target_opcodes (if specified)
+                if self.target_opcodes:
+                    if instr.opcode.lower() not in self.target_opcodes:
+                        self._instructions_skipped += 1
+                        continue
+                
                 # Replace registers in operands
                 modified = self._replace_registers_in_instruction(instr)
                 if modified:
@@ -4490,6 +4637,8 @@ class RegisterReplacePass(Pass):
         
         if self.verbose:
             print(f"Modified {self._instructions_modified} instructions")
+            if self._instructions_skipped > 0:
+                print(f"Skipped {self._instructions_skipped} non-target instructions")
         
         # Step 5: Update DDG nodes to reflect register changes
         self._update_ddg_registers(result)
@@ -4618,6 +4767,7 @@ def replace_registers(
     range_end: int,
     registers_to_replace: List[str],
     alignments: Optional[List[int]] = None,
+    target_opcodes: Optional[List[str]] = None,
     verbose: bool = False
 ) -> Tuple[bool, Dict[str, str]]:
     """
@@ -4629,6 +4779,8 @@ def replace_registers(
         range_end: Ending instruction address (global ID, inclusive)
         registers_to_replace: List of register segment strings (e.g., ["v[40:45]", "s[37:40]"])
         alignments: List of alignment values (default: [1] * len(registers_to_replace))
+        target_opcodes: List of opcodes to apply replacement to (e.g., ["v_lshl_add_u64", "global_load_dwordx4"]).
+                       If empty or None, replacement applies to all instructions in range.
         verbose: Print progress information
         
     Returns:
@@ -4639,6 +4791,7 @@ def replace_registers(
         range_end=range_end,
         registers_to_replace=registers_to_replace,
         alignments=alignments,
+        target_opcodes=target_opcodes,
         verbose=verbose
     )
     
