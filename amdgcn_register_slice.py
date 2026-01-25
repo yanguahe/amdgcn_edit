@@ -1042,6 +1042,401 @@ def parse_register_list(register_str: str) -> Set[str]:
     return result
 
 
+# =============================================================================
+# Instruction Range DDG Slice
+# =============================================================================
+
+@dataclass
+class InstrRangeSlice:
+    """
+    DDG slice between two instruction global IDs.
+    
+    Attributes:
+        from_global_id: Starting instruction global ID (inclusive)
+        to_global_id: Ending instruction global ID (inclusive)
+        instructions: Dict mapping global_id to SliceInstruction
+        edges: List of dependency edges within the range
+        cfg_name: Name of the source CFG/function
+    """
+    from_global_id: int = 0
+    to_global_id: int = 0
+    instructions: Dict[int, SliceInstruction] = field(default_factory=dict)
+    edges: List[SliceEdge] = field(default_factory=list)
+    cfg_name: str = ""
+    
+    def get_instruction_count(self) -> int:
+        return len(self.instructions)
+    
+    def get_edge_count(self) -> int:
+        return len(self.edges)
+    
+    def get_all_global_ids_sorted(self) -> List[int]:
+        return sorted(self.instructions.keys())
+
+
+def build_instr_range_slice(
+    cfg: CFG,
+    ddgs: Dict[str, DDG],
+    from_id: int,
+    to_id: int,
+    use_address: bool = False
+) -> InstrRangeSlice:
+    """
+    Build a DDG slice containing instructions between two IDs.
+    
+    Args:
+        cfg: The Control Flow Graph
+        ddgs: Dictionary of DDGs for each block
+        from_id: Starting instruction ID (inclusive)
+        to_id: Ending instruction ID (inclusive)
+        use_address: If True, from_id/to_id are instruction addresses (line numbers).
+                     If False, they are global IDs (0-indexed).
+        
+    Returns:
+        InstrRangeSlice containing instructions and edges in the range
+    """
+    result = InstrRangeSlice(
+        from_global_id=from_id,
+        to_global_id=to_id,
+        cfg_name=cfg.name,
+    )
+    
+    # Build global ID to instruction mapping
+    global_id_to_instr: Dict[int, Tuple[str, int, Instruction]] = {}  # global_id -> (block_label, pos, instr)
+    block_order = cfg.block_order if cfg.block_order else list(cfg.blocks.keys())
+    
+    global_id = 0
+    for block_label in block_order:
+        if block_label not in cfg.blocks:
+            continue
+        block = cfg.blocks[block_label]
+        ddg = ddgs.get(block_label)
+        
+        for pos, instr in enumerate(block.instructions):
+            # Determine if this instruction is in range
+            if use_address:
+                in_range = from_id <= instr.address <= to_id
+            else:
+                in_range = from_id <= global_id <= to_id
+            
+            if in_range:
+                # Get defs and uses from DDG if available
+                if ddg and pos < len(ddg.nodes):
+                    node = ddg.nodes[pos]
+                    defs = node.defs.copy()
+                    uses = node.uses.copy()
+                    available_regs = node.available_regs.copy()
+                else:
+                    defs, uses = parse_instruction_registers(instr)
+                    available_regs = set()
+                
+                slice_instr = SliceInstruction(
+                    address=instr.address,
+                    opcode=instr.opcode,
+                    operands=instr.operands,
+                    raw_line=instr.raw_line,
+                    block_label=block_label,
+                    position_in_block=pos,
+                    reads=uses,
+                    writes=defs,
+                    is_barrier=is_barrier_instruction(
+                        instr.opcode,
+                        getattr(instr, 'is_branch', False),
+                        getattr(instr, 'is_terminator', False)
+                    ),
+                    is_waitcnt=instr.opcode.lower() == 's_waitcnt',
+                    available_regs=available_regs,
+                )
+                result.instructions[global_id] = slice_instr
+                global_id_to_instr[global_id] = (block_label, pos, instr)
+            
+            global_id += 1
+    
+    # Build edges by tracking register writes/reads
+    last_writer: Dict[str, int] = {}  # reg -> global_id
+    last_readers: Dict[str, Set[int]] = {}  # reg -> set of global_ids
+    
+    # Track memory ops that write registers (for AVAIL dependencies)
+    # mem_op_writers[reg] = list of (global_id, is_lgkm_op, is_vm_op)
+    mem_op_writers: Dict[str, List[Tuple[int, bool, bool]]] = {}
+    
+    for gid in result.get_all_global_ids_sorted():
+        instr = result.instructions[gid]
+        opcode_lower = instr.opcode.lower()
+        is_lgkm = is_lgkm_op(opcode_lower)
+        is_vm = is_vm_op(opcode_lower)
+        
+        # RAW dependencies
+        for reg in instr.reads:
+            if reg in last_writer:
+                writer_gid = last_writer[reg]
+                if writer_gid in result.instructions:
+                    # Find or create edge
+                    found = False
+                    for edge in result.edges:
+                        if edge.from_addr == writer_gid and edge.to_addr == gid and edge.dep_type == "RAW":
+                            edge.registers.add(reg)
+                            found = True
+                            break
+                    if not found:
+                        result.edges.append(SliceEdge(
+                            from_addr=writer_gid,
+                            to_addr=gid,
+                            dep_type="RAW",
+                            registers={reg},
+                        ))
+            
+            # Track as reader
+            if reg not in last_readers:
+                last_readers[reg] = set()
+            last_readers[reg].add(gid)
+        
+        # WAR dependencies
+        for reg in instr.writes:
+            if reg in last_readers:
+                for reader_gid in last_readers[reg]:
+                    if reader_gid != gid and reader_gid in result.instructions:
+                        found = False
+                        for edge in result.edges:
+                            if edge.from_addr == reader_gid and edge.to_addr == gid and edge.dep_type == "WAR":
+                                edge.registers.add(reg)
+                                found = True
+                                break
+                        if not found:
+                            result.edges.append(SliceEdge(
+                                from_addr=reader_gid,
+                                to_addr=gid,
+                                dep_type="WAR",
+                                registers={reg},
+                            ))
+        
+        # Update last writer
+        for reg in instr.writes:
+            last_writer[reg] = gid
+            if reg in last_readers:
+                last_readers[reg] = set()
+        
+        # Track memory ops that write registers (for AVAIL dependencies)
+        if is_lgkm or is_vm:
+            for reg in instr.writes:
+                if reg not in mem_op_writers:
+                    mem_op_writers[reg] = []
+                mem_op_writers[reg].append((gid, is_lgkm, is_vm))
+    
+    # Add AVAIL dependencies for s_waitcnt instructions
+    # For each s_waitcnt with available_regs:
+    # 1. WAIT edge: memory_op -> s_waitcnt (s_waitcnt waits for memory_op)
+    # 2. AVAIL edge: s_waitcnt -> user (s_waitcnt makes reg available for user)
+    for gid in result.get_all_global_ids_sorted():
+        instr = result.instructions[gid]
+        if not instr.is_waitcnt or not instr.available_regs:
+            continue
+        
+        # For each register made available by this s_waitcnt
+        for reg in instr.available_regs:
+            # Find the memory op that wrote this register (WAIT dependency)
+            if reg in mem_op_writers:
+                for writer_gid, _, _ in mem_op_writers[reg]:
+                    if writer_gid in result.instructions and writer_gid < gid:
+                        # Add WAIT edge: memory_op -> s_waitcnt
+                        found = False
+                        for edge in result.edges:
+                            if edge.from_addr == writer_gid and edge.to_addr == gid and edge.dep_type == "WAIT":
+                                edge.registers.add(reg)
+                                found = True
+                                break
+                        if not found:
+                            result.edges.append(SliceEdge(
+                                from_addr=writer_gid,
+                                to_addr=gid,
+                                dep_type="WAIT",
+                                registers={reg},
+                            ))
+            
+            # Find instructions that use this register after s_waitcnt (AVAIL dependency)
+            for user_gid in result.get_all_global_ids_sorted():
+                if user_gid <= gid:
+                    continue
+                user_instr = result.instructions[user_gid]
+                if reg in user_instr.reads:
+                    # Add AVAIL edge: s_waitcnt -> user
+                    found = False
+                    for edge in result.edges:
+                        if edge.from_addr == gid and edge.to_addr == user_gid and edge.dep_type == "AVAIL":
+                            edge.registers.add(reg)
+                            found = True
+                            break
+                    if not found:
+                        result.edges.append(SliceEdge(
+                            from_addr=gid,
+                            to_addr=user_gid,
+                            dep_type="AVAIL",
+                            registers={reg},
+                        ))
+                    # Only add AVAIL edge to the first user (closest dependency)
+                    break
+    
+    return result
+
+
+def generate_instr_range_dot(
+    slice_result: InstrRangeSlice,
+    max_label_len: int = 60
+) -> str:
+    """
+    Generate DOT format representation of the instruction range slice.
+    
+    Args:
+        slice_result: The instruction range slice to visualize
+        max_label_len: Maximum length for instruction labels
+        
+    Returns:
+        DOT format string
+    """
+    lines = []
+    
+    lines.append(f'digraph "InstrRange_{slice_result.from_global_id}_to_{slice_result.to_global_id}" {{')
+    lines.append('    rankdir=TB;')
+    lines.append('    node [shape=box, fontname="Courier", fontsize=9];')
+    lines.append('    edge [fontname="Courier", fontsize=8];')
+    lines.append('    graph [ranksep=0.5, nodesep=0.3];')
+    lines.append('')
+    
+    # Graph title
+    lines.append(f'    label="DDG Slice\\nGlobal ID Range: {slice_result.from_global_id} - {slice_result.to_global_id}\\n'
+                 f'Instructions: {slice_result.get_instruction_count()}, '
+                 f'Edges: {slice_result.get_edge_count()}";')
+    lines.append('    labelloc=t;')
+    lines.append('')
+    
+    # Add instruction nodes
+    lines.append('    // Instruction nodes')
+    for gid in slice_result.get_all_global_ids_sorted():
+        instr = slice_result.instructions[gid]
+        node_id = f"n{gid}"
+        
+        # Truncate instruction text
+        instr_text = f"{instr.opcode} {instr.operands}"
+        if len(instr_text) > max_label_len:
+            instr_text = instr_text[:max_label_len-3] + "..."
+        instr_text = escape_dot_string(instr_text)
+        
+        # Show defs and uses
+        writes_str = ",".join(sorted(list(instr.writes)[:4]))
+        if len(instr.writes) > 4:
+            writes_str += "..."
+        reads_str = ",".join(sorted(list(instr.reads)[:4]))
+        if len(instr.reads) > 4:
+            reads_str += "..."
+        
+        # Show available_regs for s_waitcnt
+        avail_str = ""
+        if instr.is_waitcnt and instr.available_regs:
+            avail_list = sorted(list(instr.available_regs)[:4])
+            avail_str = ",".join(avail_list)
+            if len(instr.available_regs) > 4:
+                avail_str += "..."
+        
+        # Build label - use address (line number) instead of global_id
+        label = f"[{instr.address}] {instr_text}"
+        if instr.writes:
+            label += f"\\nW: {writes_str}"
+        if instr.reads:
+            label += f"\\nR: {reads_str}"
+        if avail_str:
+            label += f"\\nAVAIL: {avail_str}"
+        label += f"\\n({instr.block_label}:{instr.position_in_block})"
+        
+        # Color based on instruction type
+        if instr.is_waitcnt:
+            color = "lightgray"
+        elif instr.is_barrier:
+            color = "lightyellow"
+        elif is_lgkm_op(instr.opcode.lower()):
+            color = "lightskyblue"
+        elif is_vm_op(instr.opcode.lower()):
+            color = "khaki"
+        elif instr.opcode.lower().startswith('v_mfma'):
+            color = "lightgreen"
+        else:
+            color = "white"
+        
+        lines.append(f'    {node_id} [label="{label}", style=filled, fillcolor={color}];')
+    
+    lines.append('')
+    
+    # Add edges
+    lines.append('    // Dependency edges')
+    type_colors = {
+        "RAW": "blue",
+        "WAR": "purple",
+        "WAIT": "green",      # memory_op -> s_waitcnt
+        "AVAIL": "forestgreen",  # s_waitcnt -> user
+    }
+    
+    for edge in slice_result.edges:
+        regs_str = ",".join(sorted(edge.registers)[:3])
+        if len(edge.registers) > 3:
+            regs_str += f"...(+{len(edge.registers)-3})"
+        
+        color = type_colors.get(edge.dep_type, "black")
+        # Use dashed style for WAIT/AVAIL edges to distinguish from RAW/WAR
+        style = "dashed" if edge.dep_type in ("WAIT", "AVAIL") else "solid"
+        lines.append(f'    n{edge.from_addr} -> n{edge.to_addr} '
+                    f'[label="{edge.dep_type}:{regs_str}", color={color}, style={style}];')
+    
+    lines.append('}')
+    
+    return '\n'.join(lines)
+
+
+def save_instr_range_slice(
+    slice_result: InstrRangeSlice,
+    output_dir: str,
+    generate_svg: bool = True
+) -> Dict[str, str]:
+    """
+    Save instruction range slice to DOT and SVG formats.
+    
+    Args:
+        slice_result: The instruction range slice to save
+        output_dir: Output directory
+        generate_svg: Whether to generate SVG using graphviz
+        
+    Returns:
+        Dictionary mapping format name to file path
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    base_name = f"ddg_range_{slice_result.from_global_id}_to_{slice_result.to_global_id}"
+    output_files: Dict[str, str] = {}
+    
+    # Save DOT
+    dot_content = generate_instr_range_dot(slice_result)
+    dot_file = os.path.join(output_dir, f"{base_name}.dot")
+    with open(dot_file, 'w', encoding='utf-8') as f:
+        f.write(dot_content)
+    output_files['dot'] = dot_file
+    print(f"DOT saved to: {dot_file}")
+    
+    # Save SVG
+    if generate_svg:
+        svg_file = os.path.join(output_dir, f"{base_name}.svg")
+        try:
+            subprocess.run(
+                ['dot', '-Tsvg', dot_file, '-o', svg_file],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            output_files['svg'] = svg_file
+            print(f"SVG saved to: {svg_file}")
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Failed to generate SVG: {e}")
+        except FileNotFoundError:
+            print("Warning: 'dot' command not found. Install graphviz to generate SVG files.")
+    
+    return output_files
+
+
 def print_slice_summary(slice_result: RegisterSlice) -> None:
     """Print a summary of the register slice."""
     print("\n" + "=" * 70)
@@ -1083,14 +1478,22 @@ def print_slice_summary(slice_result: RegisterSlice) -> None:
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
-        description='AMDGCN Register Slice Analyzer - Extract instructions related to specific registers',
+        description='AMDGCN Register Slice Analyzer - Extract instructions related to specific registers or by instruction range',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
+  # Register-based slice:
   %(prog)s input.amdgcn --registers v3,s7,exec,scc
   %(prog)s input.amdgcn --registers "v[0:3],s[4:7]" --output-dir ./slice_output
   %(prog)s --load-json analysis.json --registers v40,v41 --output-dir ./slice_output
   %(prog)s input.amdgcn --registers vcc,scc --no-svg --quiet
+  
+  # Instruction range-based DDG slice (by global ID, 0-indexed):
+  %(prog)s --load-json analysis.json --instr-range 100,200 --output-dir ./slice_output
+  %(prog)s input.amdgcn --instr-range 50,80 --output-dir ./ddg_slice
+  
+  # Instruction range-based DDG slice (by address/line number):
+  %(prog)s --load-json analysis.json --addr-range 1021,1071 --output-dir ./slice_output
 '''
     )
     parser.add_argument(
@@ -1106,8 +1509,17 @@ Examples:
     )
     parser.add_argument(
         '--registers', '-r',
-        required=True,
         help='Comma-separated list of registers to search for (e.g., v3,s7,exec,scc or v[0:3])'
+    )
+    parser.add_argument(
+        '--instr-range', '-i',
+        metavar='FROM,TO',
+        help='Extract DDG slice between two instruction global IDs (e.g., 100,200)'
+    )
+    parser.add_argument(
+        '--addr-range', '-a',
+        metavar='FROM,TO',
+        help='Extract DDG slice between two instruction addresses/line numbers (e.g., 1021,1071)'
     )
     parser.add_argument(
         '--output-dir', '-o',
@@ -1131,7 +1543,71 @@ Examples:
     if not args.input and not args.load_json:
         parser.error("Either input file or --load-json must be specified")
     
-    # Parse register list
+    # Validate: either --registers, --instr-range, or --addr-range must be specified
+    if not args.registers and not args.instr_range and not args.addr_range:
+        parser.error("Either --registers, --instr-range, or --addr-range must be specified")
+    
+    # Handle instruction range mode (by global ID or by address)
+    if args.instr_range or args.addr_range:
+        use_address = args.addr_range is not None
+        range_str = args.addr_range if use_address else args.instr_range
+        range_type = "address" if use_address else "global ID"
+        
+        try:
+            parts = range_str.split(',')
+            if len(parts) != 2:
+                parser.error(f"--{'addr' if use_address else 'instr'}-range requires exactly two comma-separated {range_type}s (e.g., 100,200)")
+            from_id = int(parts[0].strip())
+            to_id = int(parts[1].strip())
+            if from_id > to_id:
+                from_id, to_id = to_id, from_id
+        except ValueError:
+            parser.error(f"--{'addr' if use_address else 'instr'}-range requires integer {range_type}s (e.g., 100,200)")
+        
+        if not args.quiet:
+            print(f"Extracting DDG slice for instruction {range_type} range: {from_id} - {to_id}")
+            if args.load_json:
+                print(f"Loading from JSON: {args.load_json}")
+            else:
+                print(f"Input file: {args.input}")
+        
+        # Build the instruction range slice
+        try:
+            if args.load_json:
+                result = load_analysis_from_json(args.load_json)
+                cfg, ddgs = result.cfg, result.ddgs
+            else:
+                parser_obj = AMDGCNParser()
+                cfg = parser_obj.parse_file(args.input)
+                ddgs, _ = generate_all_ddgs(cfg, enable_cross_block_waitcnt=True)
+            
+            instr_slice = build_instr_range_slice(cfg, ddgs, from_id, to_id, use_address=use_address)
+        except FileNotFoundError:
+            input_file = args.load_json if args.load_json else args.input
+            print(f"Error: File not found: {input_file}")
+            return 1
+        except Exception as e:
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return 1
+        
+        if not args.quiet:
+            print(f"\nInstruction range slice summary:")
+            print(f"  {range_type.capitalize()} Range: {instr_slice.from_global_id} - {instr_slice.to_global_id}")
+            print(f"  Instructions: {instr_slice.get_instruction_count()}")
+            print(f"  Edges: {instr_slice.get_edge_count()}")
+        
+        # Save outputs
+        save_instr_range_slice(
+            instr_slice,
+            args.output_dir,
+            generate_svg=not args.no_svg
+        )
+        
+        return 0
+    
+    # Register-based slice mode
     target_registers = parse_register_list(args.registers)
     
     if not target_registers:

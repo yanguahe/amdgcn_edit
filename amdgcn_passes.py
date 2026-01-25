@@ -1542,6 +1542,21 @@ class MoveInstructionPass(Pass):
             if raw_conflicts:
                 if raw_conflicts == {'scc'} and not is_scc_reader(opcode_b):
                     pass  # SCC-only conflict, B doesn't read SCC
+                elif raw_conflicts == {'scc'} and is_scc_reader(opcode_b):
+                    # SCC conflict where B reads SCC - but check if there's an intermediate
+                    # SCC writer between A and B. If so, the SCC from A is overwritten
+                    # before B reads it, so the conflict is false.
+                    has_intermediate_scc_writer = False
+                    for mid_idx in range(from_idx + 1, check_idx):
+                        mid_instr = block.instructions[mid_idx]
+                        mid_defs, _ = get_instruction_defs_uses(mid_instr)
+                        if 'scc' in mid_defs:
+                            has_intermediate_scc_writer = True
+                            break
+                    if not has_intermediate_scc_writer:
+                        # No intermediate SCC writer, the conflict is real
+                        return False
+                    # else: Allow - SCC is overwritten before B reads it
                 else:
                     return False
             
