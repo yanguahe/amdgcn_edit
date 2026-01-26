@@ -28,6 +28,7 @@ import json
 import os
 import re
 import fnmatch
+import functools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Optional, Tuple, Any, Union
@@ -1478,11 +1479,15 @@ class InsertLatencyNopsPass:
 # Instruction Cycles Helper
 # =============================================================================
 
+# Cache for instruction cycles lookup (opcode -> cycles)
+_instruction_cycles_cache: Dict[str, int] = {}
+
 def get_instruction_cycles(opcode: str, hw_info: Optional[HardwareInfo] = None) -> int:
     """
     Get the number of cycles required to issue an instruction.
     
     This replaces the hardcoded function in amdgcn_passes.py.
+    Uses a cache for fast repeated lookups.
     
     Args:
         opcode: The instruction opcode
@@ -1491,17 +1496,25 @@ def get_instruction_cycles(opcode: str, hw_info: Optional[HardwareInfo] = None) 
     Returns:
         Number of cycles for the instruction
     """
+    opcode_lower = opcode.lower()
+    
+    # Check cache first
+    if opcode_lower in _instruction_cycles_cache:
+        return _instruction_cycles_cache[opcode_lower]
+    
     if hw_info is None:
         hw_info = load_hardware_info()
     
-    opcode_lower = opcode.lower()
-    
+    # Look up cycles
+    result = hw_info.default_cycles
     for pattern, cycles in hw_info.instruction_cycles.items():
-        # Convert glob pattern to regex
         if fnmatch.fnmatch(opcode_lower, pattern):
-            return cycles
+            result = cycles
+            break
     
-    return hw_info.default_cycles
+    # Cache the result
+    _instruction_cycles_cache[opcode_lower] = result
+    return result
 
 
 # =============================================================================

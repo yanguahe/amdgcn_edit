@@ -23,6 +23,7 @@ Usage:
 """
 
 import re
+import functools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Optional, Tuple, Any, Union
@@ -67,6 +68,49 @@ from amdgcn_latency import (
     LatencyNopsResult,
     InsertLatencyNopsPass,
 )
+
+# Enable unbuffered output for real-time printing
+print = functools.partial(print, flush=True)
+
+
+# =============================================================================
+# LDS Synchronization Order Constraint Helper
+# =============================================================================
+
+def get_lds_sync_priority(opcode: str, operands: str = "") -> int:
+    """
+    Get the priority of an LDS synchronization instruction.
+    Returns 0 for non-LDS synchronization instructions.
+    
+    Correct order for LDS inter-thread synchronization pattern:
+      ds_write_*            ; Phase 1: All threads issue LDS writes
+      s_waitcnt lgkmcnt(sx) ; Phase 2: Wait for LDS operations to complete
+      s_barrier             ; Phase 3: Synchronize all threads
+      ds_read_*             ; Phase 4: Safely read data written by other threads
+    
+    Priority: ds_write(1) < s_waitcnt lgkmcnt(2) < s_barrier(3) < ds_read(4)
+    
+    Args:
+        opcode: Instruction opcode
+        operands: Instruction operands (used to check if s_waitcnt contains lgkmcnt)
+        
+    Returns:
+        Priority value (1-4), 0 for non-LDS synchronization instructions
+    """
+    opcode_lower = opcode.lower()
+    
+    if opcode_lower.startswith('ds_write'):
+        return 1
+    if opcode_lower == 's_waitcnt':
+        # Only s_waitcnt with lgkmcnt participates in LDS synchronization
+        if 'lgkmcnt' in operands.lower():
+            return 2
+    if opcode_lower == 's_barrier':
+        return 3
+    if opcode_lower.startswith('ds_read'):
+        return 4
+    
+    return 0  # Not an LDS synchronization instruction
 
 
 # =============================================================================
@@ -1532,6 +1576,16 @@ class MoveInstructionPass(Pass):
                     return False
                 # When is_move_s_barrier=True, continue checking other dependencies
             
+            # LDS synchronization order constraint - STRICT ORDER
+            # All LDS sync instructions (ds_write, s_waitcnt lgkmcnt, s_barrier, ds_read)
+            # must maintain their original relative order within a block.
+            # This prevents cross-phase movements that would corrupt lgkmcnt semantics.
+            priority_a = get_lds_sync_priority(opcode_a, instr_a.operands)
+            priority_b = get_lds_sync_priority(opcode_b, instr_b.operands)
+            if priority_a > 0 and priority_b > 0:
+                # Strict order: any two LDS sync instructions cannot pass each other
+                return False
+            
             # RAW: B reads what A writes -> BLOCKED (A must stay before B)
             raw_conflicts = defs_a & uses_b
             if raw_conflicts:
@@ -1646,6 +1700,61 @@ class MoveInstructionPass(Pass):
             if not self.auto_insert_nops:
                 return False
         
+        # === Check LATENCY constraint: dynamic calculation with optimized search ===
+        # Note: DDG latency_edges may be stale after prior passes modify the block,
+        # so we use dynamic calculation but with limited search distance for performance
+        
+        # Get cycles provided by instruction A
+        if opcode_a == 's_nop':
+            try:
+                nop_operand = instr_a.operands.strip()
+                instr_a_cycles = int(nop_operand) + 1 if nop_operand.isdigit() else 1
+            except:
+                instr_a_cycles = 1
+        else:
+            instr_a_cycles = get_instruction_cycles(opcode_a)
+        
+        # Limit search distance for performance (latency requirements typically within 15 instructions)
+        MAX_LATENCY_DIST = 15
+        
+        # Case 1: Check if removing A from its position would break a latency constraint
+        # between a producer ABOVE A and a consumer BELOW A (but at or before to_idx)
+        for producer_idx in range(max(0, from_idx - MAX_LATENCY_DIST), from_idx):
+            producer = block.instructions[producer_idx]
+            for consumer_idx in range(from_idx + 1, min(to_idx + 1, from_idx + MAX_LATENCY_DIST + 1)):
+                if consumer_idx >= len(block.instructions):
+                    break
+                consumer = block.instructions[consumer_idx]
+                required_lat = get_required_latency(producer, consumer)
+                if required_lat > 0:
+                    # Calculate remaining cycles without A
+                    remaining_cycles = 0
+                    for k in range(producer_idx + 1, consumer_idx):
+                        if k == from_idx:
+                            continue  # Skip A as it will move away
+                        k_instr = block.instructions[k]
+                        if k_instr.opcode.lower() == 's_nop':
+                            try:
+                                k_op = k_instr.operands.strip()
+                                remaining_cycles += int(k_op) + 1 if k_op.isdigit() else 1
+                            except:
+                                remaining_cycles += 1
+                        else:
+                            remaining_cycles += get_instruction_cycles(k_instr.opcode)
+                    
+                    if remaining_cycles < required_lat:
+                        return False
+        
+        # Case 2: If A is a producer with latency requirement, check if moving past consumer
+        for check_idx in range(from_idx + 1, min(to_idx + 1, from_idx + MAX_LATENCY_DIST + 1)):
+            if check_idx >= len(block.instructions):
+                break
+            check_instr = block.instructions[check_idx]
+            required_lat = get_required_latency(instr_a, check_instr)
+            if required_lat > 0:
+                # A has latency requirement to check_instr, moving past it reverses order
+                return False
+        
         return True
     
     def _can_move_single_instruction_up(
@@ -1706,6 +1815,16 @@ class MoveInstructionPass(Pass):
                 if not self.is_move_s_barrier:
                     return False
                 # When is_move_s_barrier=True, continue checking other dependencies
+            
+            # LDS synchronization order constraint - STRICT ORDER
+            # All LDS sync instructions (ds_write, s_waitcnt lgkmcnt, s_barrier, ds_read)
+            # must maintain their original relative order within a block.
+            # This prevents cross-phase movements that would corrupt lgkmcnt semantics.
+            priority_a = get_lds_sync_priority(opcode_a, instr_a.operands)
+            priority_b = get_lds_sync_priority(opcode_b, instr_b.operands)
+            if priority_a > 0 and priority_b > 0:
+                # Strict order: any two LDS sync instructions cannot pass each other
+                return False
             
             # RAW: A reads what B writes -> BLOCKED (A depends on B)
             raw_conflicts = defs_b & uses_a
@@ -1792,6 +1911,59 @@ class MoveInstructionPass(Pass):
         if not check_move_side_effects_on_latency(block, from_idx, to_idx):
             # If auto_insert_nops is enabled, we allow the move
             if not self.auto_insert_nops:
+                return False
+        
+        # === Check LATENCY constraint: dynamic calculation with optimized search ===
+        # Note: DDG latency_edges may be stale after prior passes modify the block,
+        # so we use dynamic calculation but with limited search distance for performance
+        
+        # Get cycles provided by instruction A
+        if opcode_a == 's_nop':
+            try:
+                nop_operand = instr_a.operands.strip()
+                instr_a_cycles = int(nop_operand) + 1 if nop_operand.isdigit() else 1
+            except:
+                instr_a_cycles = 1
+        else:
+            instr_a_cycles = get_instruction_cycles(opcode_a)
+        
+        # Limit search distance for performance (latency requirements typically within 15 instructions)
+        MAX_LATENCY_DIST = 15
+        
+        # Case 1: Check if removing A from its position would break a latency constraint
+        # between a producer ABOVE to_idx and a consumer BELOW A
+        for producer_idx in range(max(0, to_idx - MAX_LATENCY_DIST), from_idx):
+            producer = block.instructions[producer_idx]
+            for consumer_idx in range(from_idx + 1, min(len(block.instructions), from_idx + MAX_LATENCY_DIST + 1)):
+                consumer = block.instructions[consumer_idx]
+                required_lat = get_required_latency(producer, consumer)
+                if required_lat > 0:
+                    # If A moves up before producer, it won't provide delay
+                    if to_idx <= producer_idx:
+                        # Calculate remaining cycles without A
+                        remaining_cycles = 0
+                        for k in range(producer_idx + 1, consumer_idx):
+                            if k == from_idx:
+                                continue  # Skip A as it will move away
+                            k_instr = block.instructions[k]
+                            if k_instr.opcode.lower() == 's_nop':
+                                try:
+                                    k_op = k_instr.operands.strip()
+                                    remaining_cycles += int(k_op) + 1 if k_op.isdigit() else 1
+                                except:
+                                    remaining_cycles += 1
+                            else:
+                                remaining_cycles += get_instruction_cycles(k_instr.opcode)
+                        
+                        if remaining_cycles < required_lat:
+                            return False
+        
+        # Case 2: If A is a consumer with latency requirement from a producer, moving A before producer
+        for check_idx in range(max(0, to_idx), from_idx):
+            producer = block.instructions[check_idx]
+            required_lat = get_required_latency(producer, instr_a)
+            if required_lat > 0:
+                # A has latency requirement from producer, moving before producer reverses order
                 return False
         
         return True
@@ -3706,8 +3878,12 @@ class DistributeInstructionPass(Pass):
         if k <= 0:
             return []
         
-        interval = total_cycles / (k + 1)
-        return [int(i * interval) for i in range(1, k + 1)]
+        if k == 1:
+            return [total_cycles // 2]
+        
+        # Match debug_distribute_pass.py: cycle_spacing = total_cycles / k
+        cycle_spacing = total_cycles / k
+        return [int(cycle_spacing * (i + 1)) for i in range(k)]
     
     def _find_branch_boundary(self, block: BasicBlock) -> int:
         """
@@ -3758,7 +3934,8 @@ class DistributeInstructionPass(Pass):
         """
         Convert a target cycle position to an instruction index.
         
-        Finds the instruction that starts at or just after the target cycle.
+        Matches debug_distribute_pass.py implementation: finds the first instruction
+        whose cumulative cycle (after adding its cycles) reaches or exceeds target_cycle.
         
         Args:
             block: The basic block
@@ -3767,11 +3944,12 @@ class DistributeInstructionPass(Pass):
         Returns:
             Instruction index corresponding to the target cycle
         """
-        cumulative = 0
+        total = 0
         for i, instr in enumerate(block.instructions):
-            if cumulative >= target_cycle:
+            cycles = get_instruction_cycles(instr.opcode)
+            total += cycles
+            if total >= target_cycle:
                 return i
-            cumulative += get_instruction_cycles(instr.opcode)
         return len(block.instructions) - 1
     
     def _get_instruction_cycle_position(self, block: BasicBlock, index: int) -> int:
@@ -3856,9 +4034,16 @@ class DistributeInstructionPass(Pass):
         if current_idx == target_idx:
             return current_idx  # Already at (clamped) target
         
-        # Calculate cycle difference
-        current_cycle = self._get_instruction_cycle_position(block, current_idx)
-        target_cycle = self._get_instruction_cycle_position(block, target_idx)
+        # Calculate cycle difference using END cycle (cumulative including instruction)
+        # This matches debug_distribute_pass.py's get_cumulative_cycle for consistency
+        def get_cumulative_cycle(blk, idx):
+            total = 0
+            for i in range(idx + 1):
+                total += get_instruction_cycles(blk.instructions[i].opcode)
+            return total
+        
+        current_cycle = get_cumulative_cycle(block, current_idx)
+        target_cycle = get_cumulative_cycle(block, target_idx)
         cycle_diff = target_cycle - current_cycle
         
         if cycle_diff == 0:
@@ -4025,22 +4210,28 @@ class DistributeInstructionPass(Pass):
         K = min(self.distribute_count, M)
         
         if self.verbose:
-            print(f"Found {M} {self.target_opcode} instructions, distributing {K} evenly")
+            print(f"Found {M} {self.target_opcode} instructions in {self.block_label}")
         
-        # 2. Calculate total cycles
-        total_cycles = self._calculate_block_cycles(block)
+        # 2. Find branch boundary first (needed for total_cycles calculation)
+        branch_boundary = self._find_branch_boundary(block)
+        
+        # 3. Calculate total cycles up to branch_boundary (matches debug_distribute_pass.py)
+        # Use cumulative cycle INCLUDING the instruction at branch_boundary - 1
+        if branch_boundary > 0:
+            total_cycles = 0
+            for i in range(branch_boundary):
+                total_cycles += get_instruction_cycles(block.instructions[i].opcode)
+        else:
+            total_cycles = 0
         
         if self.verbose:
-            print(f"Block total cycles: {total_cycles}")
+            print(f"Block total cycles: {total_cycles}, branch boundary: {branch_boundary}")
         
-        # 3. Calculate ideal cycle positions for K instructions
+        # 4. Calculate ideal cycle positions for K instructions
         ideal_cycles = self._calculate_ideal_cycles(total_cycles, K)
         
         if self.verbose:
-            print(f"Ideal cycle positions: {ideal_cycles}")
-        
-        # 4. Find branch boundary
-        branch_boundary = self._find_branch_boundary(block)
+            print(f"Ideal cycle positions: {ideal_cycles[:5]}{'...' if len(ideal_cycles) > 5 else ''}")
         
         if self.verbose:
             print(f"Branch boundary at index: {branch_boundary}")
@@ -4053,36 +4244,13 @@ class DistributeInstructionPass(Pass):
             if idx >= 0:
                 all_target_instrs.append(block.instructions[idx])
         
-        # 6. Two-pass distribution strategy:
-        # Pass 1: Move instructions that need to go UP (in order, from first to last)
-        # Pass 2: Move instructions that need to go DOWN (in reverse order, from last to first)
-        # This minimizes the protected instruction count during moves
+        # 6. Sequential distribution strategy (matches debug_distribute_pass.py)
+        # Process all K instructions in order (0, 1, 2, ..., K-1)
+        # This is simpler and produces consistent results with the debug tool
         
-        # First, categorize which instructions need to move up vs down
-        move_up_indices = []
-        move_down_indices = []
+        frozen_boundary = 0
         
         for i in range(K):
-            current_idx = self._find_nth_target(block, i)
-            if current_idx < 0:
-                continue
-            current_cycle = self._get_instruction_cycle_position(block, current_idx)
-            ideal_cycle = ideal_cycles[i]
-            if current_cycle > ideal_cycle:
-                move_up_indices.append(i)
-            elif current_cycle < ideal_cycle:
-                move_down_indices.append(i)
-            # If current_cycle == ideal_cycle, no move needed
-        
-        if self.verbose:
-            print(f"Move strategy: {len(move_up_indices)} up, {len(move_down_indices)} down")
-        
-        # Track final positions: maps instruction index i to its final idx
-        final_positions = {}
-        
-        # Pass 1: Move up instructions in order (0, 1, 2, ...)
-        frozen_boundary = 0
-        for i in move_up_indices:
             current_idx = self._find_nth_target(block, i)
             if current_idx < 0:
                 if self.verbose:
@@ -4092,7 +4260,7 @@ class DistributeInstructionPass(Pass):
             ideal_cycle = ideal_cycles[i]
             target_idx = self._cycle_to_index(block, ideal_cycle)
             
-            # Don't move past already-placed instructions (they should stay in order)
+            # Ensure target_idx respects ordering constraints
             if i > 0:
                 prev_target_idx = self._find_nth_target(block, i - 1)
                 if prev_target_idx >= 0 and target_idx <= prev_target_idx:
@@ -4101,7 +4269,7 @@ class DistributeInstructionPass(Pass):
             # Ensure target is at least at frozen_boundary
             target_idx = max(target_idx, frozen_boundary)
             
-            # Protected: all target instructions that will be processed later (i+1, ..., K-1)
+            # Protected: all REMAINING target instructions (i+1, ..., K-1)
             protected_instrs = all_target_instrs[i+1:]
             
             if self.verbose:
@@ -4109,7 +4277,6 @@ class DistributeInstructionPass(Pass):
                 print(f"  [{i}] Moving from idx={current_idx} (cycle={current_cycle}) to idx={target_idx} (ideal cycle={ideal_cycle})")
             
             final_idx = self._move_instruction_toward(result, current_idx, target_idx, branch_boundary, frozen_boundary, protected_instrs)
-            final_positions[i] = final_idx
             
             if self.verbose:
                 final_cycle = self._get_instruction_cycle_position(block, final_idx)
@@ -4117,41 +4284,6 @@ class DistributeInstructionPass(Pass):
             
             # Update frozen boundary
             frozen_boundary = final_idx + 1
-        
-        # Pass 2: Move down instructions in REVERSE order (K-1, K-2, ..., last of move_up + 1)
-        # This way, when moving instruction i down, instructions i+1, i+2, ... are NOT protected
-        for i in reversed(move_down_indices):
-            current_idx = self._find_nth_target(block, i)
-            if current_idx < 0:
-                if self.verbose:
-                    print(f"  Could not find target instruction {i}")
-                continue
-            
-            ideal_cycle = ideal_cycles[i]
-            target_idx = self._cycle_to_index(block, ideal_cycle)
-            
-            # For downward moves, clamp to branch boundary
-            target_idx = min(target_idx, branch_boundary - 1)
-            
-            # Ensure we don't go below already-placed instructions (next higher index that was placed)
-            if i < K - 1:
-                next_target_idx = self._find_nth_target(block, i + 1)
-                if next_target_idx >= 0 and target_idx >= next_target_idx:
-                    target_idx = next_target_idx - 1
-            
-            # Protected: only instructions 0..i-1 (not i+1..K-1, they were already processed)
-            protected_instrs = all_target_instrs[:i]
-            
-            if self.verbose:
-                current_cycle = self._get_instruction_cycle_position(block, current_idx)
-                print(f"  [{i}] Moving from idx={current_idx} (cycle={current_cycle}) to idx={target_idx} (ideal cycle={ideal_cycle})")
-            
-            final_idx = self._move_instruction_toward(result, current_idx, target_idx, branch_boundary, frozen_boundary, protected_instrs)
-            final_positions[i] = final_idx
-            
-            if self.verbose:
-                final_cycle = self._get_instruction_cycle_position(block, final_idx)
-                print(f"      Final position: idx={final_idx} (cycle={final_cycle})")
         
         # 7. Move remaining M-K instructions toward the end (in reverse order since they're all moving down)
         if M > K:
@@ -4327,9 +4459,9 @@ def distribute_instructions(
     pm.verbose = verbose
     pm.add_pass(pass_)
     
-    # Add latency fix pass to ensure MFMA latency constraints are satisfied
-    if auto_fix_latency:
-        pm.add_pass(InsertLatencyNopsPass())
+    # # Add latency fix pass to ensure MFMA latency constraints are satisfied
+    # if auto_fix_latency:
+    #     pm.add_pass(InsertLatencyNopsPass())
     
     return pm.run_all(result)
 

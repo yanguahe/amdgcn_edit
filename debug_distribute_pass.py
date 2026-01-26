@@ -158,7 +158,8 @@ def dump_single_block_instructions(cfg: CFG, block_label: str, output_dir: str) 
             else:
                 line = f"{instr.opcode} {instr.operands}" if instr.operands else instr.opcode
             
-            f.write(f"[{idx}] {line}\n")
+            # Use global address instead of local index for consistency with amdgcn_ddg.py
+            f.write(f"[{instr.address}] {line}\n")
 
 
 def save_amdgcn(result: AnalysisResult, output_path: str, block_label: str = None):

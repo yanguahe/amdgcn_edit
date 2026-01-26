@@ -17,6 +17,7 @@ import re
 import os
 import subprocess
 import json
+import functools
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Optional, Tuple, Union, Any
 from pathlib import Path
@@ -26,6 +27,8 @@ from amdgcn_cfg import (
     escape_dot_string, truncate_instruction
 )
 
+# Enable unbuffered output for real-time printing
+print = functools.partial(print, flush=True)
 
 # =============================================================================
 # AMDGCN Register Patterns
@@ -625,6 +628,17 @@ class DDG:
     # Cross-block memory ops waited by each s_waitcnt: waitcnt_node_id -> list of PendingMemOp
     waitcnt_cross_block_ops: Dict[int, List['PendingMemOp']] = field(default_factory=dict)
     
+    # === Latency constraint tracking (Table 11 hazards, MFMA latency, etc.) ===
+    # Latency edges: (producer_idx, consumer_idx, required_cycles)
+    # These represent hardware hazards that require minimum cycles between instructions
+    latency_edges: List[Tuple[int, int, int]] = field(default_factory=list)
+    # s_nop instructions that satisfy latency constraints: (producer_idx, consumer_idx) -> [nop_indices]
+    # Maps a latency constraint to the s_nop instruction(s) that satisfy it
+    latency_nops: Dict[Tuple[int, int], List[int]] = field(default_factory=dict)
+    # Index: node_idx -> list of latency edge indices where this node is producer or consumer or in between
+    # Format: {node_idx: [(edge_idx, role), ...]} where role is 'producer', 'consumer', or 'between'
+    latency_edge_index: Dict[int, List[Tuple[int, str]]] = field(default_factory=dict)
+    
     def get_critical_path_length(self) -> int:
         """Calculate the length of the critical path."""
         if not self.nodes:
@@ -662,6 +676,11 @@ class DDG:
             },
             'waitcnt_cross_block_ops': {
                 str(k): [op.to_dict() for op in v] for k, v in self.waitcnt_cross_block_ops.items()
+            },
+            # Latency constraint tracking
+            'latency_edges': [[e[0], e[1], e[2]] for e in self.latency_edges],
+            'latency_nops': {
+                f"{k[0]},{k[1]}": v for k, v in self.latency_nops.items()
             },
         }
     
@@ -731,7 +750,37 @@ class DDG:
             for k, v in data.get('waitcnt_cross_block_ops', {}).items()
         }
         
+        # Latency constraint tracking
+        ddg.latency_edges = [tuple(e) for e in data.get('latency_edges', [])]
+        ddg.latency_nops = {
+            tuple(map(int, k.split(','))): v 
+            for k, v in data.get('latency_nops', {}).items()
+        }
+        
+        # Build latency edge index
+        ddg._build_latency_edge_index()
+        
         return ddg
+    
+    def _build_latency_edge_index(self):
+        """Build index from node to related latency edges for fast lookup."""
+        self.latency_edge_index = {}
+        for edge_idx, (producer_idx, consumer_idx, required_lat) in enumerate(self.latency_edges):
+            # Index the producer
+            if producer_idx not in self.latency_edge_index:
+                self.latency_edge_index[producer_idx] = []
+            self.latency_edge_index[producer_idx].append((edge_idx, 'producer'))
+            
+            # Index the consumer
+            if consumer_idx not in self.latency_edge_index:
+                self.latency_edge_index[consumer_idx] = []
+            self.latency_edge_index[consumer_idx].append((edge_idx, 'consumer'))
+            
+            # Index nodes in between
+            for between_idx in range(producer_idx + 1, consumer_idx):
+                if between_idx not in self.latency_edge_index:
+                    self.latency_edge_index[between_idx] = []
+                self.latency_edge_index[between_idx].append((edge_idx, 'between'))
 
 
 @dataclass
@@ -1572,6 +1621,56 @@ def build_ddg(block: BasicBlock,
                         cross_avail_regs = cross_avail_regs - redefined
                         if not cross_avail_regs:
                             break
+    
+    # === Fourth pass: Build LATENCY edges for hardware hazards (Table 11, MFMA latency, etc.) ===
+    # Import here to avoid circular import
+    from amdgcn_latency import get_required_latency, load_hardware_info
+    
+    hw_info = load_hardware_info()
+    
+    # Optimization: Only check pairs within a limited distance
+    # Latency requirements are typically satisfied within 15 instructions
+    MAX_LATENCY_DISTANCE = 15
+    
+    # Pre-compute opcodes that might have latency requirements (as producer)
+    # This avoids calling get_required_latency for pairs that definitely have no requirement
+    LATENCY_PRODUCER_PREFIXES = ('v_', 'ds_', 's_load', 'global_', 'buffer_')
+    
+    # Scan instruction pairs within distance limit
+    for i, node_a in enumerate(nodes):
+        opcode_a = node_a.instr.opcode.lower()
+        
+        # Skip if this instruction type can't be a latency producer
+        if not any(opcode_a.startswith(prefix) for prefix in LATENCY_PRODUCER_PREFIXES):
+            continue
+        
+        # Only check instructions within MAX_LATENCY_DISTANCE
+        end_j = min(i + 1 + MAX_LATENCY_DISTANCE, len(nodes))
+        for j in range(i + 1, end_j):
+            node_b = nodes[j]
+            
+            # Calculate required latency between A and B
+            required_latency = get_required_latency(node_a.instr, node_b.instr, hw_info)
+            
+            if required_latency > 0:
+                # Add LATENCY edge
+                ddg.latency_edges.append((i, j, required_latency))
+                ddg.edges.append((i, j, f"LATENCY:{required_latency}"))
+                
+                # Find s_nop instructions between A and B that might satisfy this constraint
+                nop_indices = []
+                
+                for k in range(i + 1, j):
+                    instr_k = nodes[k].instr
+                    if instr_k.opcode.lower() == 's_nop':
+                        nop_indices.append(k)
+                
+                # If s_nops contribute to the latency requirement, record them
+                if nop_indices:
+                    ddg.latency_nops[(i, j)] = nop_indices
+    
+    # Build latency edge index for fast lookup
+    ddg._build_latency_edge_index()
     
     return ddg
 
