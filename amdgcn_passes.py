@@ -1801,19 +1801,22 @@ class MoveInstructionPass(Pass):
         defs_a, uses_a = get_instruction_defs_uses(instr_a)
         opcode_a = instr_a.opcode.lower()
         
-        # s_barrier is a hard barrier - no instructions can cross it by default
-        # The is_move_s_barrier flag controls whether we move s_barrier as a group,
-        # but individual instructions still cannot cross s_barrier
+        # s_barrier handling for the instruction being moved:
+        # - If is_move_s_barrier=True AND in chain context (protected_indices not empty),
+        #   allow s_barrier to move as part of the chain
+        # - Otherwise, s_barrier cannot be moved
         is_barrier_moving = opcode_a == 's_barrier'
-        
-        # s_barrier cannot be moved through swap operations (it's handled specially in gap processing)
         if is_barrier_moving:
-            return False
+            # Allow s_barrier movement only when is_move_s_barrier=True AND in chain context
+            if not self.is_move_s_barrier or not protected_indices:
+                return False
         
         # Check all instructions we would pass
         for check_idx in range(from_idx + 1, to_idx + 1):
+            # Skip instructions in protected_indices (they move together with the instruction)
+            # This is used for chain-based movement where chain members shouldn't block each other
             if check_idx in protected_indices:
-                return False
+                continue
             
             instr_b = block.instructions[check_idx]
             defs_b, uses_b = get_instruction_defs_uses(instr_b)
@@ -2041,19 +2044,22 @@ class MoveInstructionPass(Pass):
         defs_a, uses_a = get_instruction_defs_uses(instr_a)
         opcode_a = instr_a.opcode.lower()
         
-        # s_barrier is a hard barrier - no instructions can cross it by default
-        # The is_move_s_barrier flag controls whether we move s_barrier as a group,
-        # but individual instructions still cannot cross s_barrier
+        # s_barrier handling for the instruction being moved:
+        # - If is_move_s_barrier=True AND in chain context (protected_indices not empty),
+        #   allow s_barrier to move as part of the chain
+        # - Otherwise, s_barrier cannot be moved
         is_barrier_moving = opcode_a == 's_barrier'
-        
-        # s_barrier cannot be moved through swap operations (it's handled specially in gap processing)
         if is_barrier_moving:
-            return False
+            # Allow s_barrier movement only when is_move_s_barrier=True AND in chain context
+            if not self.is_move_s_barrier or not protected_indices:
+                return False
         
         # Check all instructions we would pass
         for check_idx in range(from_idx - 1, to_idx - 1, -1):
+            # Skip instructions in protected_indices (they move together with the instruction)
+            # This is used for chain-based movement where chain members shouldn't block each other
             if check_idx in protected_indices:
-                return False
+                continue
             
             instr_b = block.instructions[check_idx]
             defs_b, uses_b = get_instruction_defs_uses(instr_b)
@@ -2563,7 +2569,7 @@ class MoveInstructionPass(Pass):
                 # We check regular dependencies instead - an instruction can pass through ABT
                 # as long as it has no dependencies with those instructions
                 if self._can_move_single_instruction_down(block, ddg, src_idx, dest_idx, set()):
-                    # Move it
+                    # Move it directly
                     instr_cycles = get_instruction_cycles(instr_to_move.opcode)
                     self._move_single_instruction_down_impl(block, ddg, src_idx, dest_idx)
                     self._total_cycles_moved += instr_cycles
@@ -2573,8 +2579,23 @@ class MoveInstructionPass(Pass):
                     if self.verbose:
                         print(f"    Moved [{src_idx}] {instr_to_move.opcode} down to [{dest_idx}] (+{instr_cycles} cycles)")
                 else:
-                    # Blocked by dependencies
-                    self._blocked_by_dependencies.add(id(instr_to_move))
+                    # Try chain-based movement: build dependency chain and move together
+                    chain = self._build_downward_dependency_chain(block, ddg, src_idx, dest_idx)
+                    if chain and len(chain) > 1:
+                        if self.verbose:
+                            print(f"    Building downward dependency chain for [{src_idx}] {instr_to_move.opcode}: {len(chain)} instructions")
+                        
+                        chain_moved, chain_cycles = self._try_move_chain_down(block, ddg, chain, dest_idx)
+                        if chain_moved:
+                            self._total_cycles_moved += chain_cycles
+                            any_moved = True
+                            moved_in_phase2 = True
+                            if self.verbose:
+                                print(f"    Chain moved successfully: +{chain_cycles} cycles")
+                        else:
+                            self._blocked_by_dependencies.add(id(instr_to_move))
+                    else:
+                        self._blocked_by_dependencies.add(id(instr_to_move))
             
             if self._total_cycles_moved >= cycles_to_move:
                 break
@@ -2920,7 +2941,7 @@ class MoveInstructionPass(Pass):
                 
                 # Don't pass protected_indices - check regular dependencies
                 if self._can_move_single_instruction_up(block, ddg, src_idx, dest_idx, set()):
-                    # Move it
+                    # Move it directly
                     instr_cycles = get_instruction_cycles(instr_to_move.opcode)
                     self._move_single_instruction_up_impl(block, ddg, src_idx, dest_idx)
                     self._total_cycles_moved += instr_cycles
@@ -2930,7 +2951,23 @@ class MoveInstructionPass(Pass):
                     if self.verbose:
                         print(f"    Moved [{src_idx}] {instr_to_move.opcode} up to [{dest_idx}] (+{instr_cycles} cycles)")
                 else:
-                    self._blocked_by_dependencies.add(id(instr_to_move))
+                    # Try chain-based movement: build dependency chain and move together
+                    chain = self._build_upward_dependency_chain(block, ddg, src_idx, dest_idx)
+                    if chain and len(chain) > 1:
+                        if self.verbose:
+                            print(f"    Building upward dependency chain for [{src_idx}] {instr_to_move.opcode}: {len(chain)} instructions")
+                        
+                        chain_moved, chain_cycles = self._try_move_chain_up(block, ddg, chain, dest_idx)
+                        if chain_moved:
+                            self._total_cycles_moved += chain_cycles
+                            any_moved = True
+                            moved_in_phase2 = True
+                            if self.verbose:
+                                print(f"    Chain moved successfully: +{chain_cycles} cycles")
+                        else:
+                            self._blocked_by_dependencies.add(id(instr_to_move))
+                    else:
+                        self._blocked_by_dependencies.add(id(instr_to_move))
             
             if self._total_cycles_moved >= cycles_to_move:
                 break
@@ -3138,6 +3175,829 @@ class MoveInstructionPass(Pass):
             else:
                 self._blocked_by_dependencies.add(id(gap_instr))
                 return False
+    
+    # =========================================================================
+    # Chain-based movement methods
+    # =========================================================================
+    
+    def _build_upward_dependency_chain(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        instr_idx: int,
+        target_idx: int,
+        max_chain_length: int = 50
+    ) -> List[int]:
+        """
+        Build an upward dependency chain for instruction at instr_idx.
+        
+        When an instruction B cannot move up past instruction A because B depends on A,
+        we build a chain starting from the blocking instruction A, going up to find
+        all instructions that must move together to preserve dependencies.
+        
+        The chain includes:
+        1. RAW dependencies (B reads what A writes)
+        2. s_waitcnt AVAIL dependencies (B uses registers made available by s_waitcnt)
+        
+        Args:
+            block: The basic block
+            ddg: The DDG for dependency analysis
+            instr_idx: Index of the instruction we want to move up
+            target_idx: Target position (above this)
+            max_chain_length: Maximum chain length to prevent infinite loops
+            
+        Returns:
+            List of instruction indices in the chain, sorted from top to bottom
+            (the order in which they should be moved up).
+            Empty list if no chain can be built.
+        """
+        if instr_idx <= target_idx:
+            return []
+        
+        instr_to_move = block.instructions[instr_idx]
+        defs_to_move, uses_to_move = get_instruction_defs_uses(instr_to_move)
+        opcode_to_move = instr_to_move.opcode.lower()
+        lds_priority_to_move = get_lds_sync_priority(instr_to_move.opcode, instr_to_move.operands)
+        
+        # Find the first blocking instruction
+        # Check all dependency types that _can_move_single_instruction_up checks:
+        # 1. RAW: check writes what instr reads
+        # 2. WAR: instr writes what check reads
+        # 3. s_waitcnt AVAIL
+        # 4. LDS sync order
+        # 5. s_barrier constraints
+        first_blocker_idx = -1
+        for check_idx in range(instr_idx - 1, target_idx - 1, -1):
+            check_instr = block.instructions[check_idx]
+            defs_check, uses_check = get_instruction_defs_uses(check_instr)
+            opcode_check = check_instr.opcode.lower()
+            
+            # Check RAW dependency: check writes what instr reads
+            raw_conflicts = defs_check & uses_to_move
+            if raw_conflicts:
+                if not (raw_conflicts == {'scc'} and not is_scc_reader(opcode_to_move)):
+                    first_blocker_idx = check_idx
+                    break
+            
+            # Check WAR dependency: instr writes what check reads
+            war_conflicts = defs_to_move & uses_check
+            if war_conflicts:
+                if not (war_conflicts == {'scc'} and is_scc_only_writer(opcode_to_move)):
+                    first_blocker_idx = check_idx
+                    break
+            
+            # Check s_waitcnt AVAIL dependency
+            if opcode_check == 's_waitcnt':
+                cross_block_regs = ddg.waitcnt_cross_block_regs.get(check_idx, set()) if ddg else set()
+                intra_block_regs = compute_waitcnt_available_regs(block, check_idx)
+                all_avail_regs = cross_block_regs | intra_block_regs
+                
+                if all_avail_regs & uses_to_move:
+                    first_blocker_idx = check_idx
+                    break
+            
+            # Check LDS sync order
+            lds_priority_check = get_lds_sync_priority(check_instr.opcode, check_instr.operands)
+            if lds_priority_to_move > 0 and lds_priority_check > 0:
+                first_blocker_idx = check_idx
+                break
+            
+            # Check s_barrier constraints
+            if opcode_check == 's_barrier' and not self.is_move_s_barrier:
+                first_blocker_idx = check_idx
+                break
+        
+        if first_blocker_idx < 0:
+            return []
+        
+        # Build the chain: find all connected instructions
+        chain = set()
+        chain.add(instr_idx)
+        chain.add(first_blocker_idx)
+        
+        # Expand the chain iteratively
+        changed = True
+        iterations = 0
+        while changed and iterations < max_chain_length:
+            changed = False
+            iterations += 1
+            
+            chain_min = min(chain)
+            chain_max = max(chain)
+            
+            for idx in range(chain_min, chain_max + 1):
+                if idx in chain:
+                    continue
+                
+                instr = block.instructions[idx]
+                defs, uses = get_instruction_defs_uses(instr)
+                
+                # Check RAW connections with chain
+                for chain_idx in list(chain):
+                    chain_instr = block.instructions[chain_idx]
+                    chain_defs, chain_uses = get_instruction_defs_uses(chain_instr)
+                    
+                    # instr -> chain_instr (instr writes, chain reads)
+                    if idx < chain_idx:
+                        raw = defs & chain_uses
+                        if raw and not (raw == {'scc'} and not is_scc_reader(chain_instr.opcode.lower())):
+                            chain.add(idx)
+                            changed = True
+                            break
+                    
+                    # chain_instr -> instr (chain writes, instr reads)
+                    if idx > chain_idx:
+                        raw = chain_defs & uses
+                        if raw and not (raw == {'scc'} and not is_scc_reader(instr.opcode.lower())):
+                            chain.add(idx)
+                            changed = True
+                            break
+                
+                if idx in chain:
+                    continue
+                
+                # Check s_waitcnt AVAIL: if this is s_waitcnt and chain uses its available regs
+                if instr.opcode.lower() == 's_waitcnt':
+                    cross_block_regs = ddg.waitcnt_cross_block_regs.get(idx, set()) if ddg else set()
+                    intra_block_regs = compute_waitcnt_available_regs(block, idx)
+                    all_avail_regs = cross_block_regs | intra_block_regs
+                    
+                    for chain_idx in chain:
+                        if chain_idx > idx:
+                            chain_instr = block.instructions[chain_idx]
+                            _, chain_uses = get_instruction_defs_uses(chain_instr)
+                            if all_avail_regs & chain_uses:
+                                chain.add(idx)
+                                changed = True
+                                break
+                
+                if idx in chain:
+                    continue
+                
+                # Check LDS synchronization order: ds_write -> s_waitcnt lgkmcnt -> s_barrier -> ds_read
+                # If any instruction in chain is LDS sync, include all other LDS sync instructions
+                # between chain_min and chain_max to preserve the synchronization order
+                instr_lds_priority = get_lds_sync_priority(instr.opcode, instr.operands)
+                if instr_lds_priority > 0:
+                    for chain_idx in list(chain):
+                        chain_instr = block.instructions[chain_idx]
+                        chain_lds_priority = get_lds_sync_priority(chain_instr.opcode, chain_instr.operands)
+                        # If both are LDS sync instructions, they must stay together
+                        if chain_lds_priority > 0:
+                            chain.add(idx)
+                            changed = True
+                            break
+        
+        # Third pass: extend chain head upward
+        # 1. Include s_waitcnt that chain depends on (AVAIL dependency)
+        # 2. Include ALL LDS sync instructions above chain head if chain contains any LDS sync
+        #    This must scan beyond immediate predecessor to find all connected LDS sync instructions
+        sorted_chain = sorted(chain)
+        
+        # Check if chain contains any LDS sync instruction
+        chain_has_lds_sync = False
+        for chain_idx in sorted_chain:
+            chain_instr = block.instructions[chain_idx]
+            if get_lds_sync_priority(chain_instr.opcode, chain_instr.operands) > 0:
+                chain_has_lds_sync = True
+                break
+        
+        extended = True
+        while extended and sorted_chain:
+            extended = False
+            chain_head = sorted_chain[0]
+            if chain_head > target_idx:
+                # Scan all instructions from chain_head-1 down to target_idx
+                for scan_idx in range(chain_head - 1, target_idx - 1, -1):
+                    if scan_idx in sorted_chain:
+                        continue  # Already in chain
+                    
+                    scan_instr = block.instructions[scan_idx]
+                    scan_opcode = scan_instr.opcode.lower()
+                    
+                    # Check 1: s_waitcnt AVAIL dependency
+                    if scan_opcode == 's_waitcnt':
+                        cross_block_regs = ddg.waitcnt_cross_block_regs.get(scan_idx, set()) if ddg else set()
+                        intra_block_regs = compute_waitcnt_available_regs(block, scan_idx)
+                        all_avail_regs = cross_block_regs | intra_block_regs
+                        
+                        for chain_idx in sorted_chain:
+                            chain_instr = block.instructions[chain_idx]
+                            _, chain_uses = get_instruction_defs_uses(chain_instr)
+                            if all_avail_regs & chain_uses:
+                                sorted_chain.insert(0, scan_idx)
+                                sorted_chain = sorted(set(sorted_chain))  # Re-sort and deduplicate
+                                extended = True
+                                break
+                        if extended:
+                            break
+                    
+                    # Check 2: LDS sync order - if chain has LDS sync, include all LDS sync above
+                    if chain_has_lds_sync:
+                        scan_lds_priority = get_lds_sync_priority(scan_instr.opcode, scan_instr.operands)
+                        if scan_lds_priority > 0:
+                            sorted_chain.insert(0, scan_idx)
+                            sorted_chain = sorted(set(sorted_chain))  # Re-sort and deduplicate
+                            extended = True
+                            break
+        
+        # Verify the chain head can actually move to target
+        # Pass the chain indices so we skip checking instructions within the chain
+        if sorted_chain:
+            chain_head = sorted_chain[0]
+            chain_set = set(sorted_chain)
+            can_move = self._can_chain_head_move_up(block, ddg, chain_head, target_idx, chain_set)
+            if not can_move:
+                return []
+        
+        return sorted_chain
+    
+    def _can_chain_head_move_up(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        chain_head_idx: int,
+        target_idx: int,
+        chain_indices: Optional[Set[int]] = None
+    ) -> bool:
+        """
+        Check if the head of a dependency chain can move up to target position.
+        
+        This checks only dependencies with instructions ABOVE the chain,
+        not within the chain (since chain moves together).
+        
+        Args:
+            block: The basic block
+            ddg: The DDG
+            chain_head_idx: Index of the chain head
+            target_idx: Target position to move above
+            chain_indices: Set of indices in the chain (to skip checking)
+        
+        Checks:
+        1. RAW dependencies (head reads what check writes)
+        2. WAR dependencies (head writes what check reads)
+        3. s_waitcnt AVAIL dependencies
+        4. s_barrier constraints
+        5. LDS synchronization order
+        """
+        if chain_head_idx <= target_idx:
+            return True
+        
+        if chain_indices is None:
+            chain_indices = set()
+        
+        head_instr = block.instructions[chain_head_idx]
+        defs_head, uses_head = get_instruction_defs_uses(head_instr)
+        opcode_head = head_instr.opcode.lower()
+        
+        # Check LDS sync priority of head
+        head_lds_priority = get_lds_sync_priority(head_instr.opcode, head_instr.operands)
+        
+        # Check instructions between target and chain_head
+        # Skip instructions that are part of the chain (they move together)
+        for check_idx in range(chain_head_idx - 1, target_idx - 1, -1):
+            # Skip if this index is part of the chain
+            if check_idx in chain_indices:
+                continue
+            check_instr = block.instructions[check_idx]
+            defs_check, uses_check = get_instruction_defs_uses(check_instr)
+            opcode_check = check_instr.opcode.lower()
+            
+            # RAW: head reads what check writes -> Blocked (head depends on check's output)
+            raw_conflicts = defs_check & uses_head
+            if raw_conflicts:
+                if raw_conflicts == {'scc'} and not is_scc_reader(opcode_head):
+                    pass  # SCC-only conflict, head doesn't read SCC
+                else:
+                    return False
+            
+            # WAR: head writes what check reads -> Blocked (head would overwrite check's input)
+            war_conflicts = defs_head & uses_check
+            if war_conflicts:
+                if war_conflicts == {'scc'} and is_scc_only_writer(opcode_head):
+                    pass  # SCC-only conflict, head only writes SCC
+                else:
+                    return False
+            
+            # s_waitcnt AVAIL: head uses registers made available by check
+            if opcode_check == 's_waitcnt':
+                cross_block_regs = ddg.waitcnt_cross_block_regs.get(check_idx, set()) if ddg else set()
+                intra_block_regs = compute_waitcnt_available_regs(block, check_idx)
+                all_avail_regs = cross_block_regs | intra_block_regs
+                
+                if all_avail_regs & uses_head:
+                    return False
+            
+            # s_barrier: hard barrier unless is_move_s_barrier is True
+            if opcode_check == 's_barrier' and not self.is_move_s_barrier:
+                return False
+            
+            # LDS synchronization order: cannot cross LDS sync instructions
+            check_lds_priority = get_lds_sync_priority(check_instr.opcode, check_instr.operands)
+            if head_lds_priority > 0 and check_lds_priority > 0:
+                return False
+        
+        return True
+    
+    def _try_move_chain_up(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        chain: List[int],
+        target_idx: int
+    ) -> Tuple[bool, int]:
+        """
+        Move a dependency chain up to target position by moving each instruction
+        individually, starting from the chain instruction closest to (and below)
+        the target.
+        
+        This approach avoids breaking intermediate dependencies because:
+        - We move the topmost chain instruction first (closest to target)
+        - Each subsequent instruction moves to just after the previously moved one
+        - s_waitcnt counters are updated correctly by _move_single_instruction_up_impl
+        
+        Args:
+            block: The basic block
+            ddg: The DDG
+            chain: List of instruction indices, sorted from top to bottom
+            target_idx: Target position to move above
+            
+        Returns:
+            (success, total_cycles_moved) - Whether any moves succeeded and total cycles
+        """
+        if not chain:
+            return False, 0
+        
+        # Filter: only move instructions that are below target
+        chain_to_move = [idx for idx in chain if idx > target_idx]
+        if not chain_to_move:
+            return False, 0
+        
+        # Store instruction objects (indices will shift during moves)
+        chain_instrs = [block.instructions[idx] for idx in chain_to_move]
+        
+        total_cycles = 0
+        any_moved = False
+        
+        # Track the insertion point - starts at target_idx, increments after each move
+        next_dest_idx = max(target_idx, self.frozen_boundary)
+        
+        # Create a dict mapping instruction id to instruction object (indices shift during movement)
+        chain_instr_ids = {id(instr): instr for instr in chain_instrs}
+        
+        # Move from the one closest to target (first in chain_to_move)
+        # to the one farthest from target (last in chain_to_move)
+        for chain_instr in chain_instrs:
+            # Find current position of this instruction
+            current_idx = self._find_instruction_index(block, chain_instr)
+            if current_idx < 0:
+                continue
+            
+            # Skip if already at or above destination
+            if current_idx <= next_dest_idx:
+                next_dest_idx = current_idx + 1
+                continue
+            
+            dest_idx = next_dest_idx
+            
+            if dest_idx >= current_idx:
+                continue
+            
+            # Build set of current chain indices (excluding the instruction being moved)
+            # These are "protected" - the moving instruction can pass them
+            protected_chain_indices = set()
+            for instr_id, other_instr in chain_instr_ids.items():
+                if instr_id != id(chain_instr):
+                    other_idx = self._find_instruction_index(block, other_instr)
+                    if other_idx >= 0:
+                        protected_chain_indices.add(other_idx)
+            
+            # Move using existing single-instruction move (handles s_waitcnt updates)
+            can_move = self._can_move_single_instruction_up(block, ddg, current_idx, dest_idx, protected_chain_indices)
+            if can_move:
+                self._move_single_instruction_up_impl(block, ddg, current_idx, dest_idx)
+                instr_cycles = get_instruction_cycles(chain_instr.opcode)
+                total_cycles += instr_cycles
+                any_moved = True
+                
+                if self.verbose:
+                    print(f"    Chain move up: [{current_idx}] {chain_instr.opcode} -> [{dest_idx}] (+{instr_cycles} cycles)")
+                
+                # Next instruction goes right after this one
+                next_dest_idx = dest_idx + 1
+            else:
+                # If any instruction in chain cannot move, stop
+                if self.verbose:
+                    print(f"    Chain move blocked: [{current_idx}] {chain_instr.opcode} cannot move to [{dest_idx}]")
+                break
+        
+        return any_moved, total_cycles
+    
+    def _build_downward_dependency_chain(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        instr_idx: int,
+        target_idx: int,
+        max_chain_length: int = 50
+    ) -> List[int]:
+        """
+        Build a downward dependency chain for instruction at instr_idx.
+        
+        When an instruction B cannot move down past instruction A because A depends on B,
+        we build a chain starting from the blocking instruction A, going down to find
+        all instructions that must move together to preserve dependencies.
+        
+        The chain includes:
+        1. RAW dependencies (A depends on B's output)
+        2. s_waitcnt AVAIL dependencies (A uses registers made available by s_waitcnt B)
+        
+        Args:
+            block: The basic block
+            ddg: The DDG for dependency analysis
+            instr_idx: Index of the instruction we want to move down
+            target_idx: Target position (below this)
+            max_chain_length: Maximum chain length to prevent infinite loops
+            
+        Returns:
+            List of instruction indices in the chain, sorted from bottom to top
+            (the order in which they should be moved down).
+            Empty list if no chain can be built.
+        """
+        if instr_idx >= target_idx:
+            return []
+        
+        instr_to_move = block.instructions[instr_idx]
+        defs_to_move, uses_to_move = get_instruction_defs_uses(instr_to_move)
+        opcode_to_move = instr_to_move.opcode.lower()
+        lds_priority_to_move = get_lds_sync_priority(instr_to_move.opcode, instr_to_move.operands)
+        
+        # Check if instr_to_move is s_waitcnt - special handling for AVAIL
+        is_waitcnt = opcode_to_move == 's_waitcnt'
+        avail_regs_to_move = set()
+        if is_waitcnt:
+            cross_block_regs = ddg.waitcnt_cross_block_regs.get(instr_idx, set()) if ddg else set()
+            intra_block_regs = compute_waitcnt_available_regs(block, instr_idx)
+            avail_regs_to_move = cross_block_regs | intra_block_regs
+        
+        # Find the first blocking instruction
+        # Check all dependency types that _can_move_single_instruction_down checks:
+        # 1. RAW: instr writes what check reads
+        # 2. WAR: check writes what instr reads
+        # 3. s_waitcnt AVAIL
+        # 4. LDS sync order
+        # 5. s_barrier constraints
+        first_blocker_idx = -1
+        for check_idx in range(instr_idx + 1, target_idx + 1):
+            if check_idx >= len(block.instructions):
+                break
+            check_instr = block.instructions[check_idx]
+            defs_check, uses_check = get_instruction_defs_uses(check_instr)
+            opcode_check = check_instr.opcode.lower()
+            
+            # RAW: check reads what instr writes
+            raw_conflicts = defs_to_move & uses_check
+            if raw_conflicts:
+                if not (raw_conflicts == {'scc'} and not is_scc_reader(opcode_check)):
+                    first_blocker_idx = check_idx
+                    break
+            
+            # WAR: check writes what instr reads
+            war_conflicts = defs_check & uses_to_move
+            if war_conflicts:
+                if not (war_conflicts == {'scc'} and is_scc_only_writer(opcode_check)):
+                    first_blocker_idx = check_idx
+                    break
+            
+            # s_waitcnt AVAIL: check uses registers made available by s_waitcnt
+            if is_waitcnt and (avail_regs_to_move & uses_check):
+                first_blocker_idx = check_idx
+                break
+            
+            # LDS sync order
+            lds_priority_check = get_lds_sync_priority(check_instr.opcode, check_instr.operands)
+            if lds_priority_to_move > 0 and lds_priority_check > 0:
+                first_blocker_idx = check_idx
+                break
+            
+            # s_barrier constraints
+            if opcode_check == 's_barrier' and not self.is_move_s_barrier:
+                first_blocker_idx = check_idx
+                break
+        
+        if first_blocker_idx < 0:
+            return []
+        
+        # Build the chain
+        chain = set()
+        chain.add(instr_idx)
+        chain.add(first_blocker_idx)
+        
+        changed = True
+        iterations = 0
+        while changed and iterations < max_chain_length:
+            changed = False
+            iterations += 1
+            
+            chain_min = min(chain)
+            chain_max = max(chain)
+            
+            for idx in range(chain_min, chain_max + 1):
+                if idx in chain:
+                    continue
+                
+                instr = block.instructions[idx]
+                defs, uses = get_instruction_defs_uses(instr)
+                
+                # Check RAW connections
+                for chain_idx in list(chain):
+                    chain_instr = block.instructions[chain_idx]
+                    chain_defs, chain_uses = get_instruction_defs_uses(chain_instr)
+                    
+                    # chain -> instr (chain writes, instr reads)
+                    if idx > chain_idx:
+                        raw = chain_defs & uses
+                        if raw and not (raw == {'scc'} and not is_scc_reader(instr.opcode.lower())):
+                            chain.add(idx)
+                            changed = True
+                            break
+                    
+                    # instr -> chain (instr writes, chain reads)
+                    if idx < chain_idx:
+                        raw = defs & chain_uses
+                        if raw and not (raw == {'scc'} and not is_scc_reader(chain_instr.opcode.lower())):
+                            chain.add(idx)
+                            changed = True
+                            break
+                
+                if idx in chain:
+                    continue
+                
+                # Check s_waitcnt AVAIL: if s_waitcnt is in chain and instr uses its available regs
+                for chain_idx in chain:
+                    chain_instr = block.instructions[chain_idx]
+                    if chain_instr.opcode.lower() == 's_waitcnt' and chain_idx < idx:
+                        cross_block_regs = ddg.waitcnt_cross_block_regs.get(chain_idx, set()) if ddg else set()
+                        intra_block_regs = compute_waitcnt_available_regs(block, chain_idx)
+                        all_avail_regs = cross_block_regs | intra_block_regs
+                        
+                        if all_avail_regs & uses:
+                            chain.add(idx)
+                            changed = True
+                            break
+                
+                if idx in chain:
+                    continue
+                
+                # Check LDS synchronization order: ds_write -> s_waitcnt lgkmcnt -> s_barrier -> ds_read
+                # If any instruction in chain is LDS sync, include all other LDS sync instructions
+                # between chain_min and chain_max to preserve the synchronization order
+                instr_lds_priority = get_lds_sync_priority(instr.opcode, instr.operands)
+                if instr_lds_priority > 0:
+                    for chain_idx in list(chain):
+                        chain_instr = block.instructions[chain_idx]
+                        chain_lds_priority = get_lds_sync_priority(chain_instr.opcode, chain_instr.operands)
+                        # If both are LDS sync instructions, they must stay together
+                        if chain_lds_priority > 0:
+                            chain.add(idx)
+                            changed = True
+                            break
+        
+        # Third pass: extend chain tail downward
+        # Include ALL LDS sync instructions below chain tail if chain contains any LDS sync
+        # Note: s_waitcnt AVAIL dependency does NOT need to be checked here because:
+        #   - Instructions can only use AVAIL registers from s_waitcnt ABOVE them (already executed)
+        #   - s_waitcnt below the chain hasn't executed yet, so no instruction depends on it
+        # This must scan beyond immediate successor to find all connected LDS sync instructions
+        sorted_chain = sorted(chain)  # Sort ascending first for extension
+        
+        # Check if chain contains any LDS sync instruction
+        chain_has_lds_sync = False
+        for chain_idx in sorted_chain:
+            chain_instr = block.instructions[chain_idx]
+            if get_lds_sync_priority(chain_instr.opcode, chain_instr.operands) > 0:
+                chain_has_lds_sync = True
+                break
+        
+        extended = True
+        while extended and sorted_chain:
+            extended = False
+            chain_tail = sorted_chain[-1]  # The bottom-most instruction
+            if chain_tail < target_idx:
+                # Scan all instructions from chain_tail+1 up to target_idx
+                for scan_idx in range(chain_tail + 1, target_idx + 1):
+                    if scan_idx >= len(block.instructions):
+                        break
+                    if scan_idx in sorted_chain:
+                        continue  # Already in chain
+                    
+                    scan_instr = block.instructions[scan_idx]
+                    
+                    # LDS sync order - if chain has LDS sync, include all LDS sync below
+                    if chain_has_lds_sync:
+                        scan_lds_priority = get_lds_sync_priority(scan_instr.opcode, scan_instr.operands)
+                        if scan_lds_priority > 0:
+                            sorted_chain.append(scan_idx)
+                            sorted_chain = sorted(set(sorted_chain))  # Re-sort and deduplicate
+                            extended = True
+                            break
+        
+        # Sort chain from bottom to top (the order to move them down)
+        sorted_chain = sorted(sorted_chain, reverse=True)
+        
+        # Verify the chain tail can actually move to target
+        # Pass the chain indices so we skip checking instructions within the chain
+        if sorted_chain:
+            chain_tail = sorted_chain[0]  # The bottom-most instruction
+            chain_set = set(sorted_chain)
+            if not self._can_chain_tail_move_down(block, ddg, chain_tail, target_idx, chain_set):
+                return []
+        
+        return sorted_chain
+    
+    def _can_chain_tail_move_down(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        chain_tail_idx: int,
+        target_idx: int,
+        chain_indices: Optional[Set[int]] = None
+    ) -> bool:
+        """
+        Check if the tail of a dependency chain can move down to target position.
+        
+        Args:
+            block: The basic block
+            ddg: The DDG
+            chain_tail_idx: Index of the chain tail
+            target_idx: Target position to move below
+            chain_indices: Set of indices in the chain (to skip checking)
+        
+        Checks:
+        1. RAW dependencies (check reads what tail writes)
+        2. WAR dependencies (check writes what tail reads)
+        3. s_waitcnt AVAIL dependencies (if tail is s_waitcnt)
+        4. s_barrier constraints
+        5. LDS synchronization order
+        """
+        if chain_tail_idx >= target_idx:
+            return True
+        
+        if chain_indices is None:
+            chain_indices = set()
+        
+        tail_instr = block.instructions[chain_tail_idx]
+        defs_tail, uses_tail = get_instruction_defs_uses(tail_instr)
+        opcode_tail = tail_instr.opcode.lower()
+        
+        # Check if tail is s_waitcnt - need to verify AVAIL
+        is_waitcnt = opcode_tail == 's_waitcnt'
+        avail_regs_tail = set()
+        if is_waitcnt:
+            cross_block_regs = ddg.waitcnt_cross_block_regs.get(chain_tail_idx, set()) if ddg else set()
+            intra_block_regs = compute_waitcnt_available_regs(block, chain_tail_idx)
+            avail_regs_tail = cross_block_regs | intra_block_regs
+        
+        # Check LDS sync priority of tail
+        tail_lds_priority = get_lds_sync_priority(tail_instr.opcode, tail_instr.operands)
+        
+        # Check instructions between tail and target
+        # Skip instructions that are part of the chain (they move together)
+        for check_idx in range(chain_tail_idx + 1, target_idx + 1):
+            if check_idx >= len(block.instructions):
+                break
+            # Skip if this index is part of the chain
+            if check_idx in chain_indices:
+                continue
+            check_instr = block.instructions[check_idx]
+            defs_check, uses_check = get_instruction_defs_uses(check_instr)
+            opcode_check = check_instr.opcode.lower()
+            
+            # RAW: check reads what tail writes -> Blocked (check depends on tail's output)
+            raw_conflicts = defs_tail & uses_check
+            if raw_conflicts:
+                if raw_conflicts == {'scc'} and not is_scc_reader(opcode_check):
+                    pass  # SCC-only conflict, check doesn't read SCC
+                else:
+                    return False
+            
+            # WAR: check writes what tail reads -> Blocked (check would overwrite tail's input)
+            war_conflicts = defs_check & uses_tail
+            if war_conflicts:
+                if war_conflicts == {'scc'} and is_scc_only_writer(opcode_check):
+                    pass  # SCC-only conflict, check only writes SCC
+                else:
+                    return False
+            
+            # s_waitcnt AVAIL: check_instr uses registers made available by tail
+            if is_waitcnt and (avail_regs_tail & uses_check):
+                return False
+            
+            # s_barrier: hard barrier unless is_move_s_barrier is True
+            if opcode_check == 's_barrier' and not self.is_move_s_barrier:
+                return False
+            
+            # LDS synchronization order: cannot cross LDS sync instructions
+            check_lds_priority = get_lds_sync_priority(check_instr.opcode, check_instr.operands)
+            if tail_lds_priority > 0 and check_lds_priority > 0:
+                return False
+        
+        return True
+    
+    def _try_move_chain_down(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        chain: List[int],
+        target_idx: int
+    ) -> Tuple[bool, int]:
+        """
+        Move a dependency chain down to target position by moving each instruction
+        individually, starting from the chain instruction closest to (and above)
+        the target.
+        
+        This approach avoids breaking intermediate dependencies because:
+        - We move the bottommost chain instruction first (closest to target)
+        - Each subsequent instruction moves to just before the previously moved one
+        - s_waitcnt counters are updated correctly by _move_single_instruction_down_impl
+        
+        Args:
+            block: The basic block
+            ddg: The DDG
+            chain: List of instruction indices, sorted from bottom to top
+            target_idx: Target position to move below
+            
+        Returns:
+            (success, total_cycles_moved)
+        """
+        if not chain:
+            return False, 0
+        
+        # Convert chain to top-to-bottom order for consistent processing
+        chain_sorted = sorted(set(chain))  # [top, ..., bottom]
+        
+        # Filter: only move instructions that are above target
+        chain_to_move = [idx for idx in chain_sorted if idx < target_idx]
+        if not chain_to_move:
+            return False, 0
+        
+        # Reverse: move from bottom (closest to target) to top
+        chain_to_move = list(reversed(chain_to_move))
+        chain_instrs = [block.instructions[idx] for idx in chain_to_move]
+        
+        total_cycles = 0
+        any_moved = False
+        
+        # Create a dict mapping instruction id to instruction object (indices shift during movement)
+        chain_instr_ids = {id(instr): instr for instr in chain_instrs}
+        
+        # Track the insertion point - starts at target_idx, decrements after each move
+        next_dest_idx = min(target_idx, len(block.instructions) - 1)
+        
+        for chain_instr in chain_instrs:
+            # Find current position of this instruction
+            current_idx = self._find_instruction_index(block, chain_instr)
+            if current_idx < 0:
+                continue
+            
+            # Skip if already at or below destination
+            if current_idx >= next_dest_idx:
+                next_dest_idx = current_idx
+                continue
+            
+            dest_idx = next_dest_idx
+            
+            if dest_idx <= current_idx:
+                continue
+            
+            # Build set of current chain indices (excluding the instruction being moved)
+            # These are "protected" - the moving instruction can pass them
+            protected_chain_indices = set()
+            for instr_id, other_instr in chain_instr_ids.items():
+                if instr_id != id(chain_instr):
+                    other_idx = self._find_instruction_index(block, other_instr)
+                    if other_idx >= 0:
+                        protected_chain_indices.add(other_idx)
+            
+            # Move using existing single-instruction move (handles s_waitcnt updates)
+            if self._can_move_single_instruction_down(block, ddg, current_idx, dest_idx, protected_chain_indices):
+                self._move_single_instruction_down_impl(block, ddg, current_idx, dest_idx)
+                instr_cycles = get_instruction_cycles(chain_instr.opcode)
+                total_cycles += instr_cycles
+                any_moved = True
+                
+                if self.verbose:
+                    print(f"    Chain move down: [{current_idx}] {chain_instr.opcode} -> [{dest_idx}] (+{instr_cycles} cycles)")
+                
+                # Next instruction goes right before this one (dest_idx is now where this instr is)
+                next_dest_idx = dest_idx
+            else:
+                # If any instruction in chain cannot move, stop
+                if self.verbose:
+                    print(f"    Chain move blocked: [{current_idx}] {chain_instr.opcode} cannot move to [{dest_idx}]")
+                break
+        
+        return any_moved, total_cycles
     
     # =========================================================================
     # Legacy methods (kept for compatibility and internal use)
@@ -4881,20 +5741,49 @@ class DistributeInstructionPass(Pass):
             if idx >= 0:
                 all_target_instrs.append(block.instructions[idx])
         
-        # 6. Sequential distribution strategy (matches debug_distribute_pass.py)
-        # Process all K instructions in order (0, 1, 2, ..., K-1)
-        # This is simpler and produces consistent results with the debug tool
+        # 6. Two-phase distribution strategy
+        # Phase 1: Process instructions that need to move UP (in forward order: 0, 1, 2, ...)
+        # Phase 2: Process instructions that need to move DOWN (in reverse order: K-1, K-2, ...)
+        # 
+        # Rationale: When moving down, subsequent target instructions block the path.
+        # By processing from the furthest first (reverse order), each instruction
+        # clears the way for the ones before it.
+        
+        # First, classify each instruction as needing to move up or down
+        needs_move_up = []    # (instruction_index, ideal_cycle, target_idx)
+        needs_move_down = []  # (instruction_index, ideal_cycle, target_idx)
+        
+        for i in range(K):
+            current_idx = self._find_nth_target(block, i)
+            if current_idx < 0:
+                continue
+            
+            ideal_cycle = ideal_cycles[i]
+            current_cycle = self._get_instruction_cycle_position(block, current_idx)
+            target_idx = self._cycle_to_index(block, ideal_cycle)
+            
+            if current_cycle > ideal_cycle:
+                # Need to move up (current position is after ideal)
+                needs_move_up.append((i, ideal_cycle, target_idx))
+            else:
+                # Need to move down or stay (current position is at or before ideal)
+                needs_move_down.append((i, ideal_cycle, target_idx))
+        
+        if self.verbose:
+            print(f"  Instructions needing move UP: {[x[0] for x in needs_move_up]}")
+            print(f"  Instructions needing move DOWN: {[x[0] for x in needs_move_down]}")
         
         frozen_boundary = 0
         
-        for i in range(K):
+        # Phase 1: Process instructions that need to move UP (forward order)
+        # These are processed first because moving up doesn't block other targets
+        for i, ideal_cycle, _ in needs_move_up:
             current_idx = self._find_nth_target(block, i)
             if current_idx < 0:
                 if self.verbose:
                     print(f"  Could not find target instruction {i}")
                 continue
             
-            ideal_cycle = ideal_cycles[i]
             target_idx = self._cycle_to_index(block, ideal_cycle)
             
             # Ensure target_idx respects ordering constraints
@@ -4906,12 +5795,12 @@ class DistributeInstructionPass(Pass):
             # Ensure target is at least at frozen_boundary
             target_idx = max(target_idx, frozen_boundary)
             
-            # Protected: all REMAINING target instructions (i+1, ..., K-1)
-            protected_instrs = all_target_instrs[i+1:]
+            # Protected: all other target instructions except current one
+            protected_instrs = [instr for j, instr in enumerate(all_target_instrs) if j != i]
             
             if self.verbose:
                 current_cycle = self._get_instruction_cycle_position(block, current_idx)
-                print(f"  [{i}] Moving from idx={current_idx} (cycle={current_cycle}) to idx={target_idx} (ideal cycle={ideal_cycle})")
+                print(f"  [{i}] (UP) Moving from idx={current_idx} (cycle={current_cycle}) to idx={target_idx} (ideal cycle={ideal_cycle})")
             
             final_idx = self._move_instruction_toward(result, current_idx, target_idx, branch_boundary, frozen_boundary, protected_instrs)
             
@@ -4919,8 +5808,48 @@ class DistributeInstructionPass(Pass):
                 final_cycle = self._get_instruction_cycle_position(block, final_idx)
                 print(f"      Final position: idx={final_idx} (cycle={final_cycle})")
             
-            # Update frozen boundary
+            # Update frozen boundary only for move-up instructions
             frozen_boundary = final_idx + 1
+        
+        # Phase 2: Process instructions that need to move DOWN (reverse order)
+        # By processing from furthest to closest, each instruction clears the path
+        # for the ones that need to move less far
+        for i, ideal_cycle, _ in reversed(needs_move_down):
+            current_idx = self._find_nth_target(block, i)
+            if current_idx < 0:
+                if self.verbose:
+                    print(f"  Could not find target instruction {i}")
+                continue
+            
+            target_idx = self._cycle_to_index(block, ideal_cycle)
+            
+            # For downward moves, ensure we don't go past branch boundary
+            target_idx = min(target_idx, branch_boundary - 1)
+            
+            # Ensure target_idx respects ordering with subsequent instructions
+            # (instructions after this one should stay after it)
+            if i < K - 1:
+                next_target_idx = self._find_nth_target(block, i + 1)
+                if next_target_idx >= 0 and target_idx >= next_target_idx:
+                    target_idx = next_target_idx - 1
+            
+            # Ensure we don't move below frozen boundary
+            target_idx = max(target_idx, frozen_boundary)
+            
+            # Protected: only instructions BEFORE this one (0..i-1)
+            # Instructions after (i+1..K-1) are NOT protected - they may need to move
+            # to make room for this instruction to move down
+            protected_instrs = all_target_instrs[:i]
+            
+            if self.verbose:
+                current_cycle = self._get_instruction_cycle_position(block, current_idx)
+                print(f"  [{i}] (DOWN) Moving from idx={current_idx} (cycle={current_cycle}) to idx={target_idx} (ideal cycle={ideal_cycle})")
+            
+            final_idx = self._move_instruction_toward(result, current_idx, target_idx, branch_boundary, frozen_boundary, protected_instrs)
+            
+            if self.verbose:
+                final_cycle = self._get_instruction_cycle_position(block, final_idx)
+                print(f"      Final position: idx={final_idx} (cycle={final_cycle})")
         
         # 7. Move remaining M-K instructions toward the end (in reverse order since they're all moving down)
         if M > K:
