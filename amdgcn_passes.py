@@ -74,6 +74,59 @@ print = functools.partial(print, flush=True)
 
 
 # =============================================================================
+# Base Data Classes for Pass Executors
+# =============================================================================
+
+@dataclass
+class StepResult:
+    """Result of a single step execution."""
+    step_num: int
+    success: bool
+    cycles_moved: int = 0
+    move_count: int = 0       # Number of individual instruction moves
+    message: str = ""
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SingleMoveInfo:
+    """Information about a single instruction move (for Level-2 debugging)."""
+    move_num: int             # 1-indexed move number within the step
+    instruction_idx: int      # Current index of the moved instruction
+    direction: str            # "up" or "down"
+    cycles_this_move: int     # Cycles moved in this single move
+    total_cycles_so_far: int  # Cumulative cycles moved in this step
+    target_cycles: int        # Total cycles requested for the step
+
+
+@dataclass
+class DistributeContext:
+    """Context for distribute operation with all precomputed parameters."""
+    block: BasicBlock
+    block_label: str
+    target_opcode: str
+    target_indices: List[int]        # Initial indices of all target instructions
+    all_target_instrs: List['Instruction']  # All target instruction objects
+    K: int                           # Number of instructions to distribute
+    M: int                           # Total target instructions found
+    ideal_cycles: List[int]          # Ideal cycle position for each instruction
+    total_cycles: int                # Block total cycles
+    branch_boundary: int             # Branch boundary index
+    is_move_s_barrier: bool = False
+
+
+@dataclass
+class RegisterReplaceContext:
+    """Context for register replacement operation."""
+    range_start: int
+    range_end: int
+    segments: List['RegisterSegment']
+    alignments: List[int]
+    target_opcodes: Set[str]
+    register_mapping: Dict[str, str] = field(default_factory=dict)  # old_reg -> new_reg
+
+
+# =============================================================================
 # LDS Synchronization Order Constraint Helper
 # =============================================================================
 
@@ -1154,6 +1207,204 @@ def find_all_dependent_waitcnts(
                     dependent_waitcnts.append(prev_idx)
     
     return dependent_waitcnts
+
+
+# =============================================================================
+# MoveExecutor - Modular interface for instruction movement with callbacks
+# =============================================================================
+
+class MoveExecutor:
+    """
+    Executor for instruction movement that supports single-instruction move tracking.
+    Enables Level-2 debugging by exposing each individual instruction move.
+    
+    This class wraps MoveInstructionPass and provides:
+    - Per-move callbacks for debugging
+    - Incremental movement with progress tracking
+    - Clean interface for external tools
+    """
+    
+    def __init__(
+        self,
+        result: AnalysisResult,
+        block_label: str,
+        instr_index: int,
+        frozen_boundary: int = 0,
+        protected_instructions: Optional[List['Instruction']] = None,
+        is_move_s_barrier: bool = False,
+        auto_insert_nops: bool = True,
+        verbose: bool = False
+    ):
+        """
+        Initialize the move executor.
+        
+        Args:
+            result: The AnalysisResult to modify
+            block_label: Label of the block (e.g., ".LBB0_0")
+            instr_index: Index of instruction to move
+            frozen_boundary: Instructions at idx < frozen_boundary cannot be moved
+            protected_instructions: List of instruction objects that should never be moved
+            is_move_s_barrier: If True, move s_barrier along with gap instructions
+            auto_insert_nops: If True, automatically insert s_nop for latency constraints
+            verbose: Print detailed information during execution
+        """
+        self.result = result
+        self.block_label = block_label
+        self.instr_index = instr_index
+        self.frozen_boundary = frozen_boundary
+        self.protected_instructions = protected_instructions or []
+        self.is_move_s_barrier = is_move_s_barrier
+        self.auto_insert_nops = auto_insert_nops
+        self.verbose = verbose
+        
+        # Validate block exists
+        if block_label not in result.cfg.blocks:
+            raise ValueError(f"Block '{block_label}' not found")
+        
+        self.block = result.cfg.blocks[block_label]
+        
+        # Validate instruction index
+        if instr_index < 0 or instr_index >= len(self.block.instructions):
+            raise ValueError(f"Invalid instruction index {instr_index}")
+        
+        # Store target instruction reference
+        self.target_instr = self.block.instructions[instr_index]
+        
+        # Tracking state
+        self._total_cycles_moved = 0
+        self._move_count = 0
+        self._stop_reason = ""
+    
+    @property
+    def total_cycles_moved(self) -> int:
+        """Get total cycles actually moved."""
+        return self._total_cycles_moved
+    
+    @property
+    def move_count(self) -> int:
+        """Get number of individual instruction moves."""
+        return self._move_count
+    
+    @property
+    def stop_reason(self) -> str:
+        """Get reason why movement stopped."""
+        return self._stop_reason
+    
+    def _find_current_index(self) -> int:
+        """Find the current index of the target instruction."""
+        for idx, instr in enumerate(self.block.instructions):
+            if instr is self.target_instr:
+                return idx
+        return -1
+    
+    def move_single_step(
+        self,
+        direction: str,
+        max_cycles: int = 4
+    ) -> Tuple[int, bool]:
+        """
+        Move instruction by a single step (one instruction worth of cycles).
+        
+        Args:
+            direction: "up" or "down"
+            max_cycles: Maximum cycles to move in this step
+            
+        Returns:
+            (cycles_moved, can_continue) - cycles moved in this step, and whether more moves possible
+        """
+        cycles = max_cycles if direction == "up" else -max_cycles
+        
+        current_idx = self._find_current_index()
+        if current_idx < 0:
+            return 0, False
+        
+        move_pass = MoveInstructionPass(
+            self.block_label,
+            current_idx,
+            cycles,
+            verbose=self.verbose,
+            frozen_boundary=self.frozen_boundary,
+            protected_instructions=self.protected_instructions,
+            auto_insert_nops=self.auto_insert_nops,
+            is_move_s_barrier=self.is_move_s_barrier
+        )
+        
+        try:
+            move_pass.run(self.result)
+        except Exception:
+            # Move failed (verification error)
+            self._stop_reason = "verification_failed"
+            return 0, False
+        
+        cycles_moved = move_pass.total_cycles_moved
+        
+        if cycles_moved > 0:
+            self._move_count += 1
+            self._total_cycles_moved += cycles_moved
+        
+        # Check if we can continue
+        can_continue = cycles_moved > 0 and move_pass.stop_reason == "reached target"
+        
+        if not can_continue and cycles_moved == 0:
+            self._stop_reason = move_pass.stop_reason
+        
+        return cycles_moved, can_continue
+    
+    def move_by_cycles(
+        self,
+        cycles: int,
+        on_single_move: Optional[callable] = None
+    ) -> int:
+        """
+        Move instruction by specified cycles, with optional per-move callback.
+        
+        Args:
+            cycles: Total cycles to move (positive=up, negative=down)
+            on_single_move: Called after each single-instruction move.
+                           Signature: (move_info: SingleMoveInfo) -> bool
+                           Return False to stop moving.
+                           
+        Returns:
+            Total cycles actually moved
+        """
+        if cycles == 0:
+            return 0
+        
+        direction = "up" if cycles > 0 else "down"
+        target_cycles = abs(cycles)
+        
+        self._total_cycles_moved = 0
+        self._move_count = 0
+        self._stop_reason = ""
+        
+        while self._total_cycles_moved < target_cycles:
+            remaining = target_cycles - self._total_cycles_moved
+            step_cycles = min(4, remaining)  # Move at most 4 cycles at a time
+            
+            cycles_moved, can_continue = self.move_single_step(direction, step_cycles)
+            
+            if cycles_moved > 0 and on_single_move is not None:
+                move_info = SingleMoveInfo(
+                    move_num=self._move_count,
+                    instruction_idx=self._find_current_index(),
+                    direction=direction,
+                    cycles_this_move=cycles_moved,
+                    total_cycles_so_far=self._total_cycles_moved,
+                    target_cycles=target_cycles
+                )
+                
+                # Call the callback, stop if it returns False
+                if not on_single_move(move_info):
+                    self._stop_reason = "callback_stopped"
+                    break
+            
+            if not can_continue:
+                break
+        
+        if self._total_cycles_moved >= target_cycles:
+            self._stop_reason = "reached_target"
+        
+        return self._total_cycles_moved
 
 
 class MoveInstructionPass(Pass):
@@ -3789,6 +4040,392 @@ class MoveInstructionPass(Pass):
 
 
 # =============================================================================
+# DistributeStepExecutor - Modular interface for instruction distribution
+# =============================================================================
+
+class DistributeStepExecutor:
+    """
+    Step executor for DistributeInstructionPass.
+    Exposes clean interface for debug_distribute_pass.py.
+    
+    This class provides:
+    - Context creation with all precomputed parameters
+    - Step-by-step execution with callbacks
+    - Per-move callbacks for Level-2 debugging
+    """
+    
+    def __init__(self, result: AnalysisResult, context: DistributeContext):
+        """
+        Initialize the step executor.
+        
+        Args:
+            result: The AnalysisResult to modify
+            context: Precomputed distribute context
+        """
+        self.result = result
+        self.ctx = context
+        self.frozen_boundary = 0
+        self._step_results: List[StepResult] = []
+    
+    @staticmethod
+    def get_cumulative_cycle(block: BasicBlock, idx: int) -> int:
+        """
+        Calculate cumulative cycle count up to and including instruction at idx.
+        
+        This is the canonical implementation - use this instead of duplicating.
+        """
+        total = 0
+        for i in range(idx + 1):
+            total += get_instruction_cycles(block.instructions[i].opcode)
+        return total
+    
+    @staticmethod
+    def cycle_to_index(block: BasicBlock, target_cycle: int) -> int:
+        """
+        Convert target cycle to instruction index.
+        
+        Finds the first instruction whose cumulative cycle reaches or exceeds target_cycle.
+        """
+        total = 0
+        for i, instr in enumerate(block.instructions):
+            cycles = get_instruction_cycles(instr.opcode)
+            total += cycles
+            if total >= target_cycle:
+                return i
+        return len(block.instructions) - 1
+    
+    @staticmethod
+    def _find_branch_boundary(block: BasicBlock, is_move_s_barrier: bool) -> int:
+        """Find index of first branch/terminator instruction."""
+        n = len(block.instructions)
+        
+        # First, find the branch/terminator position
+        branch_pos = n
+        for i, instr in enumerate(block.instructions):
+            if instr.is_branch or instr.is_terminator:
+                branch_pos = i
+                break
+        
+        if not is_move_s_barrier:
+            # Original behavior: first s_barrier (before branch) is a boundary
+            for i in range(branch_pos):
+                if block.instructions[i].opcode.lower() == 's_barrier':
+                    return i
+        else:
+            # is_move_s_barrier=True: only s_barrier immediately before branch is a boundary
+            if branch_pos > 0 and branch_pos < n:
+                check_idx = branch_pos - 1
+                while check_idx >= 0:
+                    check_instr = block.instructions[check_idx]
+                    opcode_lower = check_instr.opcode.lower()
+                    if opcode_lower == 's_barrier':
+                        return check_idx
+                    elif opcode_lower.startswith('s_nop'):
+                        check_idx -= 1
+                    else:
+                        break
+        
+        return branch_pos
+    
+    @staticmethod
+    def _calculate_ideal_cycles(total_cycles: int, k: int) -> List[int]:
+        """Calculate ideal cycle positions for K evenly distributed instructions."""
+        if k <= 0:
+            return []
+        
+        if k == 1:
+            return [total_cycles // 2]
+        
+        cycle_spacing = total_cycles / k
+        return [int(cycle_spacing * (i + 1)) for i in range(k)]
+    
+    @staticmethod
+    def create_context(
+        result: AnalysisResult,
+        block_label: str,
+        target_opcode: str,
+        distribute_count: int,
+        is_move_s_barrier: bool = False
+    ) -> Optional[DistributeContext]:
+        """
+        Create distribute context with all precomputed parameters.
+        
+        Args:
+            result: The AnalysisResult
+            block_label: Label of the block to modify
+            target_opcode: Opcode to distribute (e.g., "global_load_dwordx4")
+            distribute_count: K, number of instructions to distribute
+            is_move_s_barrier: If True, move s_barrier along with gap instructions
+            
+        Returns:
+            DistributeContext if successful, None if block not found or no targets
+        """
+        if block_label not in result.cfg.blocks:
+            return None
+        
+        block = result.cfg.blocks[block_label]
+        
+        # Find all target instructions
+        target_indices = []
+        all_target_instrs = []
+        for i, instr in enumerate(block.instructions):
+            if instr.opcode == target_opcode:
+                target_indices.append(i)
+                all_target_instrs.append(instr)
+        
+        M = len(target_indices)
+        if M == 0:
+            return None
+        
+        K = min(distribute_count, M)
+        
+        # Find branch boundary
+        branch_boundary = DistributeStepExecutor._find_branch_boundary(block, is_move_s_barrier)
+        
+        # Calculate total cycles up to branch_boundary
+        total_cycles = 0
+        for i in range(branch_boundary):
+            total_cycles += get_instruction_cycles(block.instructions[i].opcode)
+        
+        # Calculate ideal cycle positions
+        ideal_cycles = DistributeStepExecutor._calculate_ideal_cycles(total_cycles, K)
+        
+        return DistributeContext(
+            block=block,
+            block_label=block_label,
+            target_opcode=target_opcode,
+            target_indices=target_indices,
+            all_target_instrs=all_target_instrs,
+            K=K,
+            M=M,
+            ideal_cycles=ideal_cycles,
+            total_cycles=total_cycles,
+            branch_boundary=branch_boundary,
+            is_move_s_barrier=is_move_s_barrier
+        )
+    
+    def find_nth_target_index(self, n: int) -> int:
+        """Find current index of the n-th target instruction (0-indexed)."""
+        count = 0
+        for idx, instr in enumerate(self.ctx.block.instructions):
+            if instr.opcode == self.ctx.target_opcode:
+                if count == n:
+                    return idx
+                count += 1
+        return -1
+    
+    def get_step_params(self, step_num: int) -> Dict[str, Any]:
+        """
+        Get computed parameters for a step (for debugging/logging).
+        
+        Returns dict with: current_idx, target_idx, current_cycle, target_cycle, cycles_to_move
+        """
+        current_idx = self.find_nth_target_index(step_num)
+        if current_idx < 0:
+            return {"error": "target_not_found"}
+        
+        # Calculate target_idx from ideal_cycle
+        target_idx = self.cycle_to_index(self.ctx.block, self.ctx.ideal_cycles[step_num])
+        
+        # Ensure target_idx respects ordering constraints
+        if step_num > 0:
+            prev_idx = self.find_nth_target_index(step_num - 1)
+            if prev_idx >= 0 and target_idx <= prev_idx:
+                target_idx = prev_idx + 1
+        
+        target_idx = max(target_idx, self.frozen_boundary)
+        
+        # Calculate cycles
+        current_cycle = self.get_cumulative_cycle(self.ctx.block, current_idx)
+        target_cycle = self.get_cumulative_cycle(self.ctx.block, target_idx)
+        cycle_diff = target_cycle - current_cycle
+        cycles_to_move = -cycle_diff
+        
+        return {
+            "step_num": step_num,
+            "current_idx": current_idx,
+            "target_idx": target_idx,
+            "current_cycle": current_cycle,
+            "target_cycle": target_cycle,
+            "cycles_to_move": cycles_to_move,
+            "ideal_cycle": self.ctx.ideal_cycles[step_num]
+        }
+    
+    def execute_step(
+        self,
+        step_num: int,
+        on_before_move: Optional[callable] = None,
+        on_after_move: Optional[callable] = None
+    ) -> StepResult:
+        """
+        Execute a single distribution step.
+        
+        Args:
+            step_num: Step number (0-indexed)
+            on_before_move: Called before the move with step params
+            on_after_move: Called after the move with step result
+            
+        Returns:
+            StepResult with execution details
+        """
+        params = self.get_step_params(step_num)
+        
+        if "error" in params:
+            return StepResult(
+                step_num=step_num,
+                success=False,
+                message=params.get("error", "Unknown error")
+            )
+        
+        current_idx = params["current_idx"]
+        target_idx = params["target_idx"]
+        cycles_to_move = params["cycles_to_move"]
+        
+        if on_before_move:
+            on_before_move(params)
+        
+        cycles_moved = 0
+        move_count = 0
+        
+        if cycles_to_move != 0:
+            # Get protected instructions (all remaining targets)
+            protected_instrs = self.ctx.all_target_instrs[step_num + 1:]
+            
+            move_pass = MoveInstructionPass(
+                self.ctx.block_label,
+                current_idx,
+                cycles_to_move,
+                verbose=False,
+                frozen_boundary=self.frozen_boundary,
+                protected_instructions=protected_instrs,
+                is_move_s_barrier=self.ctx.is_move_s_barrier
+            )
+            move_pass.run(self.result)
+            cycles_moved = move_pass.total_cycles_moved
+            move_count = 1 if cycles_moved > 0 else 0
+        
+        # Update frozen boundary
+        new_idx = self.find_nth_target_index(step_num)
+        if new_idx >= 0:
+            self.frozen_boundary = new_idx + 1
+        
+        result = StepResult(
+            step_num=step_num,
+            success=True,
+            cycles_moved=cycles_moved,
+            move_count=move_count,
+            details=params
+        )
+        
+        self._step_results.append(result)
+        
+        if on_after_move:
+            on_after_move(result)
+        
+        return result
+    
+    def execute_step_with_moves(
+        self,
+        step_num: int,
+        on_single_move: Optional[callable] = None
+    ) -> StepResult:
+        """
+        Execute step with per-move callbacks for Level-2 debugging.
+        
+        Args:
+            step_num: Step number (0-indexed)
+            on_single_move: Called after each single instruction move.
+                           Signature: (move_info: SingleMoveInfo) -> bool
+                           Return False to stop execution.
+                           
+        Returns:
+            StepResult with execution details
+        """
+        params = self.get_step_params(step_num)
+        
+        if "error" in params:
+            return StepResult(
+                step_num=step_num,
+                success=False,
+                message=params.get("error", "Unknown error")
+            )
+        
+        current_idx = params["current_idx"]
+        cycles_to_move = params["cycles_to_move"]
+        
+        if cycles_to_move == 0:
+            return StepResult(
+                step_num=step_num,
+                success=True,
+                cycles_moved=0,
+                move_count=0,
+                message="No move needed"
+            )
+        
+        # Get protected instructions
+        protected_instrs = self.ctx.all_target_instrs[step_num + 1:]
+        
+        # Get target instruction for tracking
+        target_instr = self.ctx.block.instructions[current_idx]
+        
+        # Use MoveExecutor for per-move callbacks
+        executor = MoveExecutor(
+            self.result,
+            self.ctx.block_label,
+            current_idx,
+            frozen_boundary=self.frozen_boundary,
+            protected_instructions=protected_instrs,
+            is_move_s_barrier=self.ctx.is_move_s_barrier,
+            verbose=False
+        )
+        
+        total_cycles = executor.move_by_cycles(cycles_to_move, on_single_move=on_single_move)
+        
+        # Update frozen boundary
+        new_idx = self.find_nth_target_index(step_num)
+        if new_idx >= 0:
+            self.frozen_boundary = new_idx + 1
+        
+        result = StepResult(
+            step_num=step_num,
+            success=True,
+            cycles_moved=total_cycles,
+            move_count=executor.move_count,
+            details=params
+        )
+        
+        self._step_results.append(result)
+        return result
+    
+    def execute_all_steps(
+        self,
+        on_step_complete: Optional[callable] = None
+    ) -> List[StepResult]:
+        """
+        Execute all K steps with optional callback after each step.
+        
+        Args:
+            on_step_complete: Called after each step completes.
+                             Signature: (result: StepResult) -> bool
+                             Return False to stop execution.
+                             
+        Returns:
+            List of StepResult for each step
+        """
+        results = []
+        
+        for i in range(self.ctx.K):
+            result = self.execute_step(i)
+            results.append(result)
+            
+            if on_step_complete:
+                if not on_step_complete(result):
+                    break
+        
+        return results
+
+
+# =============================================================================
 # Distribute Instruction Pass
 # =============================================================================
 
@@ -4567,6 +5204,225 @@ def find_aligned_free_registers(
             return start_idx
     
     return None
+
+
+# =============================================================================
+# RegisterReplaceExecutor - Modular interface for register replacement
+# =============================================================================
+
+class RegisterReplaceExecutor:
+    """
+    Step executor for RegisterReplacePass.
+    Provides per-instruction callbacks for debugging.
+    """
+    
+    def __init__(self, result: AnalysisResult, context: RegisterReplaceContext):
+        """
+        Initialize the register replace executor.
+        
+        Args:
+            result: The AnalysisResult to modify
+            context: Precomputed register replace context
+        """
+        self.result = result
+        self.ctx = context
+        self._instructions_modified = 0
+        self._instructions_skipped = 0
+    
+    @property
+    def instructions_modified(self) -> int:
+        """Get count of instructions modified."""
+        return self._instructions_modified
+    
+    @property
+    def instructions_skipped(self) -> int:
+        """Get count of instructions skipped (not in target_opcodes)."""
+        return self._instructions_skipped
+    
+    @staticmethod
+    def create_context(
+        result: AnalysisResult,
+        range_start: int,
+        range_end: int,
+        registers_to_replace: List[str],
+        alignments: Optional[List[int]] = None,
+        target_opcodes: Optional[List[str]] = None
+    ) -> Optional[RegisterReplaceContext]:
+        """
+        Create register replace context and compute register mapping.
+        
+        Args:
+            result: The AnalysisResult
+            range_start: Starting instruction address (global ID, inclusive)
+            range_end: Ending instruction address (global ID, inclusive)
+            registers_to_replace: List of register segment strings
+            alignments: List of alignment values
+            target_opcodes: List of opcodes to apply replacement to
+            
+        Returns:
+            RegisterReplaceContext if successful, None on error
+        """
+        # Parse register segments
+        segments = []
+        for reg_str in registers_to_replace:
+            segment = parse_register_segment(reg_str)
+            if segment is None:
+                return None
+            segments.append(segment)
+        
+        if alignments is None:
+            alignments = [1] * len(segments)
+        
+        if len(alignments) != len(segments):
+            return None
+        
+        # Normalize target_opcodes
+        target_opcodes_set = set(op.lower() for op in target_opcodes) if target_opcodes else set()
+        
+        # Get FGPR from CFG
+        cfg = result.cfg
+        if cfg.fgpr is None:
+            from amdgcn_ddg import compute_register_statistics, compute_fgpr
+            stats = compute_register_statistics(result.ddgs)
+            fgpr_info = compute_fgpr(stats)
+            cfg.fgpr = fgpr_info.to_dict()
+            cfg.register_stats = stats.to_dict()
+        
+        fgpr_data = cfg.fgpr
+        fgpr_v = set(fgpr_data['full_free']['vgpr'])
+        fgpr_a = set(fgpr_data['full_free']['agpr'])
+        fgpr_s = set(fgpr_data['full_free']['sgpr'])
+        
+        # Compute register mapping
+        register_mapping = {}
+        used_new_regs = set()
+        
+        for i, segment in enumerate(segments):
+            alignment = alignments[i]
+            
+            # Select the appropriate FGPR set
+            if segment.prefix == 'v':
+                fgpr_set = fgpr_v - used_new_regs
+            elif segment.prefix == 'a':
+                fgpr_set = fgpr_a - used_new_regs
+            else:  # 's'
+                fgpr_set = fgpr_s - used_new_regs
+            
+            # Find aligned starting index
+            new_start = find_aligned_free_registers(
+                fgpr_set, segment.prefix, segment.count, alignment
+            )
+            
+            if new_start is None:
+                return None  # No free registers available
+            
+            # Build mapping for each register in the segment
+            for j in range(segment.count):
+                old_reg = f"{segment.prefix}{segment.start + j}"
+                new_reg = f"{segment.prefix}{new_start + j}"
+                register_mapping[old_reg] = new_reg
+                used_new_regs.add(new_reg)
+        
+        return RegisterReplaceContext(
+            range_start=range_start,
+            range_end=range_end,
+            segments=segments,
+            alignments=alignments,
+            target_opcodes=target_opcodes_set,
+            register_mapping=register_mapping
+        )
+    
+    def _replace_registers_in_string(self, text: str) -> str:
+        """Replace registers in a string according to the mapping."""
+        result = text
+        
+        # Sort by length descending to replace longer register names first
+        # This prevents v10 from being replaced before v100
+        sorted_mapping = sorted(
+            self.ctx.register_mapping.items(),
+            key=lambda x: len(x[0]),
+            reverse=True
+        )
+        
+        for old_reg, new_reg in sorted_mapping:
+            # Use word boundary matching to avoid partial replacements
+            pattern = r'\b' + re.escape(old_reg) + r'\b'
+            result = re.sub(pattern, new_reg, result)
+        
+        return result
+    
+    def replace_in_instruction(
+        self,
+        block_label: str,
+        instr_idx: int
+    ) -> bool:
+        """
+        Replace registers in a single instruction.
+        
+        Args:
+            block_label: Label of the block
+            instr_idx: Index of instruction in the block
+            
+        Returns:
+            True if the instruction was modified
+        """
+        block = self.result.cfg.blocks[block_label]
+        instr = block.instructions[instr_idx]
+        
+        # Check if instruction is in range
+        if instr.address < self.ctx.range_start or instr.address > self.ctx.range_end:
+            return False
+        
+        # Check if instruction matches target_opcodes (if specified)
+        if self.ctx.target_opcodes and instr.opcode.lower() not in self.ctx.target_opcodes:
+            self._instructions_skipped += 1
+            return False
+        
+        # Replace in operands
+        original_operands = instr.operands
+        new_operands = self._replace_registers_in_string(original_operands)
+        
+        if new_operands != original_operands:
+            instr.operands = new_operands
+            
+            # Update raw_line if present
+            if instr.raw_line:
+                instr.raw_line = self._replace_registers_in_string(instr.raw_line)
+            
+            self._instructions_modified += 1
+            return True
+        
+        return False
+    
+    def execute_all(
+        self,
+        on_instruction: Optional[callable] = None
+    ) -> int:
+        """
+        Execute replacement on all instructions in range.
+        
+        Args:
+            on_instruction: Callback after each instruction.
+                           Signature: (block_label: str, instr_idx: int, modified: bool) -> None
+                           
+        Returns:
+            Number of instructions modified
+        """
+        self._instructions_modified = 0
+        self._instructions_skipped = 0
+        
+        for block_label, block in self.result.cfg.blocks.items():
+            for idx, instr in enumerate(block.instructions):
+                # Check if in range
+                if instr.address < self.ctx.range_start or instr.address > self.ctx.range_end:
+                    continue
+                
+                modified = self.replace_in_instruction(block_label, idx)
+                
+                if on_instruction:
+                    on_instruction(block_label, idx, modified)
+        
+        return self._instructions_modified
 
 
 class RegisterReplacePass(Pass):

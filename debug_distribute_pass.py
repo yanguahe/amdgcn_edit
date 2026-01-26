@@ -77,7 +77,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from amdgcn_ddg import AnalysisResult, load_analysis_from_json, dump_block_instructions
 from amdgcn_passes import (
     MoveInstructionPass, DistributeInstructionPass, RegisterReplacePass,
-    get_instruction_cycles, sync_instruction_to_raw_lines
+    get_instruction_cycles, sync_instruction_to_raw_lines,
+    # New modular interfaces
+    MoveExecutor, DistributeStepExecutor, RegisterReplaceExecutor,
+    StepResult, SingleMoveInfo, DistributeContext, RegisterReplaceContext
 )
 from amdgcn_verify import build_global_ddg, verify_optimization, SchedulingVerificationError
 from amdgcn_cfg import BasicBlock, Instruction, CFG
@@ -123,13 +126,14 @@ FAILURE_KEYWORDS = [
 # ============================================================================
 
 
+# Use canonical implementation from DistributeStepExecutor
 def get_cumulative_cycle(block: BasicBlock, idx: int) -> int:
-    """Calculate cumulative cycle count up to instruction at idx."""
-    total = 0
-    for i in range(idx + 1):
-        instr = block.instructions[i]
-        total += get_instruction_cycles(instr.opcode)
-    return total
+    """Calculate cumulative cycle count up to instruction at idx.
+    
+    Note: This is a wrapper around DistributeStepExecutor.get_cumulative_cycle
+    for backward compatibility.
+    """
+    return DistributeStepExecutor.get_cumulative_cycle(block, idx)
 
 
 def dump_single_block_instructions(cfg: CFG, block_label: str, output_dir: str) -> None:
@@ -381,6 +385,7 @@ class PassListDebugger:
     def setup_distribute_debug(self, pass_idx: int) -> bool:
         """
         Setup state for debugging a distribute pass in detail.
+        Uses DistributeStepExecutor.create_context for consistent parameter computation.
         Returns True if successful.
         """
         pass_config = self.passes[pass_idx]
@@ -394,51 +399,45 @@ class PassListDebugger:
         self.K = pass_config['k']
         self.is_move_s_barrier = pass_config.get('is_move_s_barrier', False)
         
-        self.block = self.result.cfg.blocks.get(self.block_label)
-        if not self.block:
-            print(f"ERROR: Block {self.block_label} not found!")
+        # Use DistributeStepExecutor.create_context for consistent setup
+        self.distribute_ctx = DistributeStepExecutor.create_context(
+            self.result,
+            self.block_label,
+            self.target_opcode,
+            self.K,
+            self.is_move_s_barrier
+        )
+        
+        if self.distribute_ctx is None:
+            print(f"ERROR: Failed to create distribute context for {self.block_label}")
             return False
         
-        # Find target instructions
-        target_indices = [idx for idx, instr in enumerate(self.block.instructions)
-                        if instr.opcode.lower() == self.target_opcode.lower()]
+        # Create the executor
+        self.distribute_executor = DistributeStepExecutor(self.result, self.distribute_ctx)
         
-        if len(target_indices) < self.K:
-            print(f"WARNING: Only found {len(target_indices)} {self.target_opcode} instructions, requested {self.K}")
-            self.K = len(target_indices)
-        
-        print(f"Found {len(target_indices)} {self.target_opcode} instructions in {self.block_label}")
-        
-        # Calculate ideal cycle positions
-        branch_boundary = len(self.block.instructions)
-        for idx, instr in enumerate(self.block.instructions):
-            if instr.is_branch or instr.is_terminator:
-                branch_boundary = idx
-                break
-        
-        total_cycles = get_cumulative_cycle(self.block, branch_boundary - 1) if branch_boundary > 0 else 0
-        print(f"Block total cycles: {total_cycles}, branch boundary: {branch_boundary}")
-        
-        if self.K > 1:
-            cycle_spacing = total_cycles / self.K
-            self.ideal_cycles = [int(cycle_spacing * (i + 1)) for i in range(self.K)]
-        else:
-            self.ideal_cycles = [total_cycles // 2]
-        
-        print(f"Ideal cycle positions: {self.ideal_cycles[:5]}{'...' if len(self.ideal_cycles) > 5 else ''}")
-        
+        # Export commonly used attributes for backward compatibility
+        self.block = self.distribute_ctx.block
+        self.K = self.distribute_ctx.K
+        self.ideal_cycles = self.distribute_ctx.ideal_cycles
+        self.all_target_instrs = self.distribute_ctx.all_target_instrs
         self.frozen_boundary = 0
         
-        # Collect ALL target instruction objects (same as DistributeInstructionPass.run())
-        # This list is used to provide protected_instructions during each step
-        self.all_target_instrs = []
-        for idx in target_indices:
-            self.all_target_instrs.append(self.block.instructions[idx])
+        # Print info
+        print(f"Found {self.distribute_ctx.M} {self.target_opcode} instructions in {self.block_label}")
+        print(f"Block total cycles: {self.distribute_ctx.total_cycles}, branch boundary: {self.distribute_ctx.branch_boundary}")
+        print(f"Ideal cycle positions: {self.ideal_cycles[:5]}{'...' if len(self.ideal_cycles) > 5 else ''}")
         
         return True
     
     def find_target_instruction_index(self, n: int) -> int:
-        """Find the current index of the n-th target instruction (0-indexed)."""
+        """Find the current index of the n-th target instruction (0-indexed).
+        
+        Uses DistributeStepExecutor if available for consistency.
+        """
+        if hasattr(self, 'distribute_executor'):
+            return self.distribute_executor.find_nth_target_index(n)
+        
+        # Fallback for backward compatibility
         count = 0
         for idx, instr in enumerate(self.block.instructions):
             if instr.opcode.lower() == self.target_opcode.lower():
@@ -449,70 +448,34 @@ class PassListDebugger:
     
     def apply_distribute_step(self, step_num: int, save_path: str = None) -> bool:
         """
-        Apply a single distribution step.
+        Apply a single distribution step using DistributeStepExecutor.
         Returns True if move was successful.
-        
-        Note: This method should match the behavior of DistributeInstructionPass._move_instruction_toward()
         """
-        current_idx = self.find_target_instruction_index(step_num)
-        if current_idx < 0:
+        # Sync executor's frozen_boundary with our state
+        if hasattr(self, 'distribute_executor'):
+            self.distribute_executor.frozen_boundary = self.frozen_boundary
+        
+        # Get step params for logging
+        params = self.distribute_executor.get_step_params(step_num) if hasattr(self, 'distribute_executor') else {}
+        
+        if params.get("error"):
+            self.log(f"  Step {step_num + 1}: Error - {params.get('error')}")
             return False
         
-        target_instr = self.block.instructions[current_idx]
-        target_cycle = self.ideal_cycles[step_num]
+        self.log(f"  Step {step_num + 1}: idx={params.get('current_idx')} -> {params.get('target_idx')}, "
+                f"cycle={params.get('current_cycle')} -> {params.get('target_cycle')}, "
+                f"move={params.get('cycles_to_move')}")
         
-        # Find target_idx based on target_cycle (same as DistributeInstructionPass._cycle_to_index)
-        target_idx = 0
-        total = 0
-        for i, instr in enumerate(self.block.instructions):
-            cycles = get_instruction_cycles(instr.opcode)
-            total += cycles
-            if total >= target_cycle:
-                target_idx = i
-                break
+        # Execute the step
+        result = self.distribute_executor.execute_step(step_num)
         
-        # Ensure target_idx respects ordering constraints (same as DistributeInstructionPass)
-        if step_num > 0:
-            prev_idx = self.find_target_instruction_index(step_num - 1)
-            if prev_idx >= 0 and target_idx <= prev_idx:
-                target_idx = prev_idx + 1
-        
-        # Ensure target is at least at frozen_boundary (same as DistributeInstructionPass)
-        target_idx = max(target_idx, self.frozen_boundary)
-        
-        # Calculate protected_instructions: all REMAINING targets (same as DistributeInstructionPass)
-        # protected_instrs = all_target_instrs[step_num+1:]
-        protected_instrs = self.all_target_instrs[step_num + 1:]
-        
-        # Calculate cycle-based movement (same as DistributeInstructionPass._move_instruction_toward)
-        current_cycle = get_cumulative_cycle(self.block, current_idx)
-        target_cycle_actual = get_cumulative_cycle(self.block, target_idx)
-        cycle_diff = target_cycle_actual - current_cycle
-        cycles_to_move = -cycle_diff  # Same as _move_instruction_toward: positive = move up
-        
-        self.log(f"  Step {step_num + 1}: idx={current_idx} -> {target_idx}, cycle={current_cycle} -> {target_cycle_actual}, move={cycles_to_move}")
-        
-        if cycles_to_move == 0:
+        if result.cycles_moved > 0:
+            self.log(f"    Moved {result.cycles_moved} cycles")
+        elif result.cycles_moved == 0 and params.get('cycles_to_move', 0) == 0:
             self.log(f"    No move needed")
-        else:
-            move_pass = MoveInstructionPass(
-                self.block_label,
-                current_idx,
-                cycles_to_move,
-                verbose=False,
-                frozen_boundary=self.frozen_boundary,
-                protected_instructions=protected_instrs,
-                is_move_s_barrier=self.is_move_s_barrier
-            )
-            move_pass.run(self.result)
-            
-            if move_pass.total_cycles_moved > 0:
-                self.log(f"    Moved {move_pass.total_cycles_moved} cycles")
         
-        # Update frozen boundary (same as DistributeInstructionPass)
-        new_idx = self.find_target_instruction_index(step_num)
-        if new_idx >= 0:
-            self.frozen_boundary = new_idx + 1  # +1 to match DistributeInstructionPass
+        # Sync frozen_boundary back from executor
+        self.frozen_boundary = self.distribute_executor.frozen_boundary
         
         if save_path:
             save_amdgcn(self.result, save_path, self.block_label)
@@ -647,38 +610,25 @@ class PassListDebugger:
         else:
             print(f"\nSkipping baseline test (starting from move #{start_move})")
         
-        # Get details for the failing step
-        # Use same calculation as apply_distribute_step for consistency
-        current_idx = self.find_target_instruction_index(failing_step - 1)
+        # Get details for the failing step using executor
+        step_num = failing_step - 1  # Convert to 0-indexed
+        
+        # Sync frozen boundary with executor
+        self.distribute_executor.frozen_boundary = self.frozen_boundary
+        
+        # Use executor to get step parameters (ensures consistency with apply_distribute_step)
+        params = self.distribute_executor.get_step_params(step_num)
+        
+        current_idx = params['current_idx']
+        target_idx = params['target_idx']
+        current_cycle = params['current_cycle']
+        target_cycle = params['target_cycle']
+        cycles_to_move = params['cycles_to_move']
+        
         target_instr = self.block.instructions[current_idx]
-        
-        # Find target_idx based on target_cycle (same as apply_distribute_step)
-        target_cycle_ideal = self.ideal_cycles[failing_step - 1]
-        target_idx = 0
-        total = 0
-        for i, instr in enumerate(self.block.instructions):
-            cycles = get_instruction_cycles(instr.opcode)
-            total += cycles
-            if total >= target_cycle_ideal:
-                target_idx = i
-                break
-        
-        # Ensure target_idx respects ordering constraints (same as apply_distribute_step)
-        if failing_step > 1:
-            prev_idx = self.find_target_instruction_index(failing_step - 2)
-            if prev_idx >= 0 and target_idx <= prev_idx:
-                target_idx = prev_idx + 1
-        
-        target_idx = max(target_idx, self.frozen_boundary)
         
         # Calculate protected_instructions for level2 (same as apply_distribute_step)
         level2_protected = self.all_target_instrs[failing_step:]  # step_num = failing_step - 1, so [step_num + 1:] = [failing_step:]
-        
-        # Calculate cycle-based movement (same as apply_distribute_step / _move_instruction_toward)
-        current_cycle = get_cumulative_cycle(self.block, current_idx)
-        target_cycle = get_cumulative_cycle(self.block, target_idx)
-        cycle_diff = target_cycle - current_cycle
-        cycles_to_move = -cycle_diff  # positive = move up, negative = move down
         
         print(f"\nStep {failing_step} details:")
         print(f"  Target instruction: {self.target_opcode} at idx={current_idx}")
