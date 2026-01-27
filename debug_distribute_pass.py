@@ -120,7 +120,12 @@ TEST_TIMEOUT = 180
 FAILURE_KEYWORDS = [
     "FAILED",
     "AssertionError", 
-    "exceeded the error threshold"
+    "exceeded the error threshold",
+    "HIP error",
+    "illegal memory access",
+    "AcceleratorError",
+    "RuntimeError",
+    "Traceback (most recent call last)"
 ]
 
 # ============================================================================
@@ -289,7 +294,14 @@ class PassListDebugger:
             try:
                 result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
                 output = result.stdout + result.stderr
-                return result.returncode == 0, output
+                # Check keywords first
+                for keyword in FAILURE_KEYWORDS:
+                    if keyword in output:
+                        return False, output
+                # Then check exit code
+                if result.returncode != 0:
+                    return False, f"Process exited with code {result.returncode}\n{output}"
+                return True, output
             except subprocess.TimeoutExpired:
                 return False, "Test timed out"
             except Exception as e:
@@ -309,9 +321,15 @@ class PassListDebugger:
                                        timeout=TEST_TIMEOUT, env=env, cwd=WORK_DIR)
                 output = result.stdout + result.stderr
                 
+                # Check for failure keywords in output
                 for keyword in FAILURE_KEYWORDS:
                     if keyword in output:
                         return False, output
+                
+                # Also check exit code (non-zero indicates failure)
+                if result.returncode != 0:
+                    return False, f"Process exited with code {result.returncode}\n{output}"
+                
                 return True, output
             except subprocess.TimeoutExpired:
                 return False, "Test timed out"
@@ -1002,7 +1020,14 @@ class DistributeDebugger:
             try:
                 result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
                 output = result.stdout + result.stderr
-                return result.returncode == 0, output
+                # Check keywords first
+                for keyword in FAILURE_KEYWORDS:
+                    if keyword in output:
+                        return False, output
+                # Then check exit code
+                if result.returncode != 0:
+                    return False, f"Process exited with code {result.returncode}\n{output}"
+                return True, output
             except subprocess.TimeoutExpired:
                 return False, "Test timed out"
             except Exception as e:
@@ -1022,9 +1047,15 @@ class DistributeDebugger:
                                        timeout=TEST_TIMEOUT, env=env, cwd=WORK_DIR)
                 output = result.stdout + result.stderr
                 
+                # Check for failure keywords in output
                 for keyword in FAILURE_KEYWORDS:
                     if keyword in output:
                         return False, output
+                
+                # Also check exit code (non-zero indicates failure)
+                if result.returncode != 0:
+                    return False, f"Process exited with code {result.returncode}\n{output}"
+                
                 return True, output
             except subprocess.TimeoutExpired:
                 return False, "Test timed out"

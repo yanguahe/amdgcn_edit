@@ -1,18 +1,23 @@
 [
   {
     "type": "replace_registers",
-    "range_start": 1109,
-    "range_end": 1213,
-    "registers": ["v[200:209]"],
+    "range_start": 1,
+    "range_end": 534,
+    "registers": ["v[40:51]"],
     "alignments": [2],
     "target_opcodes": ["v_lshl_add_u64", "global_load_dwordx4"]
   },
 
   {
     "type": "distribute",
-    "block": ".LBB0_10",
+    "block": ".LBB0_2",
     "opcode": "global_load_dwordx4",
     "k": 16,
     "is_move_s_barrier": true
+  },
+
+
+
+  {
   }
 ]

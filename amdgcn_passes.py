@@ -166,6 +166,105 @@ def get_lds_sync_priority(opcode: str, operands: str = "") -> int:
     return 0  # Not an LDS synchronization instruction
 
 
+def is_exec_save_instruction(opcode: str) -> bool:
+    """
+    Check if instruction saves exec register (start of exec save/restore pair).
+    
+    These instructions save exec to a register and modify exec:
+    - s_and_saveexec_b64, s_or_saveexec_b64, s_xor_saveexec_b64, etc.
+    """
+    opcode_lower = opcode.lower()
+    return 'saveexec' in opcode_lower
+
+
+def is_exec_restore_instruction(opcode: str, operands: str) -> bool:
+    """
+    Check if instruction restores exec register (end of exec save/restore pair).
+    
+    Pattern: s_or_b64 exec, exec, s[x:y] (restores exec from saved value)
+    """
+    opcode_lower = opcode.lower()
+    if opcode_lower in ('s_or_b64', 's_mov_b64'):
+        # Check if operands start with 'exec' as destination
+        operands_lower = operands.lower().strip()
+        if operands_lower.startswith('exec'):
+            return True
+    return False
+
+
+def find_exec_save_restore_ranges(block) -> list:
+    """
+    Find all exec save/restore pair ranges in a block.
+    
+    Returns a list of (save_idx, restore_idx) tuples representing ranges
+    where instructions should move together.
+    
+    New rule: For each s_and_saveexec_b64 (or similar saveexec), find the FIRST
+    s_or_b64 below it to form a pair. Instructions within the pair (inclusive)
+    must move together as a unit.
+    """
+    ranges = []
+    n = len(block.instructions)
+    used_restore_indices = set()  # Track already-paired s_or_b64
+    
+    for idx, instr in enumerate(block.instructions):
+        opcode_lower = instr.opcode.lower()
+        
+        # Check for saveexec instructions (s_and_saveexec_b64, s_or_saveexec_b64, etc.)
+        if is_exec_save_instruction(opcode_lower):
+            # Find first s_or_b64 below this saveexec
+            for restore_idx in range(idx + 1, n):
+                restore_instr = block.instructions[restore_idx]
+                restore_opcode = restore_instr.opcode.lower()
+                if restore_opcode == 's_or_b64':
+                    if restore_idx not in used_restore_indices:
+                        ranges.append((idx, restore_idx))
+                        used_restore_indices.add(restore_idx)
+                        break
+    
+    return ranges
+
+
+def is_in_exec_save_restore_range(block, idx: int, ranges: list = None) -> tuple:
+    """
+    Check if an instruction is inside an exec save/restore range.
+    
+    Returns:
+        (is_in_range, range_start, range_end) or (False, -1, -1)
+    """
+    if ranges is None:
+        ranges = find_exec_save_restore_ranges(block)
+    
+    for save_idx, restore_idx in ranges:
+        if save_idx <= idx <= restore_idx:
+            return (True, save_idx, restore_idx)
+    
+    return (False, -1, -1)
+
+
+def find_unpaired_saveexec_indices(block) -> set:
+    """
+    Find saveexec instructions that don't have a paired s_or_b64 below.
+    
+    If a saveexec doesn't have a matching s_or_b64 below it, then instructions
+    at or below this saveexec position cannot move up (including the saveexec itself).
+    
+    Returns:
+        Set of indices where unpaired saveexec instructions are located.
+    """
+    ranges = find_exec_save_restore_ranges(block)
+    paired_save_indices = {r[0] for r in ranges}
+    
+    unpaired = set()
+    for idx, instr in enumerate(block.instructions):
+        opcode_lower = instr.opcode.lower()
+        if is_exec_save_instruction(opcode_lower):
+            if idx not in paired_save_indices:
+                unpaired.add(idx)
+    
+    return unpaired
+
+
 # =============================================================================
 # Pass Base Class and Manager
 # =============================================================================
@@ -1811,6 +1910,9 @@ class MoveInstructionPass(Pass):
             if not self.is_move_s_barrier or not protected_indices:
                 return False
         
+        # Pre-compute exec ranges for efficiency
+        exec_ranges = find_exec_save_restore_ranges(block)
+        
         # Check all instructions we would pass
         for check_idx in range(from_idx + 1, to_idx + 1):
             # Skip instructions in protected_indices (they move together with the instruction)
@@ -1824,11 +1926,31 @@ class MoveInstructionPass(Pass):
             
             # s_barrier handling:
             # - is_move_s_barrier=False: s_barrier is a hard barrier, no instructions can cross
-            # - is_move_s_barrier=True: allow crossing s_barrier (user has enabled this mode)
+            # - is_move_s_barrier=True: allow crossing s_barrier ONLY in chain context
+            #   (i.e., only if the s_barrier itself is part of the chain and will move together)
+            #   This preserves the rule that instructions around s_barrier keep their relative order
             if opcode_b == 's_barrier':
                 if not self.is_move_s_barrier:
                     return False
-                # When is_move_s_barrier=True, continue checking other dependencies
+                # When is_move_s_barrier=True, only allow crossing if s_barrier is in the chain
+                # (protected_indices is non-empty means we're in chain context)
+                # If s_barrier is not in the chain, we can't cross it
+                # Note: we already checked 'check_idx in protected_indices' above and continued,
+                # so if we reach here, s_barrier is NOT in the chain - block the move
+                return False
+            
+            # Exec save/restore range constraint (for _can_move_single_instruction_down):
+            # Instructions within s_and_saveexec / s_or_b64 pairs must move together as a unit.
+            # If check_idx is the boundary (saveexec or s_or_b64), block unless entire range is protected.
+            if is_exec_save_instruction(opcode_b) or opcode_b == 's_or_b64':
+                # Found an exec boundary - check if entire range is in protected chain
+                in_range, range_start, range_end = is_in_exec_save_restore_range(block, check_idx, exec_ranges)
+                if in_range:
+                    # Check if ALL instructions in this range are in protected_indices
+                    range_fully_protected = all(i in protected_indices for i in range(range_start, range_end + 1))
+                    if not range_fully_protected:
+                        # Cannot cross this exec range boundary
+                        return False
             
             # LDS synchronization order constraint - STRICT ORDER
             # All LDS sync instructions (ds_write, s_waitcnt lgkmcnt, s_barrier, ds_read)
@@ -2054,6 +2176,20 @@ class MoveInstructionPass(Pass):
             if not self.is_move_s_barrier or not protected_indices:
                 return False
         
+        # Unpaired saveexec constraint:
+        # If a saveexec doesn't have a paired s_or_b64 below, then instructions
+        # at or below this saveexec cannot move up (including the saveexec itself).
+        # Exception: if in chain context (protected_indices not empty), allow movement.
+        if not protected_indices:
+            unpaired_saveexec = find_unpaired_saveexec_indices(block)
+            for unpaired_idx in unpaired_saveexec:
+                if from_idx >= unpaired_idx:
+                    # Instruction is at or below unpaired saveexec, block upward move
+                    return False
+        
+        # Pre-compute exec ranges for efficiency
+        exec_ranges = find_exec_save_restore_ranges(block)
+        
         # Check all instructions we would pass
         for check_idx in range(from_idx - 1, to_idx - 1, -1):
             # Skip instructions in protected_indices (they move together with the instruction)
@@ -2067,11 +2203,31 @@ class MoveInstructionPass(Pass):
             
             # s_barrier handling:
             # - is_move_s_barrier=False: s_barrier is a hard barrier, no instructions can cross
-            # - is_move_s_barrier=True: allow crossing s_barrier (user has enabled this mode)
+            # - is_move_s_barrier=True: allow crossing s_barrier ONLY in chain context
+            #   (i.e., only if the s_barrier itself is part of the chain and will move together)
+            #   This preserves the rule that instructions around s_barrier keep their relative order
             if opcode_b == 's_barrier':
                 if not self.is_move_s_barrier:
                     return False
-                # When is_move_s_barrier=True, continue checking other dependencies
+                # When is_move_s_barrier=True, only allow crossing if s_barrier is in the chain
+                # (protected_indices is non-empty means we're in chain context)
+                # If s_barrier is not in the chain, we can't cross it
+                # Note: we already checked 'check_idx in protected_indices' above and continued,
+                # so if we reach here, s_barrier is NOT in the chain - block the move
+                return False
+            
+            # Exec save/restore range constraint (for _can_move_single_instruction_up):
+            # Instructions within s_and_saveexec / s_or_b64 pairs must move together as a unit.
+            # If check_idx is the boundary (saveexec or s_or_b64), block unless entire range is protected.
+            if is_exec_save_instruction(opcode_b) or opcode_b == 's_or_b64':
+                # Found an exec boundary - check if entire range is in protected chain
+                in_range, range_start, range_end = is_in_exec_save_restore_range(block, check_idx, exec_ranges)
+                if in_range:
+                    # Check if ALL instructions in this range are in protected_indices
+                    range_fully_protected = all(i in protected_indices for i in range(range_start, range_end + 1))
+                    if not range_fully_protected:
+                        # Cannot cross this exec range boundary
+                        return False
             
             # LDS synchronization order constraint - STRICT ORDER
             # All LDS sync instructions (ds_write, s_waitcnt lgkmcnt, s_barrier, ds_read)
@@ -2585,7 +2741,7 @@ class MoveInstructionPass(Pass):
                         if self.verbose:
                             print(f"    Building downward dependency chain for [{src_idx}] {instr_to_move.opcode}: {len(chain)} instructions")
                         
-                        chain_moved, chain_cycles = self._try_move_chain_down(block, ddg, chain, dest_idx)
+                        chain_moved, chain_cycles = self._try_move_chain_down(block, ddg, chain, dest_idx, self.protected_instructions)
                         if chain_moved:
                             self._total_cycles_moved += chain_cycles
                             any_moved = True
@@ -2957,7 +3113,7 @@ class MoveInstructionPass(Pass):
                         if self.verbose:
                             print(f"    Building upward dependency chain for [{src_idx}] {instr_to_move.opcode}: {len(chain)} instructions")
                         
-                        chain_moved, chain_cycles = self._try_move_chain_up(block, ddg, chain, dest_idx)
+                        chain_moved, chain_cycles = self._try_move_chain_up(block, ddg, chain, dest_idx, self.protected_instructions)
                         if chain_moved:
                             self._total_cycles_moved += chain_cycles
                             any_moved = True
@@ -3388,6 +3544,10 @@ class MoveInstructionPass(Pass):
                                 sorted_chain.insert(0, scan_idx)
                                 sorted_chain = sorted(set(sorted_chain))  # Re-sort and deduplicate
                                 extended = True
+                                # Update chain_has_lds_sync if we added an LDS sync instruction
+                                # (s_waitcnt lgkmcnt is LDS sync with priority=2)
+                                if get_lds_sync_priority(scan_instr.opcode, scan_instr.operands) > 0:
+                                    chain_has_lds_sync = True
                                 break
                         if extended:
                             break
@@ -3400,6 +3560,48 @@ class MoveInstructionPass(Pass):
                             sorted_chain = sorted(set(sorted_chain))  # Re-sort and deduplicate
                             extended = True
                             break
+        
+        # Fourth pass: fill in LDS sync gaps within the chain
+        # After extending chain head, there might be LDS sync instructions between
+        # the new chain head and original chain members that need to be included
+        # to maintain LDS synchronization order (ds_write -> s_waitcnt lgkmcnt -> s_barrier -> ds_read)
+        if chain_has_lds_sync and len(sorted_chain) >= 2:
+            chain_min = sorted_chain[0]
+            chain_max = sorted_chain[-1]
+            gap_filled = True
+            while gap_filled:
+                gap_filled = False
+                for idx in range(chain_min, chain_max + 1):
+                    if idx in sorted_chain:
+                        continue
+                    gap_instr = block.instructions[idx]
+                    gap_lds_priority = get_lds_sync_priority(gap_instr.opcode, gap_instr.operands)
+                    if gap_lds_priority > 0:
+                        # This is an LDS sync instruction in a gap - must include it
+                        sorted_chain.append(idx)
+                        sorted_chain = sorted(set(sorted_chain))
+                        gap_filled = True
+                        break
+        
+        # Fifth pass: extend chain to include complete exec save/restore ranges
+        # If any chain member is within an exec range (s_and_saveexec to s_or_b64 pair),
+        # include the entire range in the chain so they move together as a unit.
+        if sorted_chain:
+            exec_ranges = find_exec_save_restore_ranges(block)
+            range_extended = True
+            while range_extended:
+                range_extended = False
+                for range_start, range_end in exec_ranges:
+                    # Check if any chain member is in this range
+                    chain_in_range = any(range_start <= idx <= range_end for idx in sorted_chain)
+                    if chain_in_range:
+                        # Add all range members to chain
+                        for idx in range(range_start, range_end + 1):
+                            if idx not in sorted_chain:
+                                sorted_chain.append(idx)
+                                range_extended = True
+                if range_extended:
+                    sorted_chain = sorted(set(sorted_chain))
         
         # Verify the chain head can actually move to target
         # Pass the chain indices so we skip checking instructions within the chain
@@ -3504,7 +3706,8 @@ class MoveInstructionPass(Pass):
         block: BasicBlock,
         ddg: Optional[DDG],
         chain: List[int],
-        target_idx: int
+        target_idx: int,
+        protected_instructions: Optional[List['Instruction']] = None
     ) -> Tuple[bool, int]:
         """
         Move a dependency chain up to target position by moving each instruction
@@ -3521,12 +3724,15 @@ class MoveInstructionPass(Pass):
             ddg: The DDG
             chain: List of instruction indices, sorted from top to bottom
             target_idx: Target position to move above
+            protected_instructions: List of instruction objects that should never be moved
             
         Returns:
             (success, total_cycles_moved) - Whether any moves succeeded and total cycles
         """
         if not chain:
             return False, 0
+        
+        protected_instructions = protected_instructions or []
         
         # Filter: only move instructions that are below target
         chain_to_move = [idx for idx in chain if idx > target_idx]
@@ -3535,6 +3741,11 @@ class MoveInstructionPass(Pass):
         
         # Store instruction objects (indices will shift during moves)
         chain_instrs = [block.instructions[idx] for idx in chain_to_move]
+        
+        # Filter out protected instructions from the chain
+        chain_instrs = [instr for instr in chain_instrs if instr not in protected_instructions]
+        if not chain_instrs:
+            return False, 0
         
         total_cycles = 0
         any_moved = False
@@ -3802,6 +4013,47 @@ class MoveInstructionPass(Pass):
                             extended = True
                             break
         
+        # Fourth pass: fill in LDS sync gaps within the chain
+        # After extending chain tail, there might be LDS sync instructions between
+        # chain members that need to be included to maintain LDS synchronization order
+        if chain_has_lds_sync and len(sorted_chain) >= 2:
+            chain_min = sorted_chain[0]
+            chain_max = sorted_chain[-1]
+            gap_filled = True
+            while gap_filled:
+                gap_filled = False
+                for idx in range(chain_min, chain_max + 1):
+                    if idx in sorted_chain:
+                        continue
+                    gap_instr = block.instructions[idx]
+                    gap_lds_priority = get_lds_sync_priority(gap_instr.opcode, gap_instr.operands)
+                    if gap_lds_priority > 0:
+                        # This is an LDS sync instruction in a gap - must include it
+                        sorted_chain.append(idx)
+                        sorted_chain = sorted(set(sorted_chain))
+                        gap_filled = True
+                        break
+        
+        # Fifth pass: extend chain to include complete exec save/restore ranges
+        # If any chain member is within an exec range (s_and_saveexec to s_or_b64 pair),
+        # include the entire range in the chain so they move together as a unit.
+        if sorted_chain:
+            exec_ranges = find_exec_save_restore_ranges(block)
+            range_extended = True
+            while range_extended:
+                range_extended = False
+                for range_start, range_end in exec_ranges:
+                    # Check if any chain member is in this range
+                    chain_in_range = any(range_start <= idx <= range_end for idx in sorted_chain)
+                    if chain_in_range:
+                        # Add all range members to chain
+                        for idx in range(range_start, range_end + 1):
+                            if idx not in sorted_chain:
+                                sorted_chain.append(idx)
+                                range_extended = True
+                if range_extended:
+                    sorted_chain = sorted(set(sorted_chain))
+        
         # Sort chain from bottom to top (the order to move them down)
         sorted_chain = sorted(sorted_chain, reverse=True)
         
@@ -3909,7 +4161,8 @@ class MoveInstructionPass(Pass):
         block: BasicBlock,
         ddg: Optional[DDG],
         chain: List[int],
-        target_idx: int
+        target_idx: int,
+        protected_instructions: Optional[List['Instruction']] = None
     ) -> Tuple[bool, int]:
         """
         Move a dependency chain down to target position by moving each instruction
@@ -3926,12 +4179,15 @@ class MoveInstructionPass(Pass):
             ddg: The DDG
             chain: List of instruction indices, sorted from bottom to top
             target_idx: Target position to move below
+            protected_instructions: List of instruction objects that should never be moved
             
         Returns:
             (success, total_cycles_moved)
         """
         if not chain:
             return False, 0
+        
+        protected_instructions = protected_instructions or []
         
         # Convert chain to top-to-bottom order for consistent processing
         chain_sorted = sorted(set(chain))  # [top, ..., bottom]
@@ -3944,6 +4200,11 @@ class MoveInstructionPass(Pass):
         # Reverse: move from bottom (closest to target) to top
         chain_to_move = list(reversed(chain_to_move))
         chain_instrs = [block.instructions[idx] for idx in chain_to_move]
+        
+        # Filter out protected instructions from the chain
+        chain_instrs = [instr for instr in chain_instrs if instr not in protected_instructions]
+        if not chain_instrs:
+            return False, 0
         
         total_cycles = 0
         any_moved = False
@@ -5802,18 +6063,24 @@ class DistributeInstructionPass(Pass):
                 current_cycle = self._get_instruction_cycle_position(block, current_idx)
                 print(f"  [{i}] (UP) Moving from idx={current_idx} (cycle={current_cycle}) to idx={target_idx} (ideal cycle={ideal_cycle})")
             
-            final_idx = self._move_instruction_toward(result, current_idx, target_idx, branch_boundary, frozen_boundary, protected_instrs)
+            self._move_instruction_toward(result, current_idx, target_idx, branch_boundary, frozen_boundary, protected_instrs)
+            
+            # Use _find_nth_target to get actual position by count order
+            actual_final_idx = self._find_nth_target(block, i)
             
             if self.verbose:
-                final_cycle = self._get_instruction_cycle_position(block, final_idx)
-                print(f"      Final position: idx={final_idx} (cycle={final_cycle})")
+                final_cycle = self._get_instruction_cycle_position(block, actual_final_idx)
+                print(f"      Final position: idx={actual_final_idx} (cycle={final_cycle})")
             
             # Update frozen boundary only for move-up instructions
-            frozen_boundary = final_idx + 1
+            frozen_boundary = actual_final_idx + 1
         
         # Phase 2: Process instructions that need to move DOWN (reverse order)
         # By processing from furthest to closest, each instruction clears the path
         # for the ones that need to move less far
+        # Track already-processed DOWN instructions to protect them from chain movement
+        down_processed_instrs = []
+        
         for i, ideal_cycle, _ in reversed(needs_move_down):
             current_idx = self._find_nth_target(block, i)
             if current_idx < 0:
@@ -5836,20 +6103,25 @@ class DistributeInstructionPass(Pass):
             # Ensure we don't move below frozen boundary
             target_idx = max(target_idx, frozen_boundary)
             
-            # Protected: only instructions BEFORE this one (0..i-1)
-            # Instructions after (i+1..K-1) are NOT protected - they may need to move
-            # to make room for this instruction to move down
-            protected_instrs = all_target_instrs[:i]
+            # Protected: instructions BEFORE this one (0..i-1) AND already-processed DOWN instructions
+            # This prevents chain movement from affecting instructions that have already been placed
+            protected_instrs = all_target_instrs[:i] + down_processed_instrs
             
             if self.verbose:
                 current_cycle = self._get_instruction_cycle_position(block, current_idx)
                 print(f"  [{i}] (DOWN) Moving from idx={current_idx} (cycle={current_cycle}) to idx={target_idx} (ideal cycle={ideal_cycle})")
             
-            final_idx = self._move_instruction_toward(result, current_idx, target_idx, branch_boundary, frozen_boundary, protected_instrs)
+            self._move_instruction_toward(result, current_idx, target_idx, branch_boundary, frozen_boundary, protected_instrs)
+            
+            # Add this instruction to processed list for protection in subsequent moves
+            down_processed_instrs.append(all_target_instrs[i])
             
             if self.verbose:
-                final_cycle = self._get_instruction_cycle_position(block, final_idx)
-                print(f"      Final position: idx={final_idx} (cycle={final_cycle})")
+                # Use _find_nth_target to get actual position by count order (not object reference)
+                # This is more accurate because chain movement may reorder target instructions
+                actual_final_idx = self._find_nth_target(block, i)
+                final_cycle = self._get_instruction_cycle_position(block, actual_final_idx)
+                print(f"      Final position: idx={actual_final_idx} (cycle={final_cycle})")
         
         # 7. Move remaining M-K instructions toward the end (in reverse order since they're all moving down)
         if M > K:
