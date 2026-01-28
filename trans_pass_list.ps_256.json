@@ -3,7 +3,7 @@
   {
     "type": "replace_registers",
     "range_start": 1,
-    "range_end": 396,
+    "range_end": 369,
     "registers": ["v[36:43]"],
     "alignments": [2],
     "target_opcodes": ["v_lshl_add_u64", "global_load_dwordx4"]
@@ -18,8 +18,8 @@
 
   {
     "type": "replace_registers",
-    "range_start": 679,
-    "range_end": 772,
+    "range_start": 652,
+    "range_end": 744,
     "registers": ["v[46:47]", "v[128:131]"],
     "alignments": [2, 2],
     "target_opcodes": ["v_lshl_add_u64", "global_load_dwordx4"]

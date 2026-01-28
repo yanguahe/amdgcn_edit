@@ -602,6 +602,248 @@ class TestMoveResult:
 
 
 # =============================================================================
+# SCC Pair Atomic Skip Tests
+# =============================================================================
+
+class TestSCCPairAtomicSkip:
+    """Tests for SCC pair atomic skip during instruction movement.
+    
+    When an instruction moves past an SCC pair (s_add_u32 + s_addc_u32),
+    the entire pair should be treated as an atomic unit and skipped together.
+    This prevents breaking the SCC dependency chain.
+    """
+
+    def test_move_up_skips_scc_pair_as_atomic_unit(self):
+        """
+        Test that moving an instruction UP past an SCC pair skips the entire pair.
+        
+        Initial layout:
+            [0] s_mov_b32 s0, 0           ; independent (4 cycles)
+            [1] s_add_u32 s20, s20, s57   ; SCC writer (pair start, 4 cycles)
+            [2] s_addc_u32 s21, s21, s58  ; SCC reader (pair end, 4 cycles)
+            [3] v_mov_b32 v0, 1.0         ; independent (4 cycles)
+            [4] global_load_dwordx4 v[124:127], v[134:135], off  ; target to move up
+        
+        Expected after moving [4] up by 12 cycles (past v_mov + s_addc + s_add):
+            [0] s_mov_b32 s0, 0
+            [1] global_load_dwordx4 v[124:127], v[134:135], off  ; moved past the entire SCC pair
+            [2] s_add_u32 s20, s20, s57   ; SCC pair kept together
+            [3] s_addc_u32 s21, s21, s58
+            [4] v_mov_b32 v0, 1.0
+        
+        The key assertion is that s_add_u32 and s_addc_u32 remain adjacent.
+        """
+        block = create_block_with_instructions(".LBB0_0", [
+            create_instruction("s_mov_b32", "s0, 0"),                              # [0]
+            create_instruction("s_add_u32", "s20, s20, s57"),                      # [1] SCC writer
+            create_instruction("s_addc_u32", "s21, s21, s58"),                     # [2] SCC reader
+            create_instruction("v_mov_b32", "v0, 1.0"),                            # [3]
+            create_instruction("global_load_dwordx4", "v[124:127], v[134:135], off"),  # [4] target
+        ])
+        
+        cfg = CFG(name="test")
+        cfg.add_block(block)
+        ddgs, waitcnt_deps = generate_all_ddgs(cfg)
+        inter_block_deps = compute_inter_block_deps(cfg, ddgs)
+        result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
+        
+        # Move instruction at index 4 up by 12 cycles (enough to pass v_mov + s_addc + s_add)
+        # Each instruction is ~4 cycles, so 12 cycles should move past 3 instructions
+        pass_ = MoveInstructionPass(".LBB0_0", 4, 12)
+        changed = pass_.run(result)
+        
+        # Get the modified block
+        modified_block = result.cfg.blocks[".LBB0_0"]
+        opcodes = [instr.opcode.lower() for instr in modified_block.instructions]
+        
+        # Find positions of s_add_u32 and s_addc_u32
+        add_idx = None
+        addc_idx = None
+        for i, opcode in enumerate(opcodes):
+            if opcode == "s_add_u32":
+                add_idx = i
+            elif opcode == "s_addc_u32":
+                addc_idx = i
+        
+        # The key assertion: s_add_u32 and s_addc_u32 must remain adjacent
+        assert add_idx is not None, "s_add_u32 should exist in block"
+        assert addc_idx is not None, "s_addc_u32 should exist in block"
+        assert addc_idx == add_idx + 1, (
+            f"SCC pair broken! s_add_u32 at idx {add_idx}, s_addc_u32 at idx {addc_idx}. "
+            f"They should be adjacent (addc should be at {add_idx + 1}). "
+            f"Opcodes: {opcodes}"
+        )
+        
+        # Also verify the global_load moved
+        assert changed is True, "Move should have happened"
+        load_idx = opcodes.index("global_load_dwordx4")
+        assert load_idx < add_idx, (
+            f"global_load_dwordx4 at idx {load_idx} should be before s_add_u32 at idx {add_idx}"
+        )
+
+    def test_move_down_skips_scc_pair_as_atomic_unit(self):
+        """
+        Test that moving an instruction DOWN past an SCC pair skips the entire pair.
+        
+        Initial layout:
+            [0] global_load_dwordx4 v[124:127], v[134:135], off  ; target to move down
+            [1] v_mov_b32 v0, 1.0         ; independent
+            [2] s_add_u32 s20, s20, s57   ; SCC writer (pair start)
+            [3] s_addc_u32 s21, s21, s58  ; SCC reader (pair end)
+            [4] s_mov_b32 s0, 0           ; independent
+        
+        Expected after moving [0] down by 4 cycles:
+            [0] v_mov_b32 v0, 1.0
+            [1] s_add_u32 s20, s20, s57   ; SCC pair kept together
+            [2] s_addc_u32 s21, s21, s58
+            [3] global_load_dwordx4 v[124:127], v[134:135], off  ; moved past the pair
+            [4] s_mov_b32 s0, 0
+        """
+        block = create_block_with_instructions(".LBB0_0", [
+            create_instruction("global_load_dwordx4", "v[124:127], v[134:135], off"),  # [0] target
+            create_instruction("v_mov_b32", "v0, 1.0"),                            # [1]
+            create_instruction("s_add_u32", "s20, s20, s57"),                      # [2] SCC writer
+            create_instruction("s_addc_u32", "s21, s21, s58"),                     # [3] SCC reader
+            create_instruction("s_mov_b32", "s0, 0"),                              # [4]
+        ])
+        
+        cfg = CFG(name="test")
+        cfg.add_block(block)
+        ddgs, waitcnt_deps = generate_all_ddgs(cfg)
+        inter_block_deps = compute_inter_block_deps(cfg, ddgs)
+        result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
+        
+        # Move instruction at index 0 down by 4 cycles (negative = down)
+        pass_ = MoveInstructionPass(".LBB0_0", 0, -4)
+        changed = pass_.run(result)
+        
+        # Get the modified block
+        modified_block = result.cfg.blocks[".LBB0_0"]
+        opcodes = [instr.opcode.lower() for instr in modified_block.instructions]
+        
+        # Find positions
+        add_idx = opcodes.index("s_add_u32")
+        addc_idx = opcodes.index("s_addc_u32")
+        
+        # The key assertion: s_add_u32 and s_addc_u32 must remain adjacent
+        assert addc_idx == add_idx + 1, (
+            f"SCC pair broken! s_add_u32 at idx {add_idx}, s_addc_u32 at idx {addc_idx}. "
+            f"They should be adjacent. Opcodes: {opcodes}"
+        )
+
+    def test_move_up_with_separated_scc_pair(self):
+        """
+        Test moving past a separated SCC pair (with instructions between s_add and s_addc).
+        
+        Initial layout:
+            [0] s_mov_b32 s0, 0
+            [1] s_add_u32 s20, s20, s57   ; SCC writer
+            [2] s_mul_i32 s10, s10, s11   ; independent (doesn't affect SCC)
+            [3] s_addc_u32 s21, s21, s58  ; SCC reader
+            [4] global_load_dwordx4 v[124:127], v[134:135], off
+        
+        Expected: global_load should move past the entire [1,2,3] range as atomic unit.
+        """
+        block = create_block_with_instructions(".LBB0_0", [
+            create_instruction("s_mov_b32", "s0, 0"),                              # [0]
+            create_instruction("s_add_u32", "s20, s20, s57"),                      # [1] SCC writer
+            create_instruction("s_mul_i32", "s10, s10, s11"),                      # [2] in between
+            create_instruction("s_addc_u32", "s21, s21, s58"),                     # [3] SCC reader
+            create_instruction("global_load_dwordx4", "v[124:127], v[134:135], off"),  # [4]
+        ])
+        
+        cfg = CFG(name="test")
+        cfg.add_block(block)
+        ddgs, waitcnt_deps = generate_all_ddgs(cfg)
+        inter_block_deps = compute_inter_block_deps(cfg, ddgs)
+        result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
+        
+        pass_ = MoveInstructionPass(".LBB0_0", 4, 4)
+        changed = pass_.run(result)
+        
+        modified_block = result.cfg.blocks[".LBB0_0"]
+        opcodes = [instr.opcode.lower() for instr in modified_block.instructions]
+        
+        # Find positions
+        add_idx = opcodes.index("s_add_u32")
+        mul_idx = opcodes.index("s_mul_i32")
+        addc_idx = opcodes.index("s_addc_u32")
+        
+        # The entire SCC pair region [s_add, s_mul, s_addc] should stay in order
+        assert add_idx < mul_idx < addc_idx, (
+            f"SCC pair region order broken! s_add at {add_idx}, s_mul at {mul_idx}, s_addc at {addc_idx}. "
+            f"Opcodes: {opcodes}"
+        )
+
+    def test_recursive_move_cannot_enter_scc_pair(self):
+        """
+        Test that recursive moves cannot put an instruction inside an SCC pair.
+        
+        This is the bug scenario where s_lshl_b64 gets recursively moved and
+        ends up between s_add_u32 and s_addc_u32, breaking the carry chain.
+        
+        Key setup:
+            - s_add_u32 writes s0, s_lshl_b64 reads s[0:1] -> RAW dependency
+            - s_addc_u32 writes s21, no conflict with s_lshl_b64
+            - Without fix: s_lshl_b64 can pass s_addc_u32 but blocked by s_add_u32
+              -> ends up INSIDE the SCC pair, breaking it!
+        
+        Initial layout:
+            [0] s_mov_b32 s10, 0            ; independent
+            [1] s_add_u32 s0, s0, s57       ; SCC pair start, writes s0
+            [2] s_addc_u32 s21, s21, s58    ; SCC pair end, writes s21
+            [3] s_lshl_b64 s[0:1], s[0:1], 1  ; reads s0 (RAW dep on s_add_u32)
+            [4] v_lshl_add_u64 v[134:135], v[0:1], 0, s[0:1]
+            [5] global_load_dwordx4 v[124:127], v[134:135], off
+        
+        Expected: s_lshl_b64 MUST NOT end up between s_add_u32 and s_addc_u32.
+        """
+        block = create_block_with_instructions(".LBB0_0", [
+            create_instruction("s_mov_b32", "s10, 0"),                             # [0] independent
+            create_instruction("s_add_u32", "s0, s0, s57"),                        # [1] SCC pair start, writes s0
+            create_instruction("s_addc_u32", "s21, s21, s58"),                     # [2] SCC pair end, writes s21
+            create_instruction("s_lshl_b64", "s[0:1], s[0:1], 1"),                 # [3] reads s[0:1]
+            create_instruction("v_lshl_add_u64", "v[134:135], v[0:1], 0, s[0:1]"), # [4] uses s[0:1]
+            create_instruction("global_load_dwordx4", "v[124:127], v[134:135], off"),  # [5]
+        ])
+        
+        cfg = CFG(name="test")
+        cfg.add_block(block)
+        ddgs, waitcnt_deps = generate_all_ddgs(cfg)
+        inter_block_deps = compute_inter_block_deps(cfg, ddgs)
+        result = AnalysisResult(cfg=cfg, ddgs=ddgs, inter_block_deps=inter_block_deps, waitcnt_deps=waitcnt_deps)
+        
+        # Try to move global_load up by many cycles - this triggers recursive moves
+        pass_ = MoveInstructionPass(".LBB0_0", 5, 20)
+        changed = pass_.run(result)
+        
+        # Get the modified block
+        modified_block = result.cfg.blocks[".LBB0_0"]
+        opcodes = [instr.opcode.lower() for instr in modified_block.instructions]
+        
+        # Find positions
+        add_idx = opcodes.index("s_add_u32")
+        addc_idx = opcodes.index("s_addc_u32")
+        lshl_idx = opcodes.index("s_lshl_b64")
+        
+        # CRITICAL ASSERTION: s_add_u32 and s_addc_u32 must remain adjacent
+        # s_lshl_b64 must NOT be between them
+        assert addc_idx == add_idx + 1, (
+            f"SCC pair broken! s_add_u32 at idx {add_idx}, s_addc_u32 at idx {addc_idx}. "
+            f"They should be adjacent (addc should be at {add_idx + 1}). "
+            f"s_lshl_b64 is at idx {lshl_idx}. "
+            f"Opcodes: {opcodes}"
+        )
+        
+        # Verify s_lshl_b64 is not inside the pair
+        assert not (add_idx < lshl_idx < addc_idx), (
+            f"s_lshl_b64 at idx {lshl_idx} ended up inside SCC pair "
+            f"[{add_idx}, {addc_idx}]! This breaks the carry chain. "
+            f"Opcodes: {opcodes}"
+        )
+
+
+# =============================================================================
 # Dependency Chain Tests
 # =============================================================================
 

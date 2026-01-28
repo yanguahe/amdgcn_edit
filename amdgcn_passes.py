@@ -644,6 +644,149 @@ def is_scc_separated_pair_end(block: BasicBlock, idx: int) -> bool:
     return pair_start >= 0
 
 
+def find_scc_writer_for_reader(block: BasicBlock, reader_idx: int, max_distance: int = 20) -> int:
+    """
+    Find the matching SCC writer above an SCC reader instruction.
+    
+    For carry chain instructions (s_addc_u32, s_subb_u32), only match with
+    their specific pair writers (s_add_u32, s_sub_u32), not any SCC writer.
+    
+    For other SCC readers (s_cselect_*, s_cbranch_scc*), match with ANY SCC writer.
+    
+    The SCC pair [writer_idx, reader_idx] should be treated as an atomic unit
+    when moving instructions - they cannot be separated.
+    
+    Args:
+        block: The basic block
+        reader_idx: Index of the SCC reader instruction
+        max_distance: Maximum distance to search backwards
+        
+    Returns:
+        Index of the SCC writer, or -1 if not found within max_distance
+    """
+    if reader_idx <= 0:
+        return -1
+    
+    instr_reader = block.instructions[reader_idx]
+    reader_opcode = instr_reader.opcode.lower()
+    
+    # Must be an SCC reader
+    if not is_scc_reader(reader_opcode):
+        return -1
+    
+    # For carry chain instructions, only match with specific pair writers
+    # s_addc_u32 must pair with s_add_u32 or s_add_i32
+    # s_subb_u32 must pair with s_sub_u32 or s_sub_i32
+    if reader_opcode == 's_addc_u32':
+        expected_writers = {'s_add_u32', 's_add_i32'}
+    elif reader_opcode == 's_subb_u32':
+        expected_writers = {'s_sub_u32', 's_sub_i32'}
+    else:
+        # For s_cselect_*, s_cbranch_scc*, match any SCC writer
+        expected_writers = None
+    
+    # Search backwards for the matching SCC writer
+    for search_idx in range(reader_idx - 1, max(0, reader_idx - max_distance) - 1, -1):
+        instr = block.instructions[search_idx]
+        opcode = instr.opcode.lower()
+        
+        if expected_writers is not None:
+            # Carry chain: only match specific pair writers
+            if opcode in expected_writers:
+                return search_idx
+            # If we encounter another SCC writer/reader, the pair is broken
+            # because the SCC value would be corrupted
+            if is_scc_writer(opcode) or is_scc_reader(opcode):
+                return -1
+        else:
+            # Generic SCC reader: match any SCC writer
+            if is_scc_writer(opcode):
+                return search_idx
+    
+    # Didn't find the matching writer within max_distance
+    return -1
+
+
+def get_scc_pair_range(block: BasicBlock, idx: int) -> Optional[tuple]:
+    """
+    Check if instruction at idx is part of an SCC pair and return the pair range.
+    
+    An SCC pair consists of:
+    - A writer instruction that writes SCC (s_add_u32, s_cmp_*, etc.)
+    - A reader instruction that reads SCC (s_addc_u32, s_cselect_*, s_cbranch_scc*)
+    - Any instructions in between (that don't affect SCC)
+    
+    When moving instructions, the entire pair range should be treated as atomic.
+    
+    Args:
+        block: The basic block
+        idx: Index to check
+        
+    Returns:
+        Tuple (start_idx, end_idx) if idx is part of an SCC pair, None otherwise
+    """
+    instr = block.instructions[idx]
+    opcode = instr.opcode.lower()
+    
+    # Case 1: idx is an SCC reader - find the writer above
+    if is_scc_reader(opcode):
+        writer_idx = find_scc_writer_for_reader(block, idx)
+        if writer_idx >= 0:
+            return (writer_idx, idx)
+        return None
+    
+    # Case 2: idx might be between a writer and reader, or is a writer itself
+    # Search forwards to find an SCC reader that uses this writer
+    if is_scc_writer(opcode):
+        # Search forward for an SCC reader (up to max_distance)
+        max_distance = 20
+        for search_idx in range(idx + 1, min(len(block.instructions), idx + max_distance)):
+            search_instr = block.instructions[search_idx]
+            search_opcode = search_instr.opcode.lower()
+            
+            if is_scc_reader(search_opcode):
+                # Found an SCC reader - verify it's paired with this writer
+                writer_idx = find_scc_writer_for_reader(block, search_idx)
+                if writer_idx == idx:
+                    return (idx, search_idx)
+                # Found a reader paired with a different writer
+                return None
+            
+            # If we encounter another SCC writer, this one doesn't have a reader
+            if is_scc_writer(search_opcode):
+                return None
+    
+    # Case 3: idx might be between a writer and reader
+    # Search backwards for a writer, then verify there's a reader
+    for writer_search_idx in range(idx - 1, max(0, idx - 20) - 1, -1):
+        writer_instr = block.instructions[writer_search_idx]
+        writer_opcode = writer_instr.opcode.lower()
+        
+        if is_scc_writer(writer_opcode):
+            # Found a potential writer - search forward for its reader
+            for reader_search_idx in range(writer_search_idx + 1, min(len(block.instructions), writer_search_idx + 20)):
+                reader_instr = block.instructions[reader_search_idx]
+                reader_opcode = reader_instr.opcode.lower()
+                
+                if is_scc_reader(reader_opcode):
+                    # Found a reader - verify it uses this writer
+                    actual_writer = find_scc_writer_for_reader(block, reader_search_idx)
+                    if actual_writer == writer_search_idx and writer_search_idx <= idx <= reader_search_idx:
+                        return (writer_search_idx, reader_search_idx)
+                    break
+                
+                if is_scc_writer(reader_opcode):
+                    # Another writer before finding reader - original writer has no reader
+                    break
+            break
+        
+        if is_scc_reader(writer_opcode):
+            # Found an SCC reader before finding a writer - idx is not in a pair
+            break
+    
+    return None
+
+
 def get_instructions_between_pair(block: BasicBlock, pair_start: int, pair_end: int) -> List[int]:
     """
     Get indices of instructions between pair_start and pair_end (exclusive).
@@ -1714,6 +1857,149 @@ class MoveInstructionPass(Pass):
             return True
         return False
     
+    def _can_skip_scc_pair(
+        self,
+        block: BasicBlock,
+        target_instr: Instruction,
+        pair_start: int,
+        pair_end: int
+    ) -> bool:
+        """
+        Check if target instruction can skip over an SCC pair without conflicts.
+        
+        An SCC pair [pair_start, pair_end] consists of:
+        - pair_start: SCC writer (e.g., s_add_u32, s_cmp_*)
+        - pair_end: SCC reader (e.g., s_addc_u32, s_cselect_*, s_cbranch_scc*)
+        - Any instructions in between (that don't affect SCC)
+        
+        The target can skip the pair if:
+        1. Target doesn't read SCC (otherwise it would read wrong SCC value)
+        2. No data dependencies exist between target and any instruction in the pair
+        3. No protected instructions in the pair
+        
+        Args:
+            block: The basic block
+            target_instr: The instruction trying to skip the pair
+            pair_start: Start index of the SCC pair (writer)
+            pair_end: End index of the SCC pair (reader)
+            
+        Returns:
+            True if target can safely skip the entire SCC pair
+        """
+        target_defs, target_uses = get_instruction_defs_uses(target_instr)
+        target_opcode = target_instr.opcode.lower()
+        
+        # Rule 1: Target must not read SCC (would read wrong value after skip)
+        if is_scc_reader(target_opcode):
+            return False
+        
+        # Check each instruction in the SCC pair range
+        for idx in range(pair_start, pair_end + 1):
+            pair_instr = block.instructions[idx]
+            
+            # Check if instruction is protected
+            if pair_instr in self.protected_instructions:
+                return False
+            
+            # Check for boundary/branch instructions
+            pair_opcode = pair_instr.opcode.lower()
+            if self._is_boundary_instruction(pair_opcode):
+                return False
+            if pair_instr.is_branch or pair_instr.is_terminator:
+                return False
+            
+            pair_defs, pair_uses = get_instruction_defs_uses(pair_instr)
+            
+            # Rule 2: No RAW dependency (target reads what pair writes, excluding SCC)
+            raw_conflicts = pair_defs & target_uses
+            if raw_conflicts:
+                # SCC conflict is OK if target doesn't read SCC (already checked above)
+                if raw_conflicts != {'scc'}:
+                    return False
+            
+            # Rule 3: No WAR dependency (target writes what pair reads, excluding SCC)
+            war_conflicts = target_defs & pair_uses
+            if war_conflicts:
+                # SCC conflict is OK if target only writes SCC
+                if not (war_conflicts == {'scc'} and is_scc_only_writer(target_opcode)):
+                    return False
+            
+            # Rule 4: WAW conflicts are generally OK (can be traversed)
+            # But we should be careful with non-SCC WAW
+            waw_conflicts = target_defs & pair_defs
+            if waw_conflicts and waw_conflicts != {'scc'}:
+                return False
+        
+        return True
+    
+    def _can_skip_scc_pair_down(
+        self,
+        block: BasicBlock,
+        target_instr: Instruction,
+        target_idx: int,
+        pair_start: int,
+        pair_end: int
+    ) -> bool:
+        """
+        Check if target instruction can skip over an SCC pair when moving DOWN.
+        
+        Similar to _can_skip_scc_pair but checks for downward movement constraints.
+        
+        Args:
+            block: The basic block
+            target_instr: The instruction trying to skip the pair
+            target_idx: Current index of the target instruction
+            pair_start: Start index of the SCC pair (writer)
+            pair_end: End index of the SCC pair (reader)
+            
+        Returns:
+            True if target can safely skip the entire SCC pair
+        """
+        target_defs, target_uses = get_instruction_defs_uses(target_instr)
+        target_opcode = target_instr.opcode.lower()
+        
+        # Rule 1: Target must not read SCC (would read wrong value after skip)
+        if is_scc_reader(target_opcode):
+            return False
+        
+        # Check each instruction in the SCC pair range
+        for idx in range(pair_start, pair_end + 1):
+            pair_instr = block.instructions[idx]
+            
+            # Check if instruction is protected
+            if pair_instr in self.protected_instructions:
+                return False
+            
+            # Check for boundary/branch instructions
+            pair_opcode = pair_instr.opcode.lower()
+            if self._is_boundary_instruction(pair_opcode):
+                return False
+            if pair_instr.is_branch or pair_instr.is_terminator:
+                return False
+            
+            pair_defs, pair_uses = get_instruction_defs_uses(pair_instr)
+            
+            # Rule 2: For downward movement, check reversed dependencies
+            # RAW: pair reads what target writes -> stop
+            raw_conflicts = target_defs & pair_uses
+            if raw_conflicts:
+                if not (raw_conflicts == {'scc'} and not is_scc_reader(pair_opcode)):
+                    return False
+            
+            # Rule 3: WAR: pair writes what target reads -> stop
+            war_conflicts = pair_defs & target_uses
+            if war_conflicts:
+                if not (war_conflicts == {'scc'} and is_scc_only_writer(pair_opcode)):
+                    return False
+            
+            # Rule 4: WAW conflicts - generally OK but be careful
+            waw_conflicts = target_defs & pair_defs
+            if waw_conflicts and waw_conflicts != {'scc'}:
+                # For safety, block on non-SCC WAW
+                return False
+        
+        return True
+    
     def _can_move_single_instruction_down(
         self,
         block: BasicBlock,
@@ -1757,6 +2043,28 @@ class MoveInstructionPass(Pass):
             instr_b = block.instructions[check_idx]
             defs_b, uses_b = get_instruction_defs_uses(instr_b)
             opcode_b = instr_b.opcode.lower()
+            
+            # CRITICAL: Check if B is the SCC writer of a pair (e.g., s_add_u32)
+            # and its reader is below. If A moves down past B, it would enter the pair.
+            if is_scc_pair_writer(opcode_b):
+                # Check if there's a reader below that pairs with this writer
+                pair_end_idx = -1
+                for search_idx in range(check_idx + 1, min(len(block.instructions), check_idx + 20)):
+                    search_opcode = block.instructions[search_idx].opcode.lower()
+                    if is_scc_pair_reader(search_opcode):
+                        # Verify this reader pairs with B
+                        found_writer = find_scc_pair_start(block, search_idx)
+                        if found_writer == check_idx:
+                            pair_end_idx = search_idx
+                            break
+                        break
+                    if is_scc_writer(search_opcode):
+                        break
+                
+                if pair_end_idx > check_idx:
+                    # B is part of a valid SCC pair [check_idx, pair_end_idx]
+                    # A cannot move past B because it would enter the pair
+                    return False
             
             # Boundary instruction check: cannot cross branch/saveexec
             if self._is_boundary_instruction(opcode_b):
@@ -1871,6 +2179,20 @@ class MoveInstructionPass(Pass):
             instr_b = block.instructions[check_idx]
             defs_b, uses_b = get_instruction_defs_uses(instr_b)
             opcode_b = instr_b.opcode.lower()
+            
+            # CRITICAL: Check if B is the SCC reader of a pair (e.g., s_addc_u32)
+            # and A is not part of the same pair. If so, A cannot move past B
+            # because it would enter the SCC pair and corrupt the dependency.
+            if is_scc_pair_reader(opcode_b):
+                # Find the SCC writer for this reader
+                pair_start = find_scc_pair_start(block, check_idx)
+                if pair_start >= 0:
+                    # B is part of a valid SCC pair [pair_start, check_idx]
+                    # A (at from_idx) is trying to move up past B
+                    # After the swap, A would be at check_idx and B at check_idx+1
+                    # This would put A inside the pair if pair_start < check_idx
+                    # We must block this to preserve the SCC pair integrity
+                    return False
             
             # Boundary instruction check: cannot cross branch/saveexec
             if self._is_boundary_instruction(opcode_b):
@@ -2265,6 +2587,44 @@ class MoveInstructionPass(Pass):
                 self._blocked_by_dependencies.add(id(aab1_instr))
                 break
             
+            # Check if AAB1 is part of an SCC pair - if so, treat the entire pair as atomic
+            scc_pair_range = get_scc_pair_range(block, aab1_idx)
+            if scc_pair_range is not None:
+                pair_start, pair_end = scc_pair_range
+                # Target is trying to move past an SCC pair - need to skip the entire pair
+                # Check if target instruction can skip the entire pair without conflicts
+                if not self._can_skip_scc_pair(block, target_instr, pair_start, pair_end):
+                    self._blocked_by_dependencies.add(id(aab1_instr))
+                    if self.verbose:
+                        print(f"    Blocked by SCC pair [{pair_start}]-[{pair_end}]")
+                    break
+                
+                # Move target past the entire SCC pair
+                pair_cycles = sum(get_instr_cycles(block.instructions[i]) for i in range(pair_start, pair_end + 1))
+                
+                # Overshoot prevention
+                error_if_stop = cycles_to_move - self._total_cycles_moved
+                error_if_move = abs(cycles_to_move - (self._total_cycles_moved + pair_cycles))
+                
+                if error_if_move > error_if_stop:
+                    if self.verbose:
+                        print(f"    Overshoot prevention: stop at error={error_if_stop}, skip SCC pair would give error={error_if_move}")
+                    break
+                
+                # Move target past the entire SCC pair
+                for i in range(pair_end - pair_start + 1):
+                    current_target_idx = self._find_instruction_index(block, target_instr)
+                    if current_target_idx <= pair_start:
+                        break
+                    self._move_single_instruction_up_impl(block, ddg, current_target_idx, current_target_idx - 1)
+                
+                self._total_cycles_moved += pair_cycles
+                any_moved = True
+                
+                if self.verbose:
+                    print(f"    Skipped SCC pair [{pair_start}]-[{pair_end}] (+{pair_cycles} cycles)")
+                continue
+            
             # Get registers for AAB1
             aab1_defs, aab1_uses = get_instruction_defs_uses(aab1_instr)
             
@@ -2360,6 +2720,15 @@ class MoveInstructionPass(Pass):
         
         # Cannot move if at the beginning or in frozen region
         if instr_idx <= 0 or instr_idx <= self.frozen_boundary:
+            return False
+        
+        # IMPORTANT: If this instruction is part of an SCC pair, we cannot move it independently
+        # The SCC pair must be kept together as an atomic unit
+        scc_pair_range = get_scc_pair_range(block, instr_idx)
+        if scc_pair_range is not None:
+            # If this is the SCC reader (end of pair), don't move it without the writer
+            # If this is the SCC writer (start of pair), don't move it without the reader
+            # For simplicity, disallow independent movement of any instruction in an SCC pair
             return False
         
         # Get instruction above
@@ -2494,6 +2863,44 @@ class MoveInstructionPass(Pass):
             if aaf1_instr in self.protected_instructions:
                 self._blocked_by_dependencies.add(id(aaf1_instr))
                 break
+            
+            # Check if AAF1 is part of an SCC pair - if so, treat the entire pair as atomic
+            scc_pair_range = get_scc_pair_range(block, aaf1_idx)
+            if scc_pair_range is not None:
+                pair_start, pair_end = scc_pair_range
+                # Target is trying to move past an SCC pair - need to skip the entire pair
+                # For downward movement, we need to check if target can skip the pair
+                if not self._can_skip_scc_pair_down(block, target_instr, target_idx, pair_start, pair_end):
+                    self._blocked_by_dependencies.add(id(aaf1_instr))
+                    if self.verbose:
+                        print(f"    Blocked by SCC pair [{pair_start}]-[{pair_end}]")
+                    break
+                
+                # Calculate cycles for the entire pair
+                pair_cycles = sum(get_instr_cycles(block.instructions[i]) for i in range(pair_start, pair_end + 1))
+                
+                # Overshoot prevention
+                error_if_stop = cycles_to_move - self._total_cycles_moved
+                error_if_move = abs(cycles_to_move - (self._total_cycles_moved + pair_cycles))
+                
+                if error_if_move > error_if_stop:
+                    if self.verbose:
+                        print(f"    Overshoot prevention: stop at error={error_if_stop}, skip SCC pair would give error={error_if_move}")
+                    break
+                
+                # Move target past the entire SCC pair
+                for i in range(pair_end - pair_start + 1):
+                    current_target_idx = self._find_instruction_index(block, target_instr)
+                    if current_target_idx > pair_end:
+                        break
+                    self._move_single_instruction_down_impl(block, ddg, current_target_idx, current_target_idx + 1)
+                
+                self._total_cycles_moved += pair_cycles
+                any_moved = True
+                
+                if self.verbose:
+                    print(f"    Skipped SCC pair [{pair_start}]-[{pair_end}] (+{pair_cycles} cycles)")
+                continue
             
             # Get registers for AAF1
             aaf1_defs, aaf1_uses = get_instruction_defs_uses(aaf1_instr)
@@ -3183,6 +3590,7 @@ class DistributeStepExecutor:
         # START cycle = cumulative cycles BEFORE the instruction
         current_cycle = self.get_start_cycle(self.ctx.block, current_idx)
         ideal_cycle = self.ctx.ideal_cycles[step_num]
+        target_cycle = self.get_start_cycle(self.ctx.block, target_idx)
         
         # Use the same calculation as _move_instruction_toward:
         # cycles_to_move = current_cycle - ideal_cycle
@@ -3194,6 +3602,7 @@ class DistributeStepExecutor:
             "current_idx": current_idx,
             "target_idx": target_idx,
             "current_cycle": current_cycle,
+            "target_cycle": target_cycle,
             "ideal_cycle": ideal_cycle,
             "cycles_to_move": cycles_to_move
         }
