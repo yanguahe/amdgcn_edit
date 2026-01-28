@@ -204,16 +204,14 @@ def load_pass_list(pass_list_path: str) -> list:
                 'type': 'move',
                 'block': pass_config['block'],
                 'index': pass_config['index'],
-                'cycles': pass_config['cycles'],
-                'is_move_s_barrier': pass_config.get('is_move_s_barrier', False)
+                'cycles': pass_config['cycles']
             })
         elif pass_type == 'distribute':
             passes.append({
                 'type': 'distribute',
                 'block': pass_config['block'],
                 'opcode': pass_config['opcode'],
-                'k': pass_config['k'],
-                'is_move_s_barrier': pass_config.get('is_move_s_barrier', False)
+                'k': pass_config['k']
             })
         elif pass_type == 'replace_registers':
             passes.append({
@@ -271,7 +269,6 @@ class PassListDebugger:
         self.ideal_cycles = []
         self.frozen_boundary = 0
         self.protected_instructions = []
-        self.is_move_s_barrier = False
         
     def log(self, msg, force=False):
         """Print message if verbose or forced."""
@@ -366,8 +363,7 @@ class PassListDebugger:
                     block_label=pass_config['block'],
                     instr_index=pass_config['index'],
                     cycles=pass_config['cycles'],
-                    verbose=self.verbose,
-                    is_move_s_barrier=pass_config.get('is_move_s_barrier', False)
+                    verbose=self.verbose
                 )
                 move_pass.run(self.result)
                 return True, None
@@ -377,8 +373,7 @@ class PassListDebugger:
                     block_label=pass_config['block'],
                     target_opcode=pass_config['opcode'],
                     distribute_count=pass_config['k'],
-                    verbose=self.verbose,
-                    is_move_s_barrier=pass_config.get('is_move_s_barrier', False)
+                    verbose=self.verbose
                 )
                 dist_pass.run(self.result)
                 return True, None
@@ -415,15 +410,13 @@ class PassListDebugger:
         self.block_label = pass_config['block']
         self.target_opcode = pass_config['opcode']
         self.K = pass_config['k']
-        self.is_move_s_barrier = pass_config.get('is_move_s_barrier', False)
         
         # Use DistributeStepExecutor.create_context for consistent setup
         self.distribute_ctx = DistributeStepExecutor.create_context(
             self.result,
             self.block_label,
             self.target_opcode,
-            self.K,
-            self.is_move_s_barrier
+            self.K
         )
         
         if self.distribute_ctx is None:
@@ -516,10 +509,16 @@ class PassListDebugger:
         # Use result.ddgs (same as DistributeInstructionPass.run()) for consistent verification
         original_gdg = build_global_ddg(self.result.cfg, self.result.ddgs)
         
+        # Get the correct execution order (matches DistributeInstructionPass.run() two-phase strategy)
+        # Phase 1: UP moves (forward order), Phase 2: DOWN moves (reverse order)
+        execution_order = self.distribute_executor.get_execution_order()
+        print(f"Execution order (two-phase): {execution_order}")
+        
         # Apply steps before start_step without testing
         if start_step > 0:
             print(f"\nSkipping steps 1-{start_step} (applying without testing)...")
-            for step in range(start_step):
+            for order_idx in range(start_step):
+                step = execution_order[order_idx]
                 self.apply_distribute_step(step)
         
         # Save baseline state
@@ -534,11 +533,12 @@ class PassListDebugger:
                 return 0
             print("✓ Baseline passes")
         
-        # Test each remaining step
-        for step in range(start_step, self.K):
-            step_path = os.path.join(self.output_dir, f"pass{pass_idx}_step{step + 1:02d}.amdgcn")
+        # Test each remaining step using the correct execution order
+        for order_idx in range(start_step, self.K):
+            step = execution_order[order_idx]
+            step_path = os.path.join(self.output_dir, f"pass{pass_idx}_step{order_idx + 1:02d}.amdgcn")
             
-            print(f"\nStep {step + 1}/{self.K}:", end=" ")
+            print(f"\nStep {order_idx + 1}/{self.K} (instruction {step}):", end=" ")
             
             # Apply the step and catch any verification errors from MoveInstructionPass.run()
             try:
@@ -546,10 +546,10 @@ class PassListDebugger:
             except SchedulingVerificationError as e:
                 print("✗ VERIFICATION FAILED (during move)")
                 print(f"\n{'=' * 60}")
-                print(f"FOUND: Step {step + 1} of pass {pass_idx} caused verification to fail!")
+                print(f"FOUND: Step {order_idx + 1} (instruction {step}) of pass {pass_idx} caused verification to fail!")
                 print(f"{'=' * 60}")
                 print(f"Error: {e}")
-                return step + 1
+                return order_idx + 1
             
             # Additional verification after this step (in case apply_distribute_step doesn't use MoveInstructionPass)
             print("Verifying...", end=" ", flush=True)
@@ -559,10 +559,10 @@ class PassListDebugger:
             except SchedulingVerificationError as e:
                 print("✗ VERIFICATION FAILED")
                 print(f"\n{'=' * 60}")
-                print(f"FOUND: Step {step + 1} of pass {pass_idx} caused verification to fail!")
+                print(f"FOUND: Step {order_idx + 1} (instruction {step}) of pass {pass_idx} caused verification to fail!")
                 print(f"{'=' * 60}")
                 print(f"Error: {e}")
-                return step + 1
+                return order_idx + 1
             
             # Also run custom test if not skipped
             if not self.skip_test:
@@ -570,7 +570,7 @@ class PassListDebugger:
                 success, output = self.run_test(step_path)
                 if not success:
                     print("✗ TEST FAIL")
-                    return step + 1
+                    return order_idx + 1
                 print("✓")
         
         print(f"\nAll {self.K} steps passed verification!")
@@ -578,14 +578,17 @@ class PassListDebugger:
     
     def level2_distribute_debug(self, pass_idx: int, failing_step: int, start_move: int = 0) -> dict:
         """
-        Level 2: Test each individual instruction move within a failing step.
+        Level 2: Test the failing step using same mechanism as Level 1.
         
-        Performs verification after each move to detect scheduling errors.
+        NOTE: The MoveInstructionPass chain-based logic cannot be easily broken into
+        independent small moves. Level 2 now uses execute_step (same as Level 1) to
+        ensure identical behavior and file output.
+        
+        The final file from Level 2 should be identical to Level 1's step file.
+        If they differ, there's a bug in the execution flow.
         """
         print("\n" + "=" * 60)
         print(f"LEVEL 2: Detailed analysis of Pass {pass_idx}, Step {failing_step}")
-        if start_move > 0:
-            print(f"         Starting from move #{start_move}")
         print("=" * 60)
         
         # Reset and reload
@@ -605,7 +608,6 @@ class PassListDebugger:
             return {"error": "setup_failed"}
         
         # Build original GDG for verification (before any moves in this step)
-        # Use result.ddgs (same as DistributeInstructionPass.run()) for consistent verification
         original_gdg = build_global_ddg(self.result.cfg, self.result.ddgs)
         
         # Apply steps before the failing step
@@ -618,15 +620,12 @@ class PassListDebugger:
         baseline_path = os.path.join(self.output_dir, f"pass{pass_idx}_level2_step{failing_step}_baseline.amdgcn")
         save_amdgcn(self.result, baseline_path, self.block_label)
         
-        if start_move == 0:
-            print(f"\nVerifying baseline (before step {failing_step})...")
-            success, _ = self.run_test(baseline_path)
-            if not success:
-                print("ERROR: Baseline before failing step already fails!")
-                return {"error": "baseline_fails"}
-            print("✓ Baseline passes")
-        else:
-            print(f"\nSkipping baseline test (starting from move #{start_move})")
+        print(f"\nVerifying baseline (before step {failing_step})...")
+        success, _ = self.run_test(baseline_path)
+        if not success:
+            print("ERROR: Baseline before failing step already fails!")
+            return {"error": "baseline_fails"}
+        print("✓ Baseline passes")
         
         # Get details for the failing step using executor
         step_num = failing_step - 1  # Convert to 0-indexed
@@ -634,133 +633,90 @@ class PassListDebugger:
         # Sync frozen boundary with executor
         self.distribute_executor.frozen_boundary = self.frozen_boundary
         
-        # Use executor to get step parameters (ensures consistency with apply_distribute_step)
+        # Use executor to get step parameters
         params = self.distribute_executor.get_step_params(step_num)
         
         current_idx = params['current_idx']
-        target_idx = params['target_idx']
         current_cycle = params['current_cycle']
         target_cycle = params['target_cycle']
         cycles_to_move = params['cycles_to_move']
-        
-        target_instr = self.block.instructions[current_idx]
-        
-        # Calculate protected_instructions for level2 (same as apply_distribute_step)
-        level2_protected = self.all_target_instrs[failing_step:]  # step_num = failing_step - 1, so [step_num + 1:] = [failing_step:]
         
         print(f"\nStep {failing_step} details:")
         print(f"  Target instruction: {self.target_opcode} at idx={current_idx}")
         print(f"  Current cycle: {current_cycle}, Target cycle: {target_cycle}")
         print(f"  Cycles to move: {cycles_to_move} ({'UP' if cycles_to_move > 0 else 'DOWN'})")
         
-        if start_move > 0:
-            print(f"\nApplying moves 1-{start_move} without testing...")
-        print(f"\nTesting individual moves (with verification after each move)...")
+        print(f"\nExecuting step {failing_step} using same method as Level 1...")
         
-        move_count = 0
-        total_cycles_moved = 0
+        # Use execute_step (same as Level 1) for identical behavior
+        try:
+            result = self.distribute_executor.execute_step(step_num)
+        except SchedulingVerificationError as e:
+            print(f"✗ VERIFICATION FAILED")
+            print(f"\n{'=' * 60}")
+            print(f"FOUND: Step {failing_step} of Pass {pass_idx} caused verification to fail!")
+            print(f"{'=' * 60}")
+            print(f"Error: {e}")
+            
+            # Save the failing state
+            step_path = os.path.join(self.output_dir, f"pass{pass_idx}_level2_step{failing_step}_final_FAILED.amdgcn")
+            save_amdgcn(self.result, step_path, self.block_label)
+            
+            return {
+                "pass_idx": pass_idx,
+                "failing_step": failing_step,
+                "passing_file": baseline_path,
+                "failing_file": step_path,
+                "error": str(e)
+            }
         
-        while total_cycles_moved < abs(cycles_to_move):
-            # Find current position of target
-            target_idx = -1
-            for idx, instr in enumerate(self.block.instructions):
-                if instr is target_instr:
-                    target_idx = idx
-                    break
-            
-            if target_idx < 0:
-                print(f"  Cannot find target instruction")
-                break
-            
-            # Move just 4 cycles (one instruction typically)
-            small_move = -4 if cycles_to_move < 0 else 4
-            
-            move_pass = MoveInstructionPass(
-                self.block_label,
-                target_idx,
-                small_move,
-                verbose=False,
-                frozen_boundary=self.frozen_boundary,
-                protected_instructions=level2_protected,  # Use same protected list as apply_distribute_step
-                is_move_s_barrier=self.is_move_s_barrier
-            )
-            
-            # Try to run the move - MoveInstructionPass.run() calls verify_optimization internally
-            try:
-                success = move_pass.run(self.result)
-            except SchedulingVerificationError as e:
-                # Move caused verification failure!
-                move_count += 1
-                print(f"\n  [{move_count}] ✗ VERIFICATION FAILED")
+        # Sync frozen boundary back
+        self.frozen_boundary = self.distribute_executor.frozen_boundary
+        
+        # Save the final state
+        final_path = os.path.join(self.output_dir, f"pass{pass_idx}_level2_step{failing_step}_final.amdgcn")
+        save_amdgcn(self.result, final_path, self.block_label)
+        
+        print(f"  Cycles moved: {result.cycles_moved}")
+        print(f"AMDGCN file saved to: {final_path}")
+        
+        # Run test on the final file
+        if not self.skip_test:
+            print(f"\nTesting final step result...")
+            test_success, output = self.run_test(final_path)
+            if not test_success:
+                print(f"✗ TEST FAIL")
                 print(f"\n{'=' * 60}")
-                print(f"FOUND: Move #{move_count} in Step {failing_step} of Pass {pass_idx} caused verification to fail!")
+                print(f"FOUND: Step {failing_step} of Pass {pass_idx} caused the test to fail!")
                 print(f"{'=' * 60}")
-                print(f"Error: {e}")
-                
-                # Save the failing state
-                step_path = os.path.join(self.output_dir, f"pass{pass_idx}_level2_step{failing_step}_move{move_count:03d}_FAILED.amdgcn")
-                save_amdgcn(self.result, step_path, self.block_label)
-                
-                if move_count > 1:
-                    prev_path = os.path.join(self.output_dir, f"pass{pass_idx}_level2_step{failing_step}_move{move_count - 1:03d}.amdgcn")
-                else:
-                    prev_path = baseline_path
                 
                 return {
                     "pass_idx": pass_idx,
                     "failing_step": failing_step,
-                    "failing_move": move_count,
-                    "total_cycles_moved": total_cycles_moved,
-                    "passing_file": prev_path,
-                    "failing_file": step_path,
-                    "error": str(e)
+                    "passing_file": baseline_path,
+                    "failing_file": final_path,
                 }
-            
-            if not success or move_pass.total_cycles_moved == 0:
-                print(f"  Move blocked after {move_count} moves, {total_cycles_moved} cycles")
-                break
-            
-            move_count += 1
-            total_cycles_moved += move_pass.total_cycles_moved
-            
-            # Save this state
-            step_path = os.path.join(self.output_dir, f"pass{pass_idx}_level2_step{failing_step}_move{move_count:03d}.amdgcn")
-            save_amdgcn(self.result, step_path, self.block_label)
-            
-            # Skip testing for moves before start_move
-            if move_count < start_move:
-                print(f"  [{move_count}] +{move_pass.total_cycles_moved} cycles (total={total_cycles_moved}/{abs(cycles_to_move)}) [skipped]")
-                continue
-            
-            print(f"  [{move_count}] +{move_pass.total_cycles_moved} cycles (total={total_cycles_moved}/{abs(cycles_to_move)}) ✓")
-            
-            # Also run custom test if not skipped
-            if not self.skip_test:
-                test_success, output = self.run_test(step_path)
-                if not test_success:
-                    print(f"    ✗ TEST FAIL")
-                    
-                    # Get the previous file for diff
-                    if move_count > 1:
-                        prev_path = os.path.join(self.output_dir, f"pass{pass_idx}_level2_step{failing_step}_move{move_count - 1:03d}.amdgcn")
-                    else:
-                        prev_path = baseline_path
-                    
-                    print(f"\n{'=' * 60}")
-                    print(f"FOUND: Move #{move_count} in Step {failing_step} of Pass {pass_idx} caused the test to fail!")
-                    print(f"{'=' * 60}")
-                    
-                    return {
-                        "pass_idx": pass_idx,
-                        "failing_step": failing_step,
-                        "failing_move": move_count,
-                        "total_cycles_moved": total_cycles_moved,
-                        "passing_file": prev_path,
-                        "failing_file": step_path,
-                    }
+            else:
+                print("✓ Test passed")
         
-        print(f"\nAll {move_count} moves completed without verification failure.")
-        return {"success": True, "total_moves": move_count}
+        # Compare with Level 1's output to ensure consistency
+        level1_path = os.path.join(self.output_dir, f"pass{pass_idx}_step{failing_step:02d}.amdgcn")
+        if os.path.exists(level1_path):
+            import subprocess
+            diff_result = subprocess.run(
+                ['diff', '-q', level1_path, final_path],
+                capture_output=True, text=True
+            )
+            if diff_result.returncode == 0:
+                print(f"\n✓ Level 2 output is IDENTICAL to Level 1 ({level1_path})")
+            else:
+                print(f"\n⚠ WARNING: Level 2 output DIFFERS from Level 1!")
+                print(f"  Level 1 file: {level1_path}")
+                print(f"  Level 2 file: {final_path}")
+                print(f"  Run 'diff {level1_path} {final_path}' to see differences")
+        
+        print(f"\nStep {failing_step} completed successfully.")
+        return {"success": True, "cycles_moved": result.cycles_moved}
     
     def run_distribute_detail_debug(self, pass_idx: int):
         """Run two-level debug for a specific distribute pass."""
@@ -987,9 +943,6 @@ class DistributeDebugger:
         self.verbose = args.verbose
         self.test_cmd = args.test_cmd
         
-        # Use is_move_s_barrier instead of barrier_crossing_opcodes
-        self.is_move_s_barrier = getattr(args, 'is_move_s_barrier', False)
-        
         self.skip_test = args.skip_test
         
         self.result = None
@@ -1150,8 +1103,7 @@ class DistributeDebugger:
                 cycles_to_move,
                 verbose=False,
                 frozen_boundary=self.frozen_boundary,
-                protected_instructions=self.protected_instructions,
-                is_move_s_barrier=self.is_move_s_barrier
+                protected_instructions=self.protected_instructions
             )
             move_pass.run(self.result)
             
@@ -1281,8 +1233,7 @@ class DistributeDebugger:
                 small_move,
                 verbose=False,
                 frozen_boundary=self.frozen_boundary,
-                protected_instructions=self.protected_instructions,
-                is_move_s_barrier=self.is_move_s_barrier
+                protected_instructions=self.protected_instructions
             )
             success = move_pass.run(self.result)
             

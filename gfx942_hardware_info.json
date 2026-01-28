@@ -398,8 +398,8 @@
       "buffer_load_*": 4,
       "buffer_store_*": 4,
       "s_load_*": 4,
-      "s_waitcnt": 1,
-      "s_barrier": 1,
+      "s_waitcnt": 4,
+      "s_barrier": 4,
       "s_nop": 1
     },
     "default": 4

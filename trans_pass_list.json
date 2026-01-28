@@ -2,8 +2,8 @@
   {
     "type": "replace_registers",
     "range_start": 1,
-    "range_end": 534,
-    "registers": ["v[40:51]"],
+    "range_end": 396,
+    "registers": ["v[36:43]"],
     "alignments": [2],
     "target_opcodes": ["v_lshl_add_u64", "global_load_dwordx4"]
   },
@@ -12,12 +12,29 @@
     "type": "distribute",
     "block": ".LBB0_2",
     "opcode": "global_load_dwordx4",
-    "k": 16,
+    "k": 8,
     "is_move_s_barrier": true
   },
 
+  {
+    "type": "replace_registers",
+    "range_start": 679,
+    "range_end": 772,
+    "registers": ["v[46:47]", "v[128:131]"],
+    "alignments": [2, 2],
+    "target_opcodes": ["v_lshl_add_u64", "global_load_dwordx4"]
+  },
 
+  {
+    "type": "distribute",
+    "block": ".LBB0_10",
+    "opcode": "global_load_dwordx4",
+    "k": 8,
+    "is_move_s_barrier": true
+  },
 
   {
   }
 ]
+
+

@@ -1517,6 +1517,32 @@ def get_instruction_cycles(opcode: str, hw_info: Optional[HardwareInfo] = None) 
     return result
 
 
+def get_instr_cycles(instr) -> int:
+    """
+    Get cycles for an instruction, with special handling for s_nop.
+    s_nop N provides N+1 cycles of delay.
+    
+    Args:
+        instr: The Instruction object (must have opcode and operands attributes)
+        
+    Returns:
+        Number of cycles for the instruction
+    """
+    opcode = instr.opcode.lower()
+    if opcode == 's_nop':
+        try:
+            operand = instr.operands.strip()
+            if operand.isdigit():
+                return int(operand) + 1
+            # Handle hex format (e.g., 0x0)
+            if operand.startswith('0x'):
+                return int(operand, 16) + 1
+            return 1
+        except:
+            return 1
+    return get_instruction_cycles(opcode)
+
+
 # =============================================================================
 # Utility Functions
 # =============================================================================
