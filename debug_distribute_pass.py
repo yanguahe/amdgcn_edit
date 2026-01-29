@@ -80,7 +80,7 @@ from amdgcn_passes import (
     get_instruction_cycles, sync_instruction_to_raw_lines,
     # New modular interfaces
     MoveExecutor, DistributeStepExecutor, RegisterReplaceExecutor,
-    StepResult, SingleMoveInfo, DistributeContext, RegisterReplaceContext
+    StepResult, SingleMoveInfo, MoveYieldInfo, DistributeContext, RegisterReplaceContext
 )
 from amdgcn_verify import build_global_ddg, verify_optimization, SchedulingVerificationError
 from amdgcn_cfg import BasicBlock, Instruction, CFG
@@ -578,14 +578,20 @@ class PassListDebugger:
     
     def level2_distribute_debug(self, pass_idx: int, failing_step: int, start_move: int = 0) -> dict:
         """
-        Level 2: Test the failing step using same mechanism as Level 1.
+        Level 2: Test each logical move unit within a step.
         
-        NOTE: The MoveInstructionPass chain-based logic cannot be easily broken into
-        independent small moves. Level 2 now uses execute_step (same as Level 1) to
-        ensure identical behavior and file output.
+        Uses MoveInstructionPass.iter_moves() via DistributeStepExecutor.execute_step_with_iter()
+        to get fine-grained control, testing after each logical move unit
+        (normal swap, SCC pair skip, or recursive move).
         
-        The final file from Level 2 should be identical to Level 1's step file.
-        If they differ, there's a bug in the execution flow.
+        Args:
+            pass_idx: Index of the distribute pass being debugged
+            failing_step: Execution order position (1-indexed) to debug - this matches
+                         what level1_distribute_debug returns
+            start_move: Skip testing moves before this number (0 = test all)
+            
+        Returns:
+            Dict with debug results including failing_move if found
         """
         print("\n" + "=" * 60)
         print(f"LEVEL 2: Detailed analysis of Pass {pass_idx}, Step {failing_step}")
@@ -607,13 +613,23 @@ class PassListDebugger:
         if not self.setup_distribute_debug(pass_idx):
             return {"error": "setup_failed"}
         
-        # Build original GDG for verification (before any moves in this step)
-        original_gdg = build_global_ddg(self.result.cfg, self.result.ddgs)
+        # Get the correct execution order (matches DistributeInstructionPass.run())
+        execution_order = self.distribute_executor.get_execution_order()
+        print(f"Execution order (two-phase): {execution_order}")
         
-        # Apply steps before the failing step
-        if failing_step > 1:
-            print(f"\nApplying steps 1-{failing_step - 1} (known to pass)...")
-            for step in range(failing_step - 1):
+        # Convert failing_step (1-indexed execution position) to actual step number
+        exec_idx = failing_step - 1  # Convert to 0-indexed
+        if exec_idx >= len(execution_order):
+            return {"error": "invalid_step", "message": f"Step {failing_step} out of range"}
+        
+        actual_step_num = execution_order[exec_idx]
+        print(f"Step {failing_step} in execution order = instruction {actual_step_num}")
+        
+        # Apply steps before the failing step (in execution order)
+        if exec_idx > 0:
+            print(f"\nApplying steps 1-{exec_idx} in execution order (known to pass)...")
+            for order_pos in range(exec_idx):
+                step = execution_order[order_pos]
                 self.apply_distribute_step(step)
         
         # Save baseline state
@@ -621,14 +637,15 @@ class PassListDebugger:
         save_amdgcn(self.result, baseline_path, self.block_label)
         
         print(f"\nVerifying baseline (before step {failing_step})...")
-        success, _ = self.run_test(baseline_path)
-        if not success:
-            print("ERROR: Baseline before failing step already fails!")
-            return {"error": "baseline_fails"}
-        print("✓ Baseline passes")
+        if not self.skip_test:
+            success, _ = self.run_test(baseline_path)
+            if not success:
+                print("ERROR: Baseline before failing step already fails!")
+                return {"error": "baseline_fails"}
+            print("Baseline passes")
         
-        # Get details for the failing step using executor
-        step_num = failing_step - 1  # Convert to 0-indexed
+        # Use actual_step_num (the real step number, not execution order position)
+        step_num = actual_step_num
         
         # Sync frozen boundary with executor
         self.distribute_executor.frozen_boundary = self.frozen_boundary
@@ -646,77 +663,104 @@ class PassListDebugger:
         print(f"  Current cycle: {current_cycle}, Target cycle: {target_cycle}")
         print(f"  Cycles to move: {cycles_to_move} ({'UP' if cycles_to_move > 0 else 'DOWN'})")
         
-        print(f"\nExecuting step {failing_step} using same method as Level 1...")
+        if start_move > 0:
+            print(f"  Starting from move {start_move} (skipping earlier moves)")
         
-        # Use execute_step (same as Level 1) for identical behavior
-        try:
-            result = self.distribute_executor.execute_step(step_num)
-        except SchedulingVerificationError as e:
-            print(f"✗ VERIFICATION FAILED")
-            print(f"\n{'=' * 60}")
-            print(f"FOUND: Step {failing_step} of Pass {pass_idx} caused verification to fail!")
-            print(f"{'=' * 60}")
-            print(f"Error: {e}")
+        print(f"\nExecuting step {failing_step} with per-move testing...")
+        
+        # Track state for callback
+        failing_move_info = [None]  # Use list to allow modification in nested function
+        prev_path = [baseline_path]
+        last_move_path = [None]
+        
+        def on_move(move_info: MoveYieldInfo) -> bool:
+            """Callback for each logical move unit."""
+            # Save current state
+            move_path = os.path.join(
+                self.output_dir,
+                f"pass{pass_idx}_step{failing_step}_move{move_info.move_num:03d}.amdgcn"
+            )
+            save_amdgcn(self.result, move_path, self.block_label)
+            last_move_path[0] = move_path
             
-            # Save the failing state
-            step_path = os.path.join(self.output_dir, f"pass{pass_idx}_level2_step{failing_step}_final_FAILED.amdgcn")
-            save_amdgcn(self.result, step_path, self.block_label)
+            # Print move info
+            print(f"  Move {move_info.move_num}: type={move_info.move_type}, "
+                  f"swaps={move_info.swaps_in_this_move}, "
+                  f"cycles={move_info.cycles_this_move}/{move_info.total_cycles_moved}")
             
-            return {
-                "pass_idx": pass_idx,
-                "failing_step": failing_step,
-                "passing_file": baseline_path,
-                "failing_file": step_path,
-                "error": str(e)
-            }
+            # Skip testing if before start_move
+            if move_info.move_num < start_move:
+                prev_path[0] = move_path
+                return True  # Continue
+            
+            # Run test
+            if not self.skip_test:
+                test_success, _ = self.run_test(move_path)
+                if not test_success:
+                    failing_move_info[0] = move_info
+                    print(f"    FAILED at move {move_info.move_num}")
+                    return False  # Stop iteration
+                print(f"    passed")
+            
+            prev_path[0] = move_path
+            return True  # Continue
+        
+        # Execute step with move-by-move callbacks
+        result = self.distribute_executor.execute_step_with_iter(
+            step_num=step_num,
+            on_move=on_move
+        )
         
         # Sync frozen boundary back
         self.frozen_boundary = self.distribute_executor.frozen_boundary
         
-        # Save the final state
+        # Check if we found a failing move
+        if failing_move_info[0] is not None:
+            move_info = failing_move_info[0]
+            print(f"\n{'=' * 60}")
+            print(f"FOUND: Move {move_info.move_num} of Step {failing_step} (Pass {pass_idx}) failed!")
+            print(f"{'=' * 60}")
+            print(f"  Move type: {move_info.move_type}")
+            print(f"  Swaps in this move: {move_info.swaps_in_this_move}")
+            print(f"  Cycles this move: {move_info.cycles_this_move}")
+            print(f"  Passing file: {prev_path[0]}")
+            print(f"  Failing file: {last_move_path[0]}")
+            print(f"\nTo analyze the diff:")
+            print(f"  diff {prev_path[0]} {last_move_path[0]}")
+            
+            return {
+                "pass_idx": pass_idx,
+                "failing_step": failing_step,
+                "failing_move": move_info.move_num,
+                "move_type": move_info.move_type,
+                "passing_file": prev_path[0],
+                "failing_file": last_move_path[0]
+            }
+        
+        # Save final state
         final_path = os.path.join(self.output_dir, f"pass{pass_idx}_level2_step{failing_step}_final.amdgcn")
         save_amdgcn(self.result, final_path, self.block_label)
         
-        print(f"  Cycles moved: {result.cycles_moved}")
+        print(f"\nStep {failing_step} completed: {result.move_count} moves, {result.cycles_moved} cycles")
         print(f"AMDGCN file saved to: {final_path}")
-        
-        # Run test on the final file
-        if not self.skip_test:
-            print(f"\nTesting final step result...")
-            test_success, output = self.run_test(final_path)
-            if not test_success:
-                print(f"✗ TEST FAIL")
-                print(f"\n{'=' * 60}")
-                print(f"FOUND: Step {failing_step} of Pass {pass_idx} caused the test to fail!")
-                print(f"{'=' * 60}")
-                
-                return {
-                    "pass_idx": pass_idx,
-                    "failing_step": failing_step,
-                    "passing_file": baseline_path,
-                    "failing_file": final_path,
-                }
-            else:
-                print("✓ Test passed")
         
         # Compare with Level 1's output to ensure consistency
         level1_path = os.path.join(self.output_dir, f"pass{pass_idx}_step{failing_step:02d}.amdgcn")
         if os.path.exists(level1_path):
-            import subprocess
             diff_result = subprocess.run(
                 ['diff', '-q', level1_path, final_path],
                 capture_output=True, text=True
             )
             if diff_result.returncode == 0:
-                print(f"\n✓ Level 2 output is IDENTICAL to Level 1 ({level1_path})")
+                print(f"\nLevel 2 output is IDENTICAL to Level 1 ({level1_path})")
             else:
-                print(f"\n⚠ WARNING: Level 2 output DIFFERS from Level 1!")
+                print(f"\nWARNING: Level 2 output DIFFERS from Level 1!")
                 print(f"  Level 1 file: {level1_path}")
                 print(f"  Level 2 file: {final_path}")
                 print(f"  Run 'diff {level1_path} {final_path}' to see differences")
         
-        print(f"\nStep {failing_step} completed successfully.")
-        return {"success": True, "cycles_moved": result.cycles_moved}
+        print(f"\nAll {result.move_count} moves completed without failure.")
+        return {"success": True, "total_moves": result.move_count, "cycles_moved": result.cycles_moved}
     
     def run_distribute_detail_debug(self, pass_idx: int):
         """Run two-level debug for a specific distribute pass."""
@@ -930,385 +974,6 @@ class PassListDebugger:
         return {"success": True, "total_passes": len(self.passes)}
 
 
-class DistributeDebugger:
-    """Two-level debugger for DistributeInstructionPass (legacy mode)."""
-    
-    def __init__(self, args):
-        self.args = args
-        self.source_file = args.source
-        self.output_dir = args.output_dir
-        self.block_label = args.block
-        self.target_opcode = args.opcode
-        self.K = args.count
-        self.verbose = args.verbose
-        self.test_cmd = args.test_cmd
-        
-        self.skip_test = args.skip_test
-        
-        self.result = None
-        self.block = None
-        self.ddg = None
-        self.ideal_cycles = []
-        self.frozen_boundary = 0
-        self.protected_instructions = []
-        
-    def log(self, msg, force=False):
-        """Print message if verbose or forced."""
-        if self.verbose or force:
-            print(msg)
-    
-    def run_test(self, amdgcn_path: str) -> tuple:
-        """
-        Run test with the given amdgcn file.
-        Returns (success: bool, output: str)
-        """
-        # Skip test if --skip-test is set
-        if self.skip_test:
-            return True, "Test skipped (--skip-test)"
-        
-        abs_path = os.path.abspath(amdgcn_path)
-        
-        if self.test_cmd:
-            cmd = self.test_cmd.replace("{FILE}", abs_path)
-            try:
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
-                output = result.stdout + result.stderr
-                # Check keywords first
-                for keyword in FAILURE_KEYWORDS:
-                    if keyword in output:
-                        return False, output
-                # Then check exit code
-                if result.returncode != 0:
-                    return False, f"Process exited with code {result.returncode}\n{output}"
-                return True, output
-            except subprocess.TimeoutExpired:
-                return False, "Test timed out"
-            except Exception as e:
-                return False, str(e)
-        else:
-            env = os.environ.copy()
-            env['TRITON_CACHE_DIR'] = TRITON_CACHE_DIR
-            env['TRITON_OVERRIDE_AMDGCN_FILE'] = abs_path
-            
-            if os.path.exists(TRITON_CACHE_DIR):
-                shutil.rmtree(TRITON_CACHE_DIR)
-            
-            cmd = ['python', TEST_SCRIPT] + TEST_ARGS
-            
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, 
-                                       timeout=TEST_TIMEOUT, env=env, cwd=WORK_DIR)
-                output = result.stdout + result.stderr
-                
-                # Check for failure keywords in output
-                for keyword in FAILURE_KEYWORDS:
-                    if keyword in output:
-                        return False, output
-                
-                # Also check exit code (non-zero indicates failure)
-                if result.returncode != 0:
-                    return False, f"Process exited with code {result.returncode}\n{output}"
-                
-                return True, output
-            except subprocess.TimeoutExpired:
-                return False, "Test timed out"
-            except Exception as e:
-                return False, str(e)
-    
-    def setup(self):
-        """Initialize analysis and calculate ideal positions."""
-        os.makedirs(self.output_dir, exist_ok=True)
-        
-        print(f"Generating analysis from {self.source_file}...")
-        gen_cmd = f"python amdgcn_edit/amdgcn_ddg.py {self.source_file} -o {self.output_dir} --stats --inter-deps --waitcnt-deps --json-only"
-        result = subprocess.run(gen_cmd, shell=True, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"Failed to generate analysis: {result.stderr}")
-            return False
-        
-        json_path = os.path.join(self.output_dir, "analysis.json")
-        print(f"Loading analysis from {json_path}...")
-        self.result = load_analysis_from_json(json_path)
-        
-        self.block = self.result.cfg.blocks.get(self.block_label)
-        self.ddg = self.result.ddgs.get(self.block_label)
-        
-        if not self.block:
-            print(f"ERROR: Block {self.block_label} not found!")
-            return False
-        
-        target_indices = [idx for idx, instr in enumerate(self.block.instructions)
-                        if instr.opcode.lower() == self.target_opcode.lower()]
-        
-        if len(target_indices) < self.K:
-            print(f"WARNING: Only found {len(target_indices)} {self.target_opcode} instructions, requested {self.K}")
-            self.K = len(target_indices)
-        
-        print(f"Found {len(target_indices)} {self.target_opcode} instructions")
-        
-        branch_boundary = len(self.block.instructions)
-        for idx, instr in enumerate(self.block.instructions):
-            if instr.is_branch or instr.is_terminator:
-                branch_boundary = idx
-                break
-        
-        total_cycles = get_cumulative_cycle(self.block, branch_boundary - 1) if branch_boundary > 0 else 0
-        print(f"Block total cycles: {total_cycles}, branch boundary: {branch_boundary}")
-        
-        if self.K > 1:
-            cycle_spacing = total_cycles / self.K
-            self.ideal_cycles = [int(cycle_spacing * (i + 1)) for i in range(self.K)]
-        else:
-            self.ideal_cycles = [total_cycles // 2]
-        
-        print(f"Ideal cycle positions: {self.ideal_cycles[:5]}{'...' if len(self.ideal_cycles) > 5 else ''}")
-        
-        self.frozen_boundary = 0
-        self.protected_instructions = []
-        
-        return True
-    
-    def find_target_instruction_index(self, n: int) -> int:
-        """Find the current index of the n-th target instruction (0-indexed)."""
-        count = 0
-        for idx, instr in enumerate(self.block.instructions):
-            if instr.opcode.lower() == self.target_opcode.lower():
-                if count == n:
-                    return idx
-                count += 1
-        return -1
-    
-    def apply_step(self, step_num: int, save_path: str = None) -> bool:
-        """
-        Apply a single distribution step.
-        Returns True if move was successful.
-        """
-        current_idx = self.find_target_instruction_index(step_num)
-        if current_idx < 0:
-            return False
-        
-        target_instr = self.block.instructions[current_idx]
-        target_cycle = self.ideal_cycles[step_num]
-        current_cycle = get_cumulative_cycle(self.block, current_idx)
-        cycles_to_move = -(current_cycle - target_cycle)
-        
-        self.log(f"  Step {step_num + 1}: idx={current_idx}, cycle={current_cycle} -> {target_cycle}, move={cycles_to_move}")
-        
-        if cycles_to_move == 0:
-            self.log(f"    No move needed")
-        else:
-            move_pass = MoveInstructionPass(
-                self.block_label,
-                current_idx,
-                cycles_to_move,
-                verbose=False,
-                frozen_boundary=self.frozen_boundary,
-                protected_instructions=self.protected_instructions
-            )
-            move_pass.run(self.result)
-            
-            if move_pass.total_cycles_moved > 0:
-                self.log(f"    Moved {move_pass.total_cycles_moved} cycles")
-        
-        new_idx = self.find_target_instruction_index(step_num)
-        if new_idx >= 0:
-            self.frozen_boundary = new_idx
-            self.protected_instructions.append(self.block.instructions[new_idx])
-        
-        if save_path:
-            save_amdgcn(self.result, save_path, self.block_label)
-        
-        return True
-    
-    def level1_debug(self, start_step: int = 0) -> int:
-        """
-        Level 1: Test each distribution step.
-        Returns the first failing step number, or -1 if all pass.
-        """
-        print("\n" + "=" * 60)
-        print("LEVEL 1: Testing each distribution step")
-        print("=" * 60)
-        
-        if start_step > 0:
-            print(f"Skipping steps 1-{start_step} (applying without testing)...")
-            for step in range(start_step):
-                self.apply_step(step)
-        
-        baseline_path = os.path.join(self.output_dir, f"level1_step{start_step:02d}_baseline.amdgcn")
-        save_amdgcn(self.result, baseline_path, self.block_label)
-        
-        if not self.args.skip_baseline and start_step == 0:
-            print("\nTesting baseline (original file)...")
-            success, _ = self.run_test(baseline_path)
-            if not success:
-                print("ERROR: Baseline test failed!")
-                return 0
-            print("✓ Baseline passes")
-        
-        for step in range(start_step, self.K):
-            step_path = os.path.join(self.output_dir, f"level1_step{step + 1:02d}.amdgcn")
-            
-            print(f"\nStep {step + 1}/{self.K}:", end=" ")
-            self.apply_step(step, step_path)
-            
-            print("Testing...", end=" ", flush=True)
-            success, output = self.run_test(step_path)
-            
-            if success:
-                print("✓ PASS")
-            else:
-                print("✗ FAIL")
-                print(f"\n{'=' * 60}")
-                print(f"FOUND: Step {step + 1} caused the test to fail!")
-                print(f"{'=' * 60}")
-                return step + 1
-        
-        print(f"\nAll {self.K} steps passed!")
-        return -1
-    
-    def level2_debug(self, failing_step: int, start_move: int = 0) -> dict:
-        """
-        Level 2: Test each individual instruction move within a failing step.
-        """
-        print("\n" + "=" * 60)
-        print(f"LEVEL 2: Detailed analysis of Step {failing_step}")
-        if start_move > 0:
-            print(f"         Starting from move #{start_move}")
-        print("=" * 60)
-        
-        self.setup()
-        
-        if failing_step > 1:
-            print(f"Applying steps 1-{failing_step - 1} (known to pass)...")
-            for step in range(failing_step - 1):
-                self.apply_step(step)
-        
-        baseline_path = os.path.join(self.output_dir, f"level2_step{failing_step}_baseline.amdgcn")
-        save_amdgcn(self.result, baseline_path, self.block_label)
-        
-        if start_move == 0:
-            print(f"\nVerifying baseline (before step {failing_step})...")
-            success, _ = self.run_test(baseline_path)
-            if not success:
-                print("ERROR: Baseline before failing step already fails!")
-                return {"error": "baseline_fails"}
-            print("✓ Baseline passes")
-        else:
-            print(f"\nSkipping baseline test (starting from move #{start_move})")
-        
-        current_idx = self.find_target_instruction_index(failing_step - 1)
-        target_instr = self.block.instructions[current_idx]
-        target_cycle = self.ideal_cycles[failing_step - 1]
-        current_cycle = get_cumulative_cycle(self.block, current_idx)
-        cycles_to_move = -(current_cycle - target_cycle)
-        
-        print(f"\nStep {failing_step} details:")
-        print(f"  Target instruction: {self.target_opcode} at idx={current_idx}")
-        print(f"  Current cycle: {current_cycle}, Target cycle: {target_cycle}")
-        print(f"  Cycles to move: {cycles_to_move} ({'UP' if cycles_to_move > 0 else 'DOWN'})")
-        
-        if start_move > 0:
-            print(f"\nApplying moves 1-{start_move} without testing...")
-        print(f"\nTesting individual moves...")
-        
-        move_count = 0
-        total_cycles_moved = 0
-        
-        while total_cycles_moved < abs(cycles_to_move):
-            target_idx = -1
-            for idx, instr in enumerate(self.block.instructions):
-                if instr is target_instr:
-                    target_idx = idx
-                    break
-            
-            if target_idx < 0:
-                print(f"  Cannot find target instruction")
-                break
-            
-            small_move = -4 if cycles_to_move < 0 else 4
-            
-            move_pass = MoveInstructionPass(
-                self.block_label,
-                target_idx,
-                small_move,
-                verbose=False,
-                frozen_boundary=self.frozen_boundary,
-                protected_instructions=self.protected_instructions
-            )
-            success = move_pass.run(self.result)
-            
-            if not success or move_pass.total_cycles_moved == 0:
-                print(f"  Move blocked after {move_count} moves, {total_cycles_moved} cycles")
-                break
-            
-            move_count += 1
-            total_cycles_moved += move_pass.total_cycles_moved
-            
-            step_path = os.path.join(self.output_dir, f"level2_step{failing_step}_move{move_count:03d}.amdgcn")
-            save_amdgcn(self.result, step_path, self.block_label)
-            
-            if move_count < start_move:
-                print(f"  [{move_count}] +{move_pass.total_cycles_moved} cycles (total={total_cycles_moved}/{abs(cycles_to_move)}) [skipped]")
-                continue
-            
-            print(f"  [{move_count}] +{move_pass.total_cycles_moved} cycles (total={total_cycles_moved}/{abs(cycles_to_move)})", end=" ")
-            
-            test_success, output = self.run_test(step_path)
-            
-            if test_success:
-                print("✓")
-            else:
-                print("✗ FAIL")
-                
-                if move_count > 1:
-                    prev_path = os.path.join(self.output_dir, f"level2_step{failing_step}_move{move_count - 1:03d}.amdgcn")
-                else:
-                    prev_path = baseline_path
-                
-                print(f"\n{'=' * 60}")
-                print(f"FOUND: Move #{move_count} caused the failure!")
-                print(f"{'=' * 60}")
-                
-                print(f"\nDiff between passing and failing files:")
-                diff_result = subprocess.run(
-                    f"diff {prev_path} {step_path} | head -100",
-                    shell=True, capture_output=True, text=True
-                )
-                print(diff_result.stdout)
-                
-                return {
-                    "failing_step": failing_step,
-                    "failing_move": move_count,
-                    "total_cycles_moved": total_cycles_moved,
-                    "passing_file": prev_path,
-                    "failing_file": step_path,
-                }
-        
-        print(f"\nAll {move_count} moves completed without failure.")
-        print("The bug might be cumulative or in a different subsystem.")
-        return {"error": "no_single_move_failure", "total_moves": move_count}
-    
-    def run(self):
-        """Run the two-level debug process."""
-        if not self.setup():
-            return
-        
-        if self.args.detail_step is not None:
-            start_move = self.args.start_move if self.args.start_move is not None else 0
-            result = self.level2_debug(self.args.detail_step, start_move=start_move)
-            return result
-        
-        failing_step = self.level1_debug(self.args.start_step or 0)
-        
-        if failing_step < 0:
-            print("\nNo failing step found. All tests passed!")
-            return None
-        
-        result = self.level2_debug(failing_step)
-        
-        return result
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Debug tool for AMDGCN transform passes",
@@ -1316,11 +981,13 @@ def main():
         epilog=__doc__
     )
     
-    # Pass list mode
-    parser.add_argument("--load-json", "-l", default=None,
+    # Required arguments
+    parser.add_argument("--load-json", "-l", required=True,
                        help="Load analysis from JSON file")
-    parser.add_argument("--pass-list", "-t", default=None,
+    parser.add_argument("--pass-list", "-t", required=True,
                        help="Pass list JSON file (e.g., transform_passes_example.json)")
+    
+    # Optional pass list mode arguments
     parser.add_argument("--output", "-r", default=None,
                        help="Output .amdgcn file path")
     parser.add_argument("--start-pass", type=int, default=0,
@@ -1328,23 +995,13 @@ def main():
     parser.add_argument("--detail-pass", type=int, default=None,
                        help="Debug specific pass N in detail (must be distribute type)")
     
-    # Two-level debug options (work with both modes)
+    # Two-level debug options
     parser.add_argument("--start-step", type=int, default=0,
                        help="Start from step N within distribute pass (Level 1)")
     parser.add_argument("--detail-step", type=int, default=None,
                        help="Debug step N in detail (Level 2)")
     parser.add_argument("--start-move", type=int, default=0,
                        help="Start from move K within --detail-step (Level 2)")
-    
-    # Legacy mode (single distribute)
-    parser.add_argument("--source", default="amdgcn_edit/pa_dot_kernel.v2.amdgcn",
-                       help="Source .amdgcn file (legacy mode)")
-    parser.add_argument("--block", default=".LBB0_2",
-                       help="Target block label (legacy mode)")
-    parser.add_argument("--opcode", default="global_load_dwordx4",
-                       help="Target instruction opcode (legacy mode)")
-    parser.add_argument("--count", type=int, default=16,
-                       help="Number of instructions to distribute (legacy mode)")
     
     # Common options
     parser.add_argument("--output-dir", default="amdgcn_edit/debug_distribute",
@@ -1355,8 +1012,6 @@ def main():
                        help="Skip baseline test")
     parser.add_argument("--skip-test", action="store_true",
                        help="Skip all tests (only apply passes and generate files)")
-    parser.add_argument("--barrier-crossing", default=None,
-                       help="Comma-separated opcodes allowed to cross s_barrier (legacy mode)")
     parser.add_argument("--verbose", "-v", action="store_true",
                        help="Show verbose output")
     
@@ -1366,33 +1021,21 @@ def main():
     print("AMDGCN Transform Pass Debugger")
     print("=" * 60)
     
-    # Determine mode
-    if args.load_json and args.pass_list:
-        # Pass list mode
-        if args.detail_pass is not None:
-            print(f"Mode: Pass List - Detailed Debug of Pass {args.detail_pass}")
-            if args.detail_step is not None:
-                print(f"       Level 2: Step {args.detail_step}, Start Move: {args.start_move}")
-            else:
-                print(f"       Level 1: Start Step: {args.start_step}")
+    # Print mode information
+    if args.detail_pass is not None:
+        print(f"Mode: Pass List - Detailed Debug of Pass {args.detail_pass}")
+        if args.detail_step is not None:
+            print(f"       Level 2: Step {args.detail_step}, Start Move: {args.start_move}")
         else:
-            print(f"Mode: Pass List Debug")
-        print(f"JSON: {args.load_json}")
-        print(f"Pass List: {args.pass_list}")
-        print(f"Output: {args.output or 'auto'}")
-        print(f"Output Dir: {args.output_dir}")
-        
-        debugger = PassListDebugger(args)
+            print(f"       Level 1: Start Step: {args.start_step}")
     else:
-        # Legacy mode
-        print(f"Mode: Legacy (Single Distribute)")
-        print(f"Source: {args.source}")
-        print(f"Block: {args.block}")
-        print(f"Opcode: {args.opcode}")
-        print(f"Count: {args.count}")
-        print(f"Output: {args.output_dir}")
-        
-        debugger = DistributeDebugger(args)
+        print(f"Mode: Pass List Debug")
+    print(f"JSON: {args.load_json}")
+    print(f"Pass List: {args.pass_list}")
+    print(f"Output: {args.output or 'auto'}")
+    print(f"Output Dir: {args.output_dir}")
+    
+    debugger = PassListDebugger(args)
     
     start_time = time.time()
     result = debugger.run()

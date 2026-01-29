@@ -26,7 +26,7 @@ import re
 import functools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Optional, Tuple, Any, Union, Callable
+from typing import Dict, List, Set, Optional, Tuple, Any, Union, Callable, Generator
 
 from amdgcn_cfg import Instruction, BasicBlock, CFG
 from amdgcn_ddg import (
@@ -98,6 +98,20 @@ class SingleMoveInfo:
     cycles_this_move: int     # Cycles moved in this single move
     total_cycles_so_far: int  # Cumulative cycles moved in this step
     target_cycles: int        # Total cycles requested for the step
+
+
+@dataclass
+class MoveYieldInfo:
+    """Information yielded after each logical move unit in iter_moves()."""
+    move_num: int              # 1-indexed logical move number
+    move_type: str             # "normal" | "scc_pair" | "recursive"
+    swaps_in_this_move: int    # Physical swap count in this logical move
+    target_new_idx: int        # Target instruction's new index after move
+    cycles_this_move: int      # Cycles moved in this logical unit
+    total_cycles_moved: int    # Cumulative cycles moved
+    target_cycles: int         # Total cycles requested
+    blocked: bool = False      # True if movement is now blocked
+    block_reason: str = ""     # Reason for blocking (if blocked)
 
 
 @dataclass
@@ -1839,6 +1853,63 @@ class MoveInstructionPass(Pass):
         
         return success
     
+    def iter_moves(self, result: AnalysisResult) -> Generator[MoveYieldInfo, None, None]:
+        """
+        Generator that yields after each logical move unit.
+        
+        Unlike run() which executes all moves at once, this method yields control
+        after each logical move unit, allowing the caller to inspect/test intermediate
+        states.
+        
+        Logical move units:
+        - normal: Single instruction swap
+        - scc_pair: Skip entire SCC pair as atomic unit
+        - recursive: Recursive move of blocking instruction (UP direction only)
+        
+        Args:
+            result: The AnalysisResult to modify
+            
+        Yields:
+            MoveYieldInfo with details of each logical move
+            
+        Raises:
+            ValueError: If block or instruction index is invalid
+            
+        Note:
+            This method does NOT perform verification after each move.
+            Caller is responsible for verification if needed.
+        """
+        # Validate block exists
+        if self.block_label not in result.cfg.blocks:
+            return
+        
+        block = result.cfg.blocks[self.block_label]
+        ddg = result.ddgs.get(self.block_label)
+        
+        # Validate instruction index
+        if self.instr_index < 0 or self.instr_index >= len(block.instructions):
+            return
+        
+        if self.cycles == 0:
+            return
+        
+        self._total_cycles_moved = 0
+        
+        # Get the target instruction reference (for tracking after moves)
+        target_instr = block.instructions[self.instr_index]
+        
+        cycles_to_move = abs(self.cycles)
+        
+        if self.cycles > 0:
+            # Move UP by n cycles
+            yield from self._iter_move_up(block, ddg, result, target_instr, cycles_to_move)
+        else:
+            # Move DOWN by |n| cycles
+            yield from self._iter_move_down(block, ddg, result, target_instr, cycles_to_move)
+        
+        if self.verbose:
+            print(f"  Total cycles moved: {self._total_cycles_moved} / {cycles_to_move} requested")
+    
     # =========================================================================
     # Instruction movement methods
     # =========================================================================
@@ -2686,6 +2757,218 @@ class MoveInstructionPass(Pass):
         
         return any_moved
     
+    def _iter_move_up(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        result: AnalysisResult,
+        target_instr: Instruction,
+        cycles_to_move: int
+    ) -> Generator[MoveYieldInfo, None, None]:
+        """
+        Generator version of _move_up_by_cycles that yields after each logical move unit.
+        
+        Logical move units:
+        - normal: Single instruction swap
+        - scc_pair: Skip entire SCC pair as atomic unit
+        - recursive: Recursive move of blocking instruction (yields once after all recursive moves)
+        
+        Args:
+            block: The basic block
+            ddg: The DDG for the block
+            result: The analysis result
+            target_instr: The instruction to move
+            cycles_to_move: Total cycles to move (positive value)
+            
+        Yields:
+            MoveYieldInfo with details of each logical move
+        """
+        move_num = 0
+        
+        # Reset blocking sets
+        self._blocked_by_frozen = set()
+        self._blocked_by_dependencies = set()
+        self._blocked_by_branch = set()
+        self._blocked_by_saveexec = set()
+        self._blocked_by_latency = set()
+        self._no_candidates = False
+        
+        while self._total_cycles_moved < cycles_to_move:
+            # Get current position of target
+            target_idx = self._find_instruction_index(block, target_instr)
+            if target_idx < 0:
+                break
+            
+            # Cannot move if at the beginning of the block
+            if target_idx <= 0:
+                self._no_candidates = True
+                break
+            
+            # Cannot move into frozen region
+            if target_idx <= self.frozen_boundary:
+                self._blocked_by_frozen.add(id(target_instr))
+                break
+            
+            # Get registers for target instruction (AA)
+            aa_defs, aa_uses = get_instruction_defs_uses(target_instr)
+            aa_rreg_set = aa_uses  # Read registers
+            aa_wreg_set = aa_defs  # Write registers
+            
+            # Get instruction above (AAB1)
+            aab1_idx = target_idx - 1
+            aab1_instr = block.instructions[aab1_idx]
+            aab1_opcode = aab1_instr.opcode.lower()
+            
+            # Check for boundary instructions
+            if self._is_boundary_instruction(aab1_opcode):
+                self._blocked_by_saveexec.add(id(aab1_instr))
+                break
+            
+            if aab1_instr.is_branch or aab1_instr.is_terminator:
+                self._blocked_by_branch.add(id(aab1_instr))
+                break
+            
+            # Skip protected instructions
+            if aab1_instr in self.protected_instructions:
+                self._blocked_by_dependencies.add(id(aab1_instr))
+                break
+            
+            # Check if AAB1 is part of an SCC pair - if so, treat the entire pair as atomic
+            scc_pair_range = get_scc_pair_range(block, aab1_idx)
+            if scc_pair_range is not None:
+                pair_start, pair_end = scc_pair_range
+                # Target is trying to move past an SCC pair - need to skip the entire pair
+                # Check if target instruction can skip the entire pair without conflicts
+                if not self._can_skip_scc_pair(block, target_instr, pair_start, pair_end):
+                    self._blocked_by_dependencies.add(id(aab1_instr))
+                    if self.verbose:
+                        print(f"    Blocked by SCC pair [{pair_start}]-[{pair_end}]")
+                    break
+                
+                # Move target past the entire SCC pair
+                pair_cycles = sum(get_instr_cycles(block.instructions[i]) for i in range(pair_start, pair_end + 1))
+                
+                # Overshoot prevention
+                error_if_stop = cycles_to_move - self._total_cycles_moved
+                error_if_move = abs(cycles_to_move - (self._total_cycles_moved + pair_cycles))
+                
+                if error_if_move > error_if_stop:
+                    if self.verbose:
+                        print(f"    Overshoot prevention: stop at error={error_if_stop}, skip SCC pair would give error={error_if_move}")
+                    break
+                
+                # Move target past the entire SCC pair
+                swaps_count = 0
+                for i in range(pair_end - pair_start + 1):
+                    current_target_idx = self._find_instruction_index(block, target_instr)
+                    if current_target_idx <= pair_start:
+                        break
+                    self._move_single_instruction_up_impl(block, ddg, current_target_idx, current_target_idx - 1)
+                    swaps_count += 1
+                
+                self._total_cycles_moved += pair_cycles
+                move_num += 1
+                
+                if self.verbose:
+                    print(f"    Skipped SCC pair [{pair_start}]-[{pair_end}] (+{pair_cycles} cycles)")
+                
+                # Yield after SCC pair skip
+                new_target_idx = self._find_instruction_index(block, target_instr)
+                yield MoveYieldInfo(
+                    move_num=move_num,
+                    move_type="scc_pair",
+                    swaps_in_this_move=swaps_count,
+                    target_new_idx=new_target_idx,
+                    cycles_this_move=pair_cycles,
+                    total_cycles_moved=self._total_cycles_moved,
+                    target_cycles=cycles_to_move
+                )
+                continue
+            
+            # Get registers for AAB1
+            aab1_defs, aab1_uses = get_instruction_defs_uses(aab1_instr)
+            
+            # Check conflicts
+            # WAR: AA writes what AAB1 reads -> stop
+            war_conflicts = aa_wreg_set & aab1_uses
+            if war_conflicts and not (war_conflicts == {'scc'} and is_scc_only_writer(target_instr.opcode.lower())):
+                self._blocked_by_dependencies.add(id(aab1_instr))
+                break
+            
+            # WAW: AA writes what AAB1 writes -> stop
+            waw_conflicts = aa_wreg_set & aab1_defs
+            if waw_conflicts and not (waw_conflicts == {'scc'}):
+                self._blocked_by_dependencies.add(id(aab1_instr))
+                break
+            
+            # RAW: AA reads what AAB1 writes -> need to recursively move AAB1 first
+            raw_conflicts = aa_rreg_set & aab1_defs
+            if raw_conflicts:
+                if raw_conflicts == {'scc'} and not is_scc_reader(target_instr.opcode.lower()):
+                    pass  # SCC-only conflict, AA doesn't read SCC
+                else:
+                    # Try to recursively move AAB1 up first
+                    moved_aab1 = self._try_move_instruction_up_recursive(
+                        block, ddg, result, aab1_instr, depth=0, max_depth=50
+                    )
+                    if not moved_aab1:
+                        self._blocked_by_dependencies.add(id(aab1_instr))
+                        break
+                    
+                    # Yield after recursive move (the recursive move itself is atomic)
+                    move_num += 1
+                    new_target_idx = self._find_instruction_index(block, target_instr)
+                    yield MoveYieldInfo(
+                        move_num=move_num,
+                        move_type="recursive",
+                        swaps_in_this_move=1,  # Recursive move counts as 1 logical unit
+                        target_new_idx=new_target_idx,
+                        cycles_this_move=0,  # Recursive moves don't count toward target cycles
+                        total_cycles_moved=self._total_cycles_moved,
+                        target_cycles=cycles_to_move
+                    )
+                    # After moving AAB1, continue the loop to try moving target again
+                    continue
+            
+            # Check s_waitcnt constraints
+            if not self._can_move_single_instruction_up(block, ddg, target_idx, target_idx - 1, set()):
+                self._blocked_by_dependencies.add(id(aab1_instr))
+                break
+            
+            # No conflict - swap AA and AAB1
+            # Use predecessor's cycles (AAB1's cycles)
+            predecessor_cycles = get_instr_cycles(aab1_instr)
+            
+            # Overshoot prevention: compare error_if_stop vs error_if_move
+            error_if_stop = cycles_to_move - self._total_cycles_moved
+            error_if_move = abs(cycles_to_move - (self._total_cycles_moved + predecessor_cycles))
+            
+            if error_if_move > error_if_stop:
+                # Making this move would increase the error - stop here
+                if self.verbose:
+                    print(f"    Overshoot prevention: stop at error={error_if_stop}, move would give error={error_if_move}")
+                break
+            
+            # Perform the swap with s_waitcnt adjustment
+            self._move_single_instruction_up_impl(block, ddg, target_idx, target_idx - 1)
+            self._total_cycles_moved += predecessor_cycles
+            move_num += 1
+            
+            if self.verbose:
+                print(f"    Moved target [{target_idx}] {target_instr.opcode} up past [{aab1_idx}] {aab1_instr.opcode} (+{predecessor_cycles} cycles)")
+            
+            # Yield after normal swap
+            new_target_idx = self._find_instruction_index(block, target_instr)
+            yield MoveYieldInfo(
+                move_num=move_num,
+                move_type="normal",
+                swaps_in_this_move=1,
+                target_new_idx=new_target_idx,
+                cycles_this_move=predecessor_cycles,
+                total_cycles_moved=self._total_cycles_moved,
+                target_cycles=cycles_to_move
+            )
+    
     def _try_move_instruction_up_recursive(
         self,
         block: BasicBlock,
@@ -2954,6 +3237,199 @@ class MoveInstructionPass(Pass):
                 print(f"    Moved target [{target_idx}] {target_instr.opcode} down past [{aaf1_idx}] {aaf1_instr.opcode} (+{successor_cycles} cycles)")
         
         return any_moved
+    
+    def _iter_move_down(
+        self,
+        block: BasicBlock,
+        ddg: Optional[DDG],
+        result: AnalysisResult,
+        target_instr: Instruction,
+        cycles_to_move: int
+    ) -> Generator[MoveYieldInfo, None, None]:
+        """
+        Generator version of _move_down_by_cycles that yields after each logical move unit.
+        
+        Logical move units:
+        - normal: Single instruction swap
+        - scc_pair: Skip entire SCC pair as atomic unit
+        
+        Args:
+            block: The basic block
+            ddg: The DDG for the block
+            result: The analysis result
+            target_instr: The instruction to move
+            cycles_to_move: Total cycles to move (positive value)
+            
+        Yields:
+            MoveYieldInfo with details of each logical move
+        """
+        move_num = 0
+        
+        # Reset blocking sets
+        self._blocked_by_frozen = set()
+        self._blocked_by_dependencies = set()
+        self._blocked_by_branch = set()
+        self._blocked_by_saveexec = set()
+        self._blocked_by_latency = set()
+        self._no_candidates = False
+        
+        # Find branch boundary
+        n = len(block.instructions)
+        branch_boundary = n
+        for i, instr in enumerate(block.instructions):
+            if instr.is_branch or instr.is_terminator:
+                branch_boundary = i
+                break
+        
+        while self._total_cycles_moved < cycles_to_move:
+            # Get current position of target
+            target_idx = self._find_instruction_index(block, target_instr)
+            if target_idx < 0:
+                break
+            
+            # Cannot move if at the end of the block
+            if target_idx >= n - 1 or target_idx >= branch_boundary - 1:
+                self._no_candidates = True
+                break
+            
+            # Get registers for target instruction (AA)
+            aa_defs, aa_uses = get_instruction_defs_uses(target_instr)
+            aa_rreg_set = aa_uses  # Read registers
+            aa_wreg_set = aa_defs  # Write registers
+            
+            # Get instruction below (AAF1)
+            aaf1_idx = target_idx + 1
+            aaf1_instr = block.instructions[aaf1_idx]
+            aaf1_opcode = aaf1_instr.opcode.lower()
+            
+            # Check for boundary instructions
+            if self._is_boundary_instruction(aaf1_opcode):
+                self._blocked_by_saveexec.add(id(aaf1_instr))
+                break
+            
+            if aaf1_instr.is_branch or aaf1_instr.is_terminator:
+                self._blocked_by_branch.add(id(aaf1_instr))
+                break
+            
+            # Skip protected instructions
+            if aaf1_instr in self.protected_instructions:
+                self._blocked_by_dependencies.add(id(aaf1_instr))
+                break
+            
+            # Check if AAF1 is part of an SCC pair - if so, treat the entire pair as atomic
+            scc_pair_range = get_scc_pair_range(block, aaf1_idx)
+            if scc_pair_range is not None:
+                pair_start, pair_end = scc_pair_range
+                # Target is trying to move past an SCC pair - need to skip the entire pair
+                # For downward movement, we need to check if target can skip the pair
+                if not self._can_skip_scc_pair_down(block, target_instr, target_idx, pair_start, pair_end):
+                    self._blocked_by_dependencies.add(id(aaf1_instr))
+                    if self.verbose:
+                        print(f"    Blocked by SCC pair [{pair_start}]-[{pair_end}]")
+                    break
+                
+                # Calculate cycles for the entire pair
+                pair_cycles = sum(get_instr_cycles(block.instructions[i]) for i in range(pair_start, pair_end + 1))
+                
+                # Overshoot prevention
+                error_if_stop = cycles_to_move - self._total_cycles_moved
+                error_if_move = abs(cycles_to_move - (self._total_cycles_moved + pair_cycles))
+                
+                if error_if_move > error_if_stop:
+                    if self.verbose:
+                        print(f"    Overshoot prevention: stop at error={error_if_stop}, skip SCC pair would give error={error_if_move}")
+                    break
+                
+                # Move target past the entire SCC pair
+                swaps_count = 0
+                for i in range(pair_end - pair_start + 1):
+                    current_target_idx = self._find_instruction_index(block, target_instr)
+                    if current_target_idx > pair_end:
+                        break
+                    self._move_single_instruction_down_impl(block, ddg, current_target_idx, current_target_idx + 1)
+                    swaps_count += 1
+                
+                self._total_cycles_moved += pair_cycles
+                move_num += 1
+                
+                if self.verbose:
+                    print(f"    Skipped SCC pair [{pair_start}]-[{pair_end}] (+{pair_cycles} cycles)")
+                
+                # Yield after SCC pair skip
+                new_target_idx = self._find_instruction_index(block, target_instr)
+                yield MoveYieldInfo(
+                    move_num=move_num,
+                    move_type="scc_pair",
+                    swaps_in_this_move=swaps_count,
+                    target_new_idx=new_target_idx,
+                    cycles_this_move=pair_cycles,
+                    total_cycles_moved=self._total_cycles_moved,
+                    target_cycles=cycles_to_move
+                )
+                continue
+            
+            # Get registers for AAF1
+            aaf1_defs, aaf1_uses = get_instruction_defs_uses(aaf1_instr)
+            
+            # Check conflicts - for downward movement, any conflict stops movement (no recursion)
+            # RAW: AAF1 reads what AA writes -> stop
+            raw_conflicts = aa_wreg_set & aaf1_uses
+            if raw_conflicts and not (raw_conflicts == {'scc'} and not is_scc_reader(aaf1_opcode)):
+                self._blocked_by_dependencies.add(id(aaf1_instr))
+                break
+            
+            # WAR: AAF1 writes what AA reads -> stop
+            war_conflicts = aaf1_defs & aa_rreg_set
+            if war_conflicts and not (war_conflicts == {'scc'} and is_scc_only_writer(aaf1_opcode)):
+                self._blocked_by_dependencies.add(id(aaf1_instr))
+                break
+            
+            # WAW: Both write same register -> usually OK (traversable)
+            # But we check anyway for non-SCC registers
+            waw_conflicts = aa_wreg_set & aaf1_defs
+            if waw_conflicts and not (waw_conflicts == {'scc'}):
+                # For non-SCC WAW, check if AAF1's result is live after
+                # We'll be conservative and allow it (WAW traversable rule)
+                pass
+            
+            # Check s_waitcnt constraints
+            if not self._can_move_single_instruction_down(block, ddg, target_idx, target_idx + 1, set()):
+                self._blocked_by_dependencies.add(id(aaf1_instr))
+                break
+            
+            # No conflict - swap AA and AAF1
+            # Use successor's cycles (AAF1's cycles)
+            successor_cycles = get_instr_cycles(aaf1_instr)
+            
+            # Overshoot prevention: compare error_if_stop vs error_if_move
+            error_if_stop = cycles_to_move - self._total_cycles_moved
+            error_if_move = abs(cycles_to_move - (self._total_cycles_moved + successor_cycles))
+            
+            if error_if_move > error_if_stop:
+                # Making this move would increase the error - stop here
+                if self.verbose:
+                    print(f"    Overshoot prevention: stop at error={error_if_stop}, move would give error={error_if_move}")
+                break
+            
+            # Perform the swap with s_waitcnt adjustment
+            self._move_single_instruction_down_impl(block, ddg, target_idx, target_idx + 1)
+            self._total_cycles_moved += successor_cycles
+            move_num += 1
+            
+            if self.verbose:
+                print(f"    Moved target [{target_idx}] {target_instr.opcode} down past [{aaf1_idx}] {aaf1_instr.opcode} (+{successor_cycles} cycles)")
+            
+            # Yield after normal swap
+            new_target_idx = self._find_instruction_index(block, target_instr)
+            yield MoveYieldInfo(
+                move_num=move_num,
+                move_type="normal",
+                swaps_in_this_move=1,
+                target_new_idx=new_target_idx,
+                cycles_this_move=successor_cycles,
+                total_cycles_moved=self._total_cycles_moved,
+                target_cycles=cycles_to_move
+            )
     
     # =========================================================================
     # Waitcnt adjustment methods
@@ -3565,6 +4041,60 @@ class DistributeStepExecutor:
         
         return current_cycle > ideal_cycle
     
+    def get_execution_order(self) -> List[int]:
+        """
+        Get the execution order of steps matching DistributeInstructionPass.run().
+        
+        The order is:
+        1. UP moves in forward order (step 0, 1, ...)
+        2. DOWN moves in reverse order (step K-1, K-2, ...)
+        
+        Returns:
+            List of step numbers in execution order
+        """
+        needs_move_up, needs_move_down = self._classify_moves()
+        
+        # UP moves in forward order
+        up_steps = [step_num for step_num, _ in needs_move_up]
+        
+        # DOWN moves in reverse order
+        down_steps = [step_num for step_num, _ in reversed(needs_move_down)]
+        
+        return up_steps + down_steps
+    
+    def get_execution_index(self, step_num: int) -> int:
+        """
+        Get the execution index (position in execution order) for a step.
+        
+        Args:
+            step_num: The step number (0-indexed)
+            
+        Returns:
+            The position in execution order (0-indexed), or -1 if not found
+        """
+        execution_order = self.get_execution_order()
+        try:
+            return execution_order.index(step_num)
+        except ValueError:
+            return -1
+    
+    def get_steps_before(self, step_num: int) -> List[int]:
+        """
+        Get all steps that should execute before the given step.
+        
+        Args:
+            step_num: The step number (0-indexed)
+            
+        Returns:
+            List of step numbers that execute before this step
+        """
+        execution_order = self.get_execution_order()
+        try:
+            exec_idx = execution_order.index(step_num)
+            return execution_order[:exec_idx]
+        except ValueError:
+            return []
+    
     def get_step_params(self, step_num: int) -> Dict[str, Any]:
         """
         Get computed parameters for a step (for debugging/logging).
@@ -3647,9 +4177,14 @@ class DistributeStepExecutor:
         move_count = 0
         
         if cycles_to_move != 0:
-            # Get protected instructions: all target instructions except current one
-            # This matches DistributeInstructionPass.run() behavior for both UP and DOWN moves
-            protected_instrs = [instr for j, instr in enumerate(self.ctx.all_target_instrs) if j != step_num]
+            # Get protected instructions based on move direction
+            # This matches DistributeInstructionPass.run() behavior:
+            # - UP moves: protect instructions after current step (not yet processed)
+            # - DOWN moves: protect instructions before current step (already processed)
+            if is_up_move:
+                protected_instrs = self.ctx.all_target_instrs[step_num + 1:]
+            else:
+                protected_instrs = self.ctx.all_target_instrs[:step_num]
             
             move_pass = MoveInstructionPass(
                 self.ctx.block_label,
@@ -3714,6 +4249,9 @@ class DistributeStepExecutor:
         current_idx = params["current_idx"]
         cycles_to_move = params["cycles_to_move"]
         
+        # Check if this is an UP move BEFORE executing
+        is_up_move = self.is_move_up(step_num)
+        
         if cycles_to_move == 0:
             return StepResult(
                 step_num=step_num,
@@ -3723,8 +4261,14 @@ class DistributeStepExecutor:
                 message="No move needed"
             )
         
-        # Get protected instructions
-        protected_instrs = self.ctx.all_target_instrs[step_num + 1:]
+        # Get protected instructions based on move direction
+        # This matches DistributeInstructionPass.run() behavior:
+        # - UP moves: protect instructions after current step (not yet processed)
+        # - DOWN moves: protect instructions before current step (already processed)
+        if is_up_move:
+            protected_instrs = self.ctx.all_target_instrs[step_num + 1:]
+        else:
+            protected_instrs = self.ctx.all_target_instrs[:step_num]
         
         # Get target instruction for tracking
         target_instr = self.ctx.block.instructions[current_idx]
@@ -3741,16 +4285,115 @@ class DistributeStepExecutor:
         
         total_cycles = executor.move_by_cycles(cycles_to_move, on_single_move=on_single_move)
         
-        # Update frozen boundary
-        new_idx = self.find_nth_target_index(step_num)
-        if new_idx >= 0:
-            self.frozen_boundary = new_idx + 1
+        # Update frozen boundary only for UP moves (matching DistributeInstructionPass.run())
+        if is_up_move:
+            new_idx = self.find_nth_target_index(step_num)
+            if new_idx >= 0:
+                self.frozen_boundary = new_idx + 1
         
         result = StepResult(
             step_num=step_num,
             success=True,
             cycles_moved=total_cycles,
             move_count=executor.move_count,
+            details=params
+        )
+        
+        self._step_results.append(result)
+        return result
+    
+    def execute_step_with_iter(
+        self,
+        step_num: int,
+        on_move: Optional[Callable[[MoveYieldInfo], bool]] = None
+    ) -> StepResult:
+        """
+        Execute step with per-logical-move callbacks using MoveInstructionPass.iter_moves().
+        
+        This method provides fine-grained control over instruction movement, yielding
+        after each logical move unit (normal swap, SCC pair skip, or recursive move).
+        
+        Args:
+            step_num: Step number (0-indexed)
+            on_move: Called after each logical move unit.
+                     Signature: (move_info: MoveYieldInfo) -> bool
+                     Return False to stop execution early.
+                     
+        Returns:
+            StepResult with execution details
+        """
+        params = self.get_step_params(step_num)
+        
+        if "error" in params:
+            return StepResult(
+                step_num=step_num,
+                success=False,
+                message=params.get("error", "Unknown error")
+            )
+        
+        current_idx = params["current_idx"]
+        cycles_to_move = params["cycles_to_move"]
+        
+        # Check if this is an UP move BEFORE executing (state will change after move)
+        is_up_move = self.is_move_up(step_num)
+        
+        if cycles_to_move == 0:
+            return StepResult(
+                step_num=step_num,
+                success=True,
+                cycles_moved=0,
+                move_count=0,
+                message="No move needed"
+            )
+        
+        # Get protected instructions based on move direction
+        # This matches DistributeInstructionPass.run() behavior:
+        # - UP moves: protect instructions after current step (not yet processed)
+        # - DOWN moves: protect instructions before current step (already processed)
+        if is_up_move:
+            protected_instrs = self.ctx.all_target_instrs[step_num + 1:]
+        else:
+            protected_instrs = self.ctx.all_target_instrs[:step_num]
+        
+        # Create MoveInstructionPass for iteration
+        move_pass = MoveInstructionPass(
+            self.ctx.block_label,
+            current_idx,
+            cycles_to_move,
+            verbose=False,
+            frozen_boundary=self.frozen_boundary,
+            protected_instructions=protected_instrs
+        )
+        
+        # Iterate through moves, calling callback after each
+        move_count = 0
+        last_move_info = None
+        stopped_early = False
+        
+        for move_info in move_pass.iter_moves(self.result):
+            move_count += 1
+            last_move_info = move_info
+            
+            if on_move is not None:
+                if not on_move(move_info):
+                    stopped_early = True
+                    break
+        
+        # Get total cycles moved
+        total_cycles = move_pass.total_cycles_moved
+        
+        # Update frozen boundary only for UP moves (matching DistributeInstructionPass.run())
+        if is_up_move:
+            new_idx = self.find_nth_target_index(step_num)
+            if new_idx >= 0:
+                self.frozen_boundary = new_idx + 1
+        
+        result = StepResult(
+            step_num=step_num,
+            success=True,
+            cycles_moved=total_cycles,
+            move_count=move_count,
+            message="Stopped early by callback" if stopped_early else "",
             details=params
         )
         
