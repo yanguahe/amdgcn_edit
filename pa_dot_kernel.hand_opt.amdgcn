@@ -17,7 +17,6 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	s_waitcnt lgkmcnt(0)
 	s_branch .LBB0_0
 	.loc	1 0 0 is_stmt 0                 ; :0:0
-.Ltmp0:
 	.p2align	8
 ; %bb.19:
 .LBB0_0:
@@ -26,7 +25,6 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	s_load_dword s33, s[0:1], 0xa4
 	s_load_dword s6, s[0:1], 0x60
 	s_load_dwordx2 s[2:3], s[0:1], 0x68
-.Ltmp1:
 	.loc	1 2013 12 is_stmt 1             ; pa_decode_gluon.py:2013:12
 	v_and_b32_e32 v1, 48, v0
 	.loc	1 2088 8                        ; pa_decode_gluon.py:2088:8
@@ -129,12 +127,10 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	s_or_b32 s6, s55, 0x80
 	.loc	1 2233 58 is_stmt 0             ; pa_decode_gluon.py:2233:58
 	s_min_i32 s6, s6, s17
-.Ltmp2:
 	.file	2 "/mnt/raid0/heyanguang/code/fa_triton/lat_triton/python/triton/language" "standard.py"
 	.loc	2 41 22 is_stmt 1               ; standard.py:41:22 @[ pa_decode_gluon.py:2236:59 ]
 	s_sub_i32 s6, s6, s55
 	s_add_i32 s28, s6, 63
-.Ltmp3:
 	.loc	1 2247 62                       ; pa_decode_gluon.py:2247:62
 	s_waitcnt lgkmcnt(0)
 	s_mul_i32 s6, s27, s16
@@ -339,10 +335,8 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	s_max_i32 s9, s9, 1
 	.loc	1 2321 40                       ; pa_decode_gluon.py:2321:40
 	s_ashr_i32 s53, s52, 31
-.Ltmp4:
 	.loc	2 41 22                         ; standard.py:41:22 @[ pa_decode_gluon.py:2307:12 ]
 	s_add_i32 s23, s9, 63
-.Ltmp5:
 	.loc	1 2321 40                       ; pa_decode_gluon.py:2321:40
 	s_lshl_b64 s[8:9], s[52:53], 2
 	s_add_u32 s8, s56, s8
@@ -378,171 +372,164 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	s_addc_u32 s9, s9, s59
 	.loc	1 2387 53                       ; pa_decode_gluon.py:2387:53
 	s_lshl_b64 s[0:1], s[0:1], 1
-	v_lshl_add_u64 v[36:37], v[0:1], 0, s[0:1]
-	v_lshl_add_u64 v[38:39], v[12:13], 0, s[0:1]
+	v_lshl_add_u64 v[134:135], v[0:1], 0, s[0:1]
+	global_load_dwordx4 v[124:127], v[134:135], off
+	v_lshl_add_u64 v[136:137], v[12:13], 0, s[0:1]
 	s_lshl_b64 s[0:1], s[8:9], 1
-	v_lshl_add_u64 v[40:41], v[0:1], 0, s[0:1]
 	.loc	1 2387 35 is_stmt 0             ; pa_decode_gluon.py:2387:35
-	global_load_dwordx4 v[124:127], v[36:37], off
-	global_load_dwordx4 v[112:115], v[36:37], off offset:16
-	global_load_dwordx4 v[104:107], v[38:39], off
-	global_load_dwordx4 v[96:99], v[38:39], off offset:16
-	global_load_dwordx4 v[120:123], v[40:41], off
-	global_load_dwordx4 v[116:119], v[40:41], off offset:16
-	.loc	1 2387 53                       ; pa_decode_gluon.py:2387:53
-	v_lshl_add_u64 v[42:43], v[12:13], 0, s[0:1]
-	.loc	1 2387 35                       ; pa_decode_gluon.py:2387:35
-	global_load_dwordx4 v[108:111], v[42:43], off
-	global_load_dwordx4 v[100:103], v[42:43], off offset:16
-	.loc	1 2406 44 is_stmt 1             ; pa_decode_gluon.py:2406:44
-	s_waitcnt vmcnt(17) lgkmcnt(0)
+	v_lshl_add_u64 v[138:139], v[0:1], 0, s[0:1]
+	v_lshl_add_u64 v[140:141], v[12:13], 0, s[0:1]
+	s_waitcnt vmcnt(10) lgkmcnt(0)
+	global_load_dwordx4 v[112:115], v[134:135], off offset:16
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[92:93], v[48:49], 0
-	.loc	1 0 0 is_stmt 0                 ; pa_decode_gluon.py:0
 	v_or_b32_e32 v36, s22, v27
+	.loc	1 2387 53                       ; pa_decode_gluon.py:2387:53
 	v_or_b32_e32 v43, 1, v36
-	.loc	1 2450 55 is_stmt 1             ; pa_decode_gluon.py:2450:55
+	.loc	1 2387 35                       ; pa_decode_gluon.py:2387:35
 	v_cmp_gt_i32_e64 s[0:1], s17, v36
-	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[94:95], v[50:51], a[0:3]
-	.loc	1 0 0 is_stmt 0                 ; pa_decode_gluon.py:0
+	.loc	1 2406 44 is_stmt 1             ; pa_decode_gluon.py:2406:44
 	v_or_b32_e32 v37, 0x43, v36
 	v_or_b32_e32 v42, 2, v36
-	.loc	1 2450 55 is_stmt 1             ; pa_decode_gluon.py:2450:55
+	.loc	1 0 0 is_stmt 0                 ; pa_decode_gluon.py:0
 	v_cmp_gt_i32_e64 s[8:9], s17, v43
+	s_waitcnt vmcnt(10)
+	v_mfma_f32_16x16x16_bf16 a[0:3], v[88:89], v[52:53], a[0:3]
 	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
-	s_waitcnt vmcnt(13)
-	v_mfma_f32_16x16x16_bf16 a[4:7], v[76:77], v[48:49], 0
-	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
 	s_and_b64 s[0:1], s[2:3], s[0:1]
 	.loc	1 0 0 is_stmt 0                 ; pa_decode_gluon.py:0
 	v_or_b32_e32 v38, 0x42, v36
 	v_or_b32_e32 v41, 3, v36
-	.loc	1 2406 44 is_stmt 1             ; pa_decode_gluon.py:2406:44
-	v_mfma_f32_16x16x16_bf16 a[0:3], v[88:89], v[52:53], a[0:3]
-	.loc	1 2450 55                       ; pa_decode_gluon.py:2450:55
+	.loc	1 2450 55 is_stmt 1             ; pa_decode_gluon.py:2450:55
+	global_load_dwordx4 v[104:107], v[136:137], off
+	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
 	v_cmp_gt_i32_e64 s[14:15], s17, v42
+	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
 	v_cmp_gt_i32_e64 s[30:31], s17, v37
 	.loc	1 0 0 is_stmt 0                 ; pa_decode_gluon.py:0
 	v_or_b32_e32 v39, 0x41, v36
+	v_mfma_f32_16x16x16_bf16 a[0:3], v[90:91], v[54:55], a[0:3]
 	.loc	1 2406 44 is_stmt 1             ; pa_decode_gluon.py:2406:44
-	v_mfma_f32_16x16x16_bf16 a[4:7], v[78:79], v[50:51], a[4:7]
-	.loc	1 0 0 is_stmt 0                 ; pa_decode_gluon.py:0
 	v_or_b32_e32 v40, s22, v26
-	.loc	1 2450 55 is_stmt 1             ; pa_decode_gluon.py:2450:55
+	.loc	1 2450 55                       ; pa_decode_gluon.py:2450:55
 	v_cmp_gt_i32_e64 s[22:23], s17, v41
 	v_cmp_gt_i32_e64 s[28:29], s17, v38
-	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
-	v_mfma_f32_16x16x16_bf16 a[0:3], v[90:91], v[54:55], a[0:3]
-	.loc	1 2450 55                       ; pa_decode_gluon.py:2450:55
+	.loc	1 0 0 is_stmt 0                 ; pa_decode_gluon.py:0
+	.loc	1 2406 44 is_stmt 1             ; pa_decode_gluon.py:2406:44
 	v_cmp_gt_i32_e64 s[24:25], s17, v40
+	.loc	1 0 0 is_stmt 0                 ; pa_decode_gluon.py:0
 	v_cmp_gt_i32_e64 s[26:27], s17, v39
-.Ltmp6:
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
-	s_waitcnt vmcnt(12)
-.Ltmp7:
-	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
-	v_mfma_f32_16x16x16_bf16 a[4:7], v[72:73], v[52:53], a[4:7]
-.Ltmp8:
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
-	s_barrier
-.Ltmp9:
-	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
+	.loc	1 2450 55 is_stmt 1             ; pa_decode_gluon.py:2450:55
+	s_waitcnt vmcnt(10)
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[84:85], v[56:57], a[0:3]
-	v_mfma_f32_16x16x16_bf16 a[4:7], v[74:75], v[54:55], a[4:7]
+	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
+	global_load_dwordx4 v[96:99], v[136:137], off offset:16
+	.loc	1 2450 55                       ; pa_decode_gluon.py:2450:55
+	; s_barrier
+	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[86:87], v[58:59], a[0:3]
-	s_waitcnt vmcnt(11)
-	v_mfma_f32_16x16x16_bf16 a[4:7], v[68:69], v[56:57], a[4:7]
+	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
+	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
+	s_waitcnt vmcnt(10)
+	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[80:81], v[60:61], a[0:3]
-	v_mfma_f32_16x16x16_bf16 a[4:7], v[70:71], v[58:59], a[4:7]
+	global_load_dwordx4 v[120:123], v[138:139], off
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[82:83], v[62:63], a[0:3]
 	s_waitcnt vmcnt(10)
-	v_mfma_f32_16x16x16_bf16 a[4:7], v[64:65], v[60:61], a[4:7]
+	v_mfma_f32_16x16x16_bf16 a[4:7], v[76:77], v[48:49], 0
 	s_nop 4
 	v_accvgpr_read_b32 v44, a0
 	v_accvgpr_read_b32 v47, a1
-	v_accvgpr_read_b32 v64, a2
-	v_accvgpr_read_b32 v65, a3
+	; v_accvgpr_read_b32 v64, a2
+	; v_accvgpr_read_b32 v65, a3
+	v_accvgpr_read_b32 v134, a2
+	v_accvgpr_read_b32 v135, a3
+	v_mfma_f32_16x16x16_bf16 a[4:7], v[78:79], v[50:51], a[4:7]
+	s_waitcnt vmcnt(9)
+	v_mfma_f32_16x16x16_bf16 a[4:7], v[72:73], v[52:53], a[4:7]
+	v_mfma_f32_16x16x16_bf16 a[4:7], v[74:75], v[54:55], a[4:7]
+	s_waitcnt vmcnt(8)
+	v_mfma_f32_16x16x16_bf16 a[4:7], v[68:69], v[56:57], a[4:7]
+	v_mfma_f32_16x16x16_bf16 a[4:7], v[70:71], v[58:59], a[4:7]
+	s_waitcnt vmcnt(7)
+	v_mfma_f32_16x16x16_bf16 a[4:7], v[64:65], v[60:61], a[4:7]
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[66:67], v[62:63], a[4:7]
-	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
+	global_load_dwordx4 v[116:119], v[138:139], off offset:16
 	v_mul_f32_e32 v44, s36, v44
 	v_mul_f32_e32 v47, s36, v47
-	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
+	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
 	v_cndmask_b32_e64 v37, v33, v44, s[0:1]
-	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
 	s_and_b64 s[0:1], s[2:3], s[8:9]
-	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
-	v_mul_f32_e32 v64, s36, v64
 	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
+	v_mul_f32_e32 v134, s36, v134
+	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
 	v_cndmask_b32_e64 v38, v33, v47, s[0:1]
-	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
+	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
 	s_and_b64 s[0:1], s[2:3], s[14:15]
-	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
+	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
 	v_accvgpr_read_b32 v66, a0
-	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
-	v_mul_f32_e32 v65, s36, v65
-	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
-	v_cndmask_b32_e64 v39, v33, v64, s[0:1]
 	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
+	v_mul_f32_e32 v135, s36, v135
+	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
+	v_cndmask_b32_e64 v39, v33, v134, s[0:1]
+	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
 	s_and_b64 s[0:1], s[2:3], s[22:23]
-	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
+	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
 	v_accvgpr_read_b32 v67, a1
-	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
+	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
 	v_mul_f32_e32 v66, s36, v66
-	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
-	v_cndmask_b32_e64 v40, v33, v65, s[0:1]
-	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
+	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
+	v_cndmask_b32_e64 v40, v33, v135, s[0:1]
+	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
 	s_and_b64 s[0:1], s[2:3], s[24:25]
-	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
+	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
 	v_accvgpr_read_b32 v68, a2
-	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
+	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
 	v_mul_f32_e32 v67, s36, v67
-	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
-	v_cndmask_b32_e64 v41, v33, v66, s[0:1]
-	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
-	s_and_b64 s[0:1], s[2:3], s[26:27]
 	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
+	v_cndmask_b32_e64 v41, v33, v66, s[0:1]
+	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
+	s_and_b64 s[0:1], s[2:3], s[26:27]
+	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
 	v_accvgpr_read_b32 v69, a3
-	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
+	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
 	v_mul_f32_e32 v68, s36, v68
-	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
-	v_cndmask_b32_e64 v42, v33, v67, s[0:1]
-	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
-	s_and_b64 s[0:1], s[2:3], s[28:29]
-.Ltmp10:
-	.loc	2 168 27                        ; standard.py:168:27 @[ pa_decode_gluon.py:2458:36 ]
-	v_max_f32_e32 v36, v37, v38
-.Ltmp11:
+	.loc	1 2406 44                       ; pa_decode_gluon.py:2406:44
+	global_load_dwordx4 v[108:111], v[140:141], off
 	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
-	v_mul_f32_e32 v69, s36, v69
+	v_cndmask_b32_e64 v42, v33, v67, s[0:1]
 	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
-	v_cndmask_b32_e64 v43, v33, v68, s[0:1]
+	s_and_b64 s[0:1], s[2:3], s[28:29]
 	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
-	s_and_b64 s[0:1], s[2:3], s[30:31]
-.Ltmp12:
+	v_max_f32_e32 v36, v37, v38
 	.loc	2 168 27                        ; standard.py:168:27 @[ pa_decode_gluon.py:2458:36 ]
-	v_max3_f32 v36, v36, v39, v40
-.Ltmp13:
+	v_mul_f32_e32 v69, s36, v69
+	.loc	1 2436 44                       ; pa_decode_gluon.py:2436:44
+	v_cndmask_b32_e64 v43, v33, v68, s[0:1]
 	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
+	s_and_b64 s[0:1], s[2:3], s[30:31]
+	.loc	1 2452 47                       ; pa_decode_gluon.py:2452:47
+	v_max3_f32 v36, v36, v39, v40
+	.loc	2 168 27                        ; standard.py:168:27 @[ pa_decode_gluon.py:2458:36 ]
 	v_cndmask_b32_e64 v44, v33, v69, s[0:1]
-.Ltmp14:
-	.loc	2 168 27                        ; standard.py:168:27 @[ pa_decode_gluon.py:2458:36 ]
+	.loc	1 2455 69                       ; pa_decode_gluon.py:2455:69
 	v_max3_f32 v36, v36, v41, v42
-	v_max3_f32 v36, v36, v43, v44
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
-	ds_bpermute_b32 v47, v28, v36
-.Ltmp15:
-	.loc	1 2322 12                       ; pa_decode_gluon.py:2322:12
-	s_waitcnt vmcnt(9)
-	v_readfirstlane_b32 s8, v45
-	s_waitcnt vmcnt(8)
-	v_readfirstlane_b32 s14, v46
-.Ltmp16:
 	.loc	2 168 27                        ; standard.py:168:27 @[ pa_decode_gluon.py:2458:36 ]
+	v_max3_f32 v36, v36, v43, v44
+	ds_bpermute_b32 v47, v28, v36
+	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
+	s_waitcnt vmcnt(8)
+	.loc	1 2322 12                       ; pa_decode_gluon.py:2322:12
+	v_readfirstlane_b32 s8, v45
+	s_waitcnt vmcnt(7)
+	v_readfirstlane_b32 s14, v46
 	s_waitcnt lgkmcnt(0)
+	.loc	2 168 27                        ; standard.py:168:27 @[ pa_decode_gluon.py:2458:36 ]
 	v_max_f32_e32 v45, v47, v47
 	v_max_f32_e32 v36, v36, v45
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
 	ds_swizzle_b32 v45, v36 offset:swizzle(SWAP,16)
+	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
+	global_load_dwordx4 v[100:103], v[140:141], off offset:16
 	s_and_saveexec_b64 s[0:1], vcc
 	s_cbranch_execz .LBB0_4
 ; %bb.3:                                ;   in Loop: Header=BB0_2 Depth=1
@@ -593,14 +580,11 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	s_waitcnt lgkmcnt(0)
 	s_barrier
 	ds_read_b32 v36, v29
-.Ltmp17:
 	.loc	1 2459 48 is_stmt 1             ; pa_decode_gluon.py:2459:48
 	v_max_f32_e32 v45, v22, v22
-.Ltmp18:
 	.loc	2 291 36                        ; standard.py:291:36 @[ pa_decode_gluon.py:2468:57 ]
 	s_waitcnt lgkmcnt(0)
 	s_barrier
-.Ltmp19:
 	.loc	1 2459 48                       ; pa_decode_gluon.py:2459:48
 	v_max_f32_e32 v36, v36, v36
 	v_max_f32_e32 v36, v45, v36
@@ -638,21 +622,16 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	v_sub_f32_e32 v44, v44, v36
 	.loc	1 2466 12                       ; pa_decode_gluon.py:2466:12
 	v_exp_f32_e32 v42, v42
-.Ltmp20:
 	.loc	2 261 15 is_stmt 1              ; standard.py:261:15 @[ pa_decode_gluon.py:2468:57 ]
 	v_add_f32_e32 v37, v39, v38
-.Ltmp21:
 	.loc	1 2466 59                       ; pa_decode_gluon.py:2466:59
 	v_mul_f32_e32 v44, 0x3fb8aa3b, v44
 	.loc	1 2466 12 is_stmt 0             ; pa_decode_gluon.py:2466:12
 	v_exp_f32_e32 v45, v47
-.Ltmp22:
 	.loc	2 261 15 is_stmt 1              ; standard.py:261:15 @[ pa_decode_gluon.py:2468:57 ]
 	v_add_f32_e32 v37, v41, v37
-.Ltmp23:
 	.loc	1 2466 12                       ; pa_decode_gluon.py:2466:12
 	v_exp_f32_e32 v44, v44
-.Ltmp24:
 	.loc	2 261 15                        ; standard.py:261:15 @[ pa_decode_gluon.py:2468:57 ]
 	v_add_f32_e32 v37, v40, v37
 	v_add_f32_e32 v37, v43, v37
@@ -684,20 +663,16 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	s_and_saveexec_b64 s[0:1], s[6:7]
 ; %bb.11:                               ;   in Loop: Header=BB0_2 Depth=1
 	ds_read_b32 v37, v31
-.Ltmp25:
 ; %bb.12:                               ;   in Loop: Header=BB0_2 Depth=1
 	.loc	2 0 36                          ; standard.py:0:36
 	s_or_b64 exec, exec, s[0:1]
 	v_sub_f32_e32 v22, v22, v36
 	v_mul_f32_e32 v22, 0x3fb8aa3b, v22
-.Ltmp26:
 	.loc	2 291 36                        ; standard.py:291:36 @[ pa_decode_gluon.py:2468:57 ]
 	s_waitcnt lgkmcnt(0)
 	v_mov_b32_e32 v46, v37
-.Ltmp27:
 	.loc	1 0 0                           ; pa_decode_gluon.py:0
 	v_exp_f32_e32 v22, v22
-.Ltmp28:
 	.loc	2 291 36                        ; standard.py:291:36 @[ pa_decode_gluon.py:2468:57 ]
 	s_nop 0
 	v_mov_b32_dpp v46, v46 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf
@@ -713,7 +688,6 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	v_add_f32_e32 v37, v37, v46
 	.loc	2 291 36                        ; standard.py:291:36 @[ pa_decode_gluon.py:2468:57 ]
 	ds_write_b32 v31, v37
-.Ltmp29:
 ; %bb.14:                               ;   in Loop: Header=BB0_2 Depth=1
 	.loc	2 0 36                          ; standard.py:0:36
 	s_or_b64 exec, exec, s[0:1]
@@ -733,50 +707,42 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	s_mul_i32 s24, s14, s46
 	.loc	1 2472 50                       ; pa_decode_gluon.py:2472:50
 	s_addc_u32 s1, s51, s1
-	v_lshl_add_u64 v[46:47], s[0:1], 0, v[4:5]
+	v_lshl_add_u64 v[134:135], s[0:1], 0, v[4:5]
 	v_lshl_add_u64 v[64:65], s[0:1], 0, v[6:7]
 	v_lshl_add_u64 v[66:67], s[0:1], 0, v[8:9]
 	v_lshl_add_u64 v[68:69], s[0:1], 0, v[10:11]
 	s_lshl_b64 s[0:1], s[24:25], 1
 	s_add_u32 s0, s50, s0
 	s_addc_u32 s1, s51, s1
+	v_lshl_add_u64 v[134:135], v[134:135], 0, v[2:3]
+	global_load_dwordx4 v[92:95], v[134:135], off
 	v_lshl_add_u64 v[70:71], s[0:1], 0, v[4:5]
 	v_lshl_add_u64 v[72:73], s[0:1], 0, v[6:7]
 	v_lshl_add_u64 v[74:75], s[0:1], 0, v[8:9]
-	v_lshl_add_u64 v[46:47], v[46:47], 0, v[2:3]
 	v_lshl_add_u64 v[64:65], v[64:65], 0, v[2:3]
 	v_lshl_add_u64 v[66:67], v[66:67], 0, v[2:3]
 	v_lshl_add_u64 v[68:69], v[68:69], 0, v[2:3]
 	v_lshl_add_u64 v[70:71], v[70:71], 0, v[2:3]
 	v_lshl_add_u64 v[72:73], v[72:73], 0, v[2:3]
-	v_lshl_add_u64 v[128:129], v[74:75], 0, v[2:3]
-	v_lshl_add_u64 v[74:75], s[0:1], 0, v[10:11]
-.Ltmp30:
+	v_lshl_add_u64 v[136:137], v[74:75], 0, v[2:3]
 	.loc	2 291 36                        ; standard.py:291:36 @[ pa_decode_gluon.py:2468:57 ]
-	s_waitcnt lgkmcnt(0)
-	s_barrier
-	ds_read_b32 v37, v29
-.Ltmp31:
-	.loc	1 2472 50                       ; pa_decode_gluon.py:2472:50
-	v_lshl_add_u64 v[130:131], v[74:75], 0, v[2:3]
-	.loc	1 2472 34 is_stmt 0             ; pa_decode_gluon.py:2472:34
-	global_load_dwordx4 v[92:95], v[46:47], off
 	global_load_dwordx4 v[88:91], v[64:65], off
-	global_load_dwordx4 v[84:87], v[66:67], off
-	global_load_dwordx4 v[80:83], v[68:69], off
-	global_load_dwordx4 v[76:79], v[70:71], off
+	v_lshl_add_u64 v[74:75], s[0:1], 0, v[10:11]
+	s_waitcnt lgkmcnt(0)
+	.loc	1 2472 50                       ; pa_decode_gluon.py:2472:50
+	s_barrier
+	.loc	1 2472 34 is_stmt 0             ; pa_decode_gluon.py:2472:34
+	ds_read_b32 v37, v29
+	v_lshl_add_u64 v[138:139], v[74:75], 0, v[2:3]
 	s_nop 0
-	global_load_dwordx4 v[72:75], v[72:73], off
 	s_nop 0
-	global_load_dwordx4 v[68:71], v[128:129], off
-	global_load_dwordx4 v[64:67], v[130:131], off
-	.loc	1 2512 12 is_stmt 1             ; pa_decode_gluon.py:2512:12
 	v_bfe_u32 v46, v45, 16, 1
 	v_bfe_u32 v47, v44, 16, 1
 	v_add3_u32 v46, v45, v46, s60
 	v_bfe_u32 v128, v43, 16, 1
 	v_add3_u32 v47, v44, v47, s60
 	v_lshrrev_b32_e32 v46, 16, v46
+	.loc	1 2512 12 is_stmt 1             ; pa_decode_gluon.py:2512:12
 	v_cmp_o_f32_e64 s[0:1], v45, v45
 	v_bfe_u32 v129, v42, 16, 1
 	v_add3_u32 v128, v43, v128, s60
@@ -791,6 +757,7 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	v_bfe_u32 v131, v40, 16, 1
 	v_add3_u32 v130, v41, v130, s60
 	v_lshrrev_b32_e32 v129, 16, v129
+	global_load_dwordx4 v[84:87], v[66:67], off
 	v_cndmask_b32_e64 v43, v34, v128, s[0:1]
 	v_cmp_o_f32_e64 s[0:1], v42, v42
 	v_bfe_u32 v132, v39, 16, 1
@@ -817,66 +784,71 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	v_perm_b32 v42, v38, v39, s61
 	v_add_u32_e32 v38, 0, v25
 	s_waitcnt lgkmcnt(0)
+	global_load_dwordx4 v[80:83], v[68:69], off
 	s_barrier
 	ds_write_b128 v38, v[42:45]
 	s_waitcnt lgkmcnt(0)
 	s_barrier
 	ds_read_b128 v[38:41], v32
 	ds_read_b128 v[42:45], v32 offset:256
-	.loc	1 2537 47                       ; pa_decode_gluon.py:2537:47
-	s_waitcnt vmcnt(15) lgkmcnt(1)
+	s_waitcnt vmcnt(11) lgkmcnt(1)
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[124:125], v[38:39], 0
-	.loc	1 2291 32                       ; pa_decode_gluon.py:2291:32
 	s_add_i32 s54, s54, 1
-	.loc	1 2468 50                       ; pa_decode_gluon.py:2468:50
 	v_fmac_f32_e32 v37, v35, v22
-	.loc	1 2291 32                       ; pa_decode_gluon.py:2291:32
-	s_cmp_lg_u32 s54, 9
 	.loc	1 2537 47                       ; pa_decode_gluon.py:2537:47
+	s_cmp_lg_u32 s54, 9
 	s_waitcnt lgkmcnt(0)
+	.loc	1 2291 32                       ; pa_decode_gluon.py:2291:32
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[126:127], v[42:43], a[0:3]
-	.loc	1 2512 12                       ; pa_decode_gluon.py:2512:12
+	.loc	1 2468 50                       ; pa_decode_gluon.py:2468:50
 	ds_read_b128 v[124:127], v32 offset:512
+	.loc	1 2291 32                       ; pa_decode_gluon.py:2291:32
 	ds_read_b128 v[128:131], v32 offset:768
 	.loc	1 2537 47                       ; pa_decode_gluon.py:2537:47
-	s_waitcnt vmcnt(13)
+	global_load_dwordx4 v[76:79], v[70:71], off
+	s_waitcnt vmcnt(10)
+	.loc	1 2512 12                       ; pa_decode_gluon.py:2512:12
 	v_mfma_f32_16x16x16_bf16 a[4:7], v[104:105], v[38:39], 0
 	s_waitcnt lgkmcnt(1)
+	.loc	1 2537 47                       ; pa_decode_gluon.py:2537:47
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[112:113], v[124:125], a[0:3]
 	v_mfma_f32_16x16x16_bf16 a[4:7], v[106:107], v[42:43], a[4:7]
 	s_waitcnt lgkmcnt(0)
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[114:115], v[128:129], a[0:3]
-	s_waitcnt vmcnt(12)
+	s_waitcnt vmcnt(9)
 	v_mfma_f32_16x16x16_bf16 a[4:7], v[96:97], v[124:125], a[4:7]
-	s_waitcnt vmcnt(11)
+	s_waitcnt vmcnt(8)
+	global_load_dwordx4 v[72:75], v[72:73], off
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[120:121], v[40:41], a[0:3]
 	v_mfma_f32_16x16x16_bf16 a[4:7], v[98:99], v[128:129], a[4:7]
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[122:123], v[44:45], a[0:3]
-	s_waitcnt vmcnt(9)
+	s_waitcnt vmcnt(7)
 	v_mfma_f32_16x16x16_bf16 a[4:7], v[108:109], v[40:41], a[4:7]
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[116:117], v[126:127], a[0:3]
 	v_mfma_f32_16x16x16_bf16 a[4:7], v[110:111], v[44:45], a[4:7]
+	global_load_dwordx4 v[68:71], v[136:137], off
 	v_mfma_f32_16x16x16_bf16 a[0:3], v[118:119], v[130:131], a[0:3]
-	s_waitcnt vmcnt(8)
+	s_waitcnt vmcnt(7)
 	v_mfma_f32_16x16x16_bf16 a[4:7], v[100:101], v[126:127], a[4:7]
 	s_nop 4
 	v_accvgpr_read_b32 v39, a3
 	v_accvgpr_read_b32 v38, a2
 	v_mfma_f32_16x16x16_bf16 a[2:5], v[102:103], v[130:131], a[4:7]
-	.loc	1 2558 37                       ; pa_decode_gluon.py:2558:37
 	v_accvgpr_read_b32 v43, a1
+	.loc	1 2558 37                       ; pa_decode_gluon.py:2558:37
 	v_pk_fma_f32 v[16:17], v[16:17], v[22:23], v[38:39] op_sel_hi:[1,0,1]
 	v_accvgpr_read_b32 v42, a0
 	v_pk_fma_f32 v[14:15], v[14:15], v[22:23], v[42:43] op_sel_hi:[1,0,1]
 	s_nop 2
 	v_accvgpr_read_b32 v39, a3
-	.loc	1 2537 47                       ; pa_decode_gluon.py:2537:47
 	v_accvgpr_read_b32 v41, a5
+	.loc	1 2537 47                       ; pa_decode_gluon.py:2537:47
 	v_accvgpr_read_b32 v40, a4
-	.loc	1 2558 37                       ; pa_decode_gluon.py:2558:37
 	v_accvgpr_read_b32 v38, a2
+	.loc	1 2558 37                       ; pa_decode_gluon.py:2558:37
 	v_pk_fma_f32 v[18:19], v[18:19], v[22:23], v[38:39] op_sel_hi:[1,0,1]
 	v_pk_fma_f32 v[20:21], v[20:21], v[22:23], v[40:41] op_sel_hi:[1,0,1]
+	global_load_dwordx4 v[64:67], v[138:139], off
 	.loc	1 2291 32                       ; pa_decode_gluon.py:2291:32
 	s_cbranch_scc0 .LBB0_16
 ; %bb.15:                               ;   in Loop: Header=BB0_2 Depth=1
@@ -1021,7 +993,6 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 .LBB0_17:                               ; %common.ret
 	.loc	1 0 0 is_stmt 0                 ; pa_decode_gluon.py:0
 	s_endpgm
-.Ltmp32:
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
 	.amdhsa_kernel paged_attention_decode_v2_gluon_dot_kernel
@@ -1043,9 +1014,9 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 		.amdhsa_system_sgpr_workgroup_id_z 1
 		.amdhsa_system_sgpr_workgroup_info 0
 		.amdhsa_system_vgpr_workitem_id 0
-		.amdhsa_next_free_vgpr 144
+		.amdhsa_next_free_vgpr 152
 		.amdhsa_next_free_sgpr 62
-		.amdhsa_accum_offset 136
+		.amdhsa_accum_offset 144
 		.amdhsa_reserve_vcc 1
 		.amdhsa_reserve_xnack_mask 1
 		.amdhsa_float_round_mode_32 0
@@ -1069,7 +1040,7 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	.size	paged_attention_decode_v2_gluon_dot_kernel, .Lfunc_end0-paged_attention_decode_v2_gluon_dot_kernel
 	.cfi_endproc
                                         ; -- End function
-	.set paged_attention_decode_v2_gluon_dot_kernel.num_vgpr, 134
+	.set paged_attention_decode_v2_gluon_dot_kernel.num_vgpr, 142
 	.set paged_attention_decode_v2_gluon_dot_kernel.num_agpr, 8
 	.set paged_attention_decode_v2_gluon_dot_kernel.numbered_sgpr, 62
 	.set paged_attention_decode_v2_gluon_dot_kernel.private_seg_size, 0
@@ -1082,19 +1053,19 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 ; Kernel info:
 ; codeLenInByte = 4288
 ; TotalNumSgprs: 68
-; NumVgprs: 134
+; NumVgprs: 142
 ; NumAgprs: 8
-; TotalNumVgprs: 144
+; TotalNumVgprs: 152
 ; ScratchSize: 0
 ; MemoryBound: 0
 ; FloatMode: 240
 ; IeeeMode: 1
 ; LDSByteSize: 0 bytes/workgroup (compile time only)
 ; SGPRBlocks: 8
-; VGPRBlocks: 17
+; VGPRBlocks: 18
 ; NumSGPRsForWavesPerEU: 68
-; NumVGPRsForWavesPerEU: 144
-; AccumOffset: 136
+; NumVGPRsForWavesPerEU: 152
+; AccumOffset: 144
 ; Occupancy: 3
 ; WaveLimiterHint : 0
 ; COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
@@ -1104,7 +1075,7 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 ; COMPUTE_PGM_RSRC2:TGID_Y_EN: 1
 ; COMPUTE_PGM_RSRC2:TGID_Z_EN: 1
 ; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 0
-; COMPUTE_PGM_RSRC3_GFX90A:ACCUM_OFFSET: 33
+; COMPUTE_PGM_RSRC3_GFX90A:ACCUM_OFFSET: 35
 ; COMPUTE_PGM_RSRC3_GFX90A:TG_SPLIT: 0
 	.text
 	.p2alignl 6, 3212836864
@@ -1114,173 +1085,6 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.section	.debug_abbrev,"",@progbits
-	.byte	1                               ; Abbreviation Code
-	.byte	17                              ; DW_TAG_compile_unit
-	.byte	1                               ; DW_CHILDREN_yes
-	.byte	37                              ; DW_AT_producer
-	.byte	14                              ; DW_FORM_strp
-	.byte	19                              ; DW_AT_language
-	.byte	5                               ; DW_FORM_data2
-	.byte	3                               ; DW_AT_name
-	.byte	14                              ; DW_FORM_strp
-	.byte	16                              ; DW_AT_stmt_list
-	.byte	23                              ; DW_FORM_sec_offset
-	.byte	27                              ; DW_AT_comp_dir
-	.byte	14                              ; DW_FORM_strp
-	.byte	17                              ; DW_AT_low_pc
-	.byte	1                               ; DW_FORM_addr
-	.byte	18                              ; DW_AT_high_pc
-	.byte	6                               ; DW_FORM_data4
-	.byte	0                               ; EOM(1)
-	.byte	0                               ; EOM(2)
-	.byte	2                               ; Abbreviation Code
-	.byte	46                              ; DW_TAG_subprogram
-	.byte	0                               ; DW_CHILDREN_no
-	.byte	3                               ; DW_AT_name
-	.byte	14                              ; DW_FORM_strp
-	.byte	32                              ; DW_AT_inline
-	.byte	11                              ; DW_FORM_data1
-	.byte	0                               ; EOM(1)
-	.byte	0                               ; EOM(2)
-	.byte	3                               ; Abbreviation Code
-	.byte	46                              ; DW_TAG_subprogram
-	.byte	1                               ; DW_CHILDREN_yes
-	.byte	17                              ; DW_AT_low_pc
-	.byte	1                               ; DW_FORM_addr
-	.byte	18                              ; DW_AT_high_pc
-	.byte	6                               ; DW_FORM_data4
-	.byte	49                              ; DW_AT_abstract_origin
-	.byte	19                              ; DW_FORM_ref4
-	.byte	0                               ; EOM(1)
-	.byte	0                               ; EOM(2)
-	.byte	4                               ; Abbreviation Code
-	.byte	29                              ; DW_TAG_inlined_subroutine
-	.byte	0                               ; DW_CHILDREN_no
-	.byte	49                              ; DW_AT_abstract_origin
-	.byte	19                              ; DW_FORM_ref4
-	.byte	17                              ; DW_AT_low_pc
-	.byte	1                               ; DW_FORM_addr
-	.byte	18                              ; DW_AT_high_pc
-	.byte	6                               ; DW_FORM_data4
-	.byte	88                              ; DW_AT_call_file
-	.byte	11                              ; DW_FORM_data1
-	.byte	89                              ; DW_AT_call_line
-	.byte	5                               ; DW_FORM_data2
-	.byte	87                              ; DW_AT_call_column
-	.byte	11                              ; DW_FORM_data1
-	.byte	0                               ; EOM(1)
-	.byte	0                               ; EOM(2)
-	.byte	5                               ; Abbreviation Code
-	.byte	29                              ; DW_TAG_inlined_subroutine
-	.byte	0                               ; DW_CHILDREN_no
-	.byte	49                              ; DW_AT_abstract_origin
-	.byte	19                              ; DW_FORM_ref4
-	.byte	85                              ; DW_AT_ranges
-	.byte	23                              ; DW_FORM_sec_offset
-	.byte	88                              ; DW_AT_call_file
-	.byte	11                              ; DW_FORM_data1
-	.byte	89                              ; DW_AT_call_line
-	.byte	5                               ; DW_FORM_data2
-	.byte	87                              ; DW_AT_call_column
-	.byte	11                              ; DW_FORM_data1
-	.byte	0                               ; EOM(1)
-	.byte	0                               ; EOM(2)
-	.byte	0                               ; EOM(3)
-	.section	.debug_info,"",@progbits
-.Lcu_begin0:
-	.long	.Ldebug_info_end0-.Ldebug_info_start0 ; Length of Unit
-.Ldebug_info_start0:
-	.short	4                               ; DWARF version number
-	.long	.debug_abbrev                   ; Offset Into Abbrev. Section
-	.byte	8                               ; Address Size (in bytes)
-	.byte	1                               ; Abbrev [1] 0xb:0x7c DW_TAG_compile_unit
-	.long	.Linfo_string0                  ; DW_AT_producer
-	.short	2                               ; DW_AT_language
-	.long	.Linfo_string1                  ; DW_AT_name
-	.long	.Lline_table_start0             ; DW_AT_stmt_list
-	.long	.Linfo_string2                  ; DW_AT_comp_dir
-	.quad	.Lfunc_begin0                   ; DW_AT_low_pc
-	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
-	.byte	2                               ; Abbrev [2] 0x2a:0x6 DW_TAG_subprogram
-	.long	.Linfo_string3                  ; DW_AT_name
-	.byte	1                               ; DW_AT_inline
-	.byte	3                               ; Abbrev [3] 0x30:0x56 DW_TAG_subprogram
-	.quad	.Lfunc_begin0                   ; DW_AT_low_pc
-	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
-	.long	42                              ; DW_AT_abstract_origin
-	.byte	4                               ; Abbrev [4] 0x41:0x15 DW_TAG_inlined_subroutine
-	.long	42                              ; DW_AT_abstract_origin
-	.quad	.Ltmp2                          ; DW_AT_low_pc
-	.long	.Ltmp3-.Ltmp2                   ; DW_AT_high_pc
-	.byte	1                               ; DW_AT_call_file
-	.short	2236                            ; DW_AT_call_line
-	.byte	59                              ; DW_AT_call_column
-	.byte	4                               ; Abbrev [4] 0x56:0x15 DW_TAG_inlined_subroutine
-	.long	42                              ; DW_AT_abstract_origin
-	.quad	.Ltmp4                          ; DW_AT_low_pc
-	.long	.Ltmp5-.Ltmp4                   ; DW_AT_high_pc
-	.byte	1                               ; DW_AT_call_file
-	.short	2307                            ; DW_AT_call_line
-	.byte	12                              ; DW_AT_call_column
-	.byte	5                               ; Abbrev [5] 0x6b:0xd DW_TAG_inlined_subroutine
-	.long	42                              ; DW_AT_abstract_origin
-	.long	.Ldebug_ranges0                 ; DW_AT_ranges
-	.byte	1                               ; DW_AT_call_file
-	.short	2458                            ; DW_AT_call_line
-	.byte	36                              ; DW_AT_call_column
-	.byte	5                               ; Abbrev [5] 0x78:0xd DW_TAG_inlined_subroutine
-	.long	42                              ; DW_AT_abstract_origin
-	.long	.Ldebug_ranges1                 ; DW_AT_ranges
-	.byte	1                               ; DW_AT_call_file
-	.short	2468                            ; DW_AT_call_line
-	.byte	57                              ; DW_AT_call_column
-	.byte	0                               ; End Of Children Mark
-	.byte	0                               ; End Of Children Mark
-.Ldebug_info_end0:
-	.section	.debug_ranges,"",@progbits
-.Ldebug_ranges0:
-	.quad	.Ltmp6-.Lfunc_begin0
-	.quad	.Ltmp7-.Lfunc_begin0
-	.quad	.Ltmp8-.Lfunc_begin0
-	.quad	.Ltmp9-.Lfunc_begin0
-	.quad	.Ltmp10-.Lfunc_begin0
-	.quad	.Ltmp11-.Lfunc_begin0
-	.quad	.Ltmp12-.Lfunc_begin0
-	.quad	.Ltmp13-.Lfunc_begin0
-	.quad	.Ltmp14-.Lfunc_begin0
-	.quad	.Ltmp15-.Lfunc_begin0
-	.quad	.Ltmp16-.Lfunc_begin0
-	.quad	.Ltmp17-.Lfunc_begin0
-	.quad	0
-	.quad	0
-.Ldebug_ranges1:
-	.quad	.Ltmp18-.Lfunc_begin0
-	.quad	.Ltmp19-.Lfunc_begin0
-	.quad	.Ltmp20-.Lfunc_begin0
-	.quad	.Ltmp21-.Lfunc_begin0
-	.quad	.Ltmp22-.Lfunc_begin0
-	.quad	.Ltmp23-.Lfunc_begin0
-	.quad	.Ltmp24-.Lfunc_begin0
-	.quad	.Ltmp25-.Lfunc_begin0
-	.quad	.Ltmp26-.Lfunc_begin0
-	.quad	.Ltmp27-.Lfunc_begin0
-	.quad	.Ltmp28-.Lfunc_begin0
-	.quad	.Ltmp29-.Lfunc_begin0
-	.quad	.Ltmp30-.Lfunc_begin0
-	.quad	.Ltmp31-.Lfunc_begin0
-	.quad	0
-	.quad	0
-	.section	.debug_str,"MS",@progbits,1
-.Linfo_string0:
-	.asciz	"triton"                        ; string offset=0
-.Linfo_string1:
-	.asciz	"pa_decode_gluon.py"            ; string offset=7
-.Linfo_string2:
-	.asciz	"/mnt/raid0/heyanguang/code/fa_triton/aiter/aiter/ops/triton/gluon" ; string offset=26
-.Linfo_string3:
-	.asciz	"paged_attention_decode_v2_gluon_dot_kernel" ; string offset=92
-	.section	".note.GNU-stack","",@progbits
 	.amdgpu_metadata
 ---
 amdhsa.kernels:
@@ -1423,7 +1227,7 @@ amdhsa.kernels:
     .sgpr_spill_count: 0
     .symbol:         paged_attention_decode_v2_gluon_dot_kernel.kd
     .uses_dynamic_stack: false
-    .vgpr_count:     144
+    .vgpr_count:     152
     .vgpr_spill_count: 0
     .wavefront_size: 64
 amdhsa.target:   amdgcn-amd-amdhsa--gfx942
@@ -1433,5 +1237,3 @@ amdhsa.version:
 ...
 
 	.end_amdgpu_metadata
-	.section	.debug_line,"",@progbits
-.Lline_table_start0:
