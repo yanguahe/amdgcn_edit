@@ -516,75 +516,83 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	v_max3_f32 v36, v36, v41, v42
 	.loc	2 168 27                        ; standard.py:168:27 @[ pa_decode_gluon.py:2458:36 ]
 	v_max3_f32 v36, v36, v43, v44
-	ds_bpermute_b32 v47, v28, v36
+; ============================================
+; Reduce Max: 256 threads -> 16 results
+; Pure LDS approach, all threads participate
+; Reuses v143-v159 (shared with reduce_sum)
+; ============================================
+
+; --- Step 1: Write to LDS ---
+; v31 = thread_id * 4 (already computed)
+	ds_write_b32 v31, v36
+
+	global_load_dwordx4 v[100:103], v[140:141], off offset:16
+
+; --- Step 2: Barrier ---
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+
+; --- Step 3: Compute LDS read base address ---
+; v143 = (thread_id & 0xF) * 4 = v31 & 0x3C
+	v_and_b32_e32 v143, 0x3C, v31
+
+; --- Step 4: Read all 16 values from LDS ---
+	ds_read_b32 v144, v143 offset:0
+	ds_read_b32 v145, v143 offset:64
+	ds_read_b32 v146, v143 offset:128
+	ds_read_b32 v147, v143 offset:192
+	ds_read_b32 v148, v143 offset:256
+	ds_read_b32 v149, v143 offset:320
+	ds_read_b32 v150, v143 offset:384
+	ds_read_b32 v151, v143 offset:448
+	ds_read_b32 v152, v143 offset:512
+	ds_read_b32 v153, v143 offset:576
+	ds_read_b32 v154, v143 offset:640
+	ds_read_b32 v155, v143 offset:704
+	ds_read_b32 v156, v143 offset:768
+	ds_read_b32 v157, v143 offset:832
+	ds_read_b32 v158, v143 offset:896
+	ds_read_b32 v159, v143 offset:960
+
+; Wait for all LDS reads
+	s_waitcnt lgkmcnt(0)
+
+; --- Step 5: Tree reduction with v_max_f32 ---
+	v_max_f32_e32 v144, v144, v145
+	v_max_f32_e32 v146, v146, v147
+	v_max_f32_e32 v148, v148, v149
+	v_max_f32_e32 v150, v150, v151
+	v_max_f32_e32 v152, v152, v153
+	v_max_f32_e32 v154, v154, v155
+	v_max_f32_e32 v156, v156, v157
+	v_max_f32_e32 v158, v158, v159
+
+	v_max_f32_e32 v144, v144, v146
+	v_max_f32_e32 v148, v148, v150
+	v_max_f32_e32 v152, v152, v154
+	v_max_f32_e32 v156, v156, v158
+
+	v_max_f32_e32 v144, v144, v148
+	v_max_f32_e32 v152, v152, v156
+
+	v_max_f32_e32 v36, v144, v152
+
+
 	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
 	s_waitcnt vmcnt(8)
 	.loc	1 2322 12                       ; pa_decode_gluon.py:2322:12
 	v_readfirstlane_b32 s8, v45
-	s_waitcnt vmcnt(7)
+	; s_waitcnt vmcnt(8)
 	v_readfirstlane_b32 s14, v46
-	s_waitcnt lgkmcnt(0)
-	.loc	2 168 27                        ; standard.py:168:27 @[ pa_decode_gluon.py:2458:36 ]
-	v_max_f32_e32 v45, v47, v47
-	v_max_f32_e32 v36, v36, v45
-	ds_swizzle_b32 v45, v36 offset:swizzle(SWAP,16)
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
-	global_load_dwordx4 v[100:103], v[140:141], off offset:16
-	s_and_saveexec_b64 s[0:1], vcc
-	s_cbranch_execz .LBB0_4
-; %bb.3:                                ;   in Loop: Header=BB0_2 Depth=1
-	.loc	2 0 40 is_stmt 0                ; standard.py:0:40
-	s_waitcnt lgkmcnt(0)
-	v_max_f32_e32 v45, v45, v45
-	v_max_f32_e32 v36, v36, v36
-	v_max_f32_e32 v36, v36, v45
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
-	ds_write_b32 v30, v36
-.LBB0_4:                                ;   in Loop: Header=BB0_2 Depth=1
-	.loc	2 0 40                          ; standard.py:0:40
-	s_or_b64 exec, exec, s[0:1]
-	v_mov_b32_e32 v36, 0
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
-	s_waitcnt lgkmcnt(0)
-	s_barrier
-	s_and_saveexec_b64 s[0:1], s[6:7]
-; %bb.5:                                ;   in Loop: Header=BB0_2 Depth=1
-	ds_read_b32 v36, v31
-; %bb.6:                                ;   in Loop: Header=BB0_2 Depth=1
-	.loc	2 0 40                          ; standard.py:0:40
-	s_or_b64 exec, exec, s[0:1]
-	.loc	2 168 27 is_stmt 1              ; standard.py:168:27 @[ pa_decode_gluon.py:2458:36 ]
-	s_waitcnt lgkmcnt(0)
-	v_max_f32_e32 v45, v36, v36
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
-	v_mov_b32_dpp v36, v36 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf
-	.loc	2 168 27                        ; standard.py:168:27 @[ pa_decode_gluon.py:2458:36 ]
-	v_max_f32_e32 v36, v36, v36
-	v_max_f32_e32 v36, v45, v36
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
-	v_mov_b32_e32 v45, v36
-	s_nop 1
-	v_mov_b32_dpp v45, v45 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
-	s_and_saveexec_b64 s[0:1], s[12:13]
-; %bb.7:                                ;   in Loop: Header=BB0_2 Depth=1
-	.loc	2 0 40 is_stmt 0                ; standard.py:0:40
-	v_max_f32_e32 v45, v45, v45
-	v_max_f32_e32 v36, v36, v36
-	v_max_f32_e32 v36, v36, v45
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
-	ds_write_b32 v31, v36
-; %bb.8:                                ;   in Loop: Header=BB0_2 Depth=1
-	.loc	2 0 40                          ; standard.py:0:40
-	s_or_b64 exec, exec, s[0:1]
-	.loc	2 189 40                        ; standard.py:189:40 @[ pa_decode_gluon.py:2458:36 ]
-	s_waitcnt lgkmcnt(0)
-	s_barrier
-	ds_read_b32 v36, v29
+
+
+; Done: v36 contains the max for this thread's group
+; All threads with (thread_id & 0xF) == k hold Result[k]
 	.loc	1 2459 48 is_stmt 1             ; pa_decode_gluon.py:2459:48
 	v_max_f32_e32 v45, v22, v22
 	.loc	2 291 36                        ; standard.py:291:36 @[ pa_decode_gluon.py:2468:57 ]
-	s_waitcnt lgkmcnt(0)
-	s_barrier
+	; s_waitcnt lgkmcnt(0)
+	; s_barrier
 	.loc	1 2459 48                       ; pa_decode_gluon.py:2459:48
 	v_max_f32_e32 v36, v36, v36
 	v_max_f32_e32 v36, v45, v36
@@ -801,9 +809,9 @@ paged_attention_decode_v2_gluon_dot_kernel: ; @paged_attention_decode_v2_gluon_d
 	v_cndmask_b32_e64 v38, v34, v133, s[0:1]
 	v_perm_b32 v42, v38, v39, s61
 	v_add_u32_e32 v38, 0, v25
-	s_waitcnt lgkmcnt(0)
+	; s_waitcnt lgkmcnt(0)
 	global_load_dwordx4 v[72:75], v[72:73], off
-	s_barrier
+	; s_barrier
 	ds_write_b128 v38, v[42:45]
 	s_waitcnt lgkmcnt(0)
 	s_barrier
